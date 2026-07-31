@@ -19,6 +19,9 @@
 
 #define DEBUG 0
 
+bool osmesaZinkMode();
+void* osmesaGetProcAddress(const char* name);
+
 std::string handle_multidraw_func_name(std::string name) {
     std::string namestr = name;
     if (namestr != "glMultiDrawElementsBaseVertex" && namestr != "glMultiDrawElements") {
@@ -53,6 +56,12 @@ std::string handle_multidraw_func_name(std::string name) {
 
 void* glXGetProcAddress(const char* name) {
     LOG()
+    // Zink/OSMesa uses a real desktop GL implementation. Resolve the original
+    // function name before MobileGlues applies GLES emulation name rewriting.
+    if (osmesaZinkMode()) {
+        void* proc = osmesaGetProcAddress(name);
+        if (proc) return proc;
+    }
     std::string real_func_name = handle_multidraw_func_name(std::string(name));
 #ifdef __APPLE__
     return dlsym((void*)(~(uintptr_t)0), real_func_name.c_str());
