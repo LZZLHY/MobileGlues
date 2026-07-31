@@ -60,7 +60,36 @@ void* glXGetProcAddress(const char* name) {
 
     void* proc = nullptr;
 
-    proc = dlsym(RTLD_DEFAULT, real_func_name.c_str());
+    // OHOS / amcl: prefer self handle over RTLD_DEFAULT.
+    //
+    // RTLD_DEFAULT walks the global symbol table in load order; on OHOS the
+    // system GLES ICD is already present, so dlsym(RTLD_DEFAULT, "glGetString")
+    // resolves to the GLES native symbol instead of the @@LIBGLFW wrapper that
+    // MG exports - LWJGL then bypasses MG entirely, surfacing GLES-level errors
+    // (GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT etc.) that MG would otherwise mask.
+    //
+    // Use dladdr(&glXGetProcAddress) -> dlopen(absolute_path, RTLD_NOLOAD) to
+    // get a non-default handle that scopes dlsym to *this* SO, and try that
+    // first. Fall back to RTLD_DEFAULT for entry points MG genuinely doesn't
+    // wrap (most GL extensions).
+    static void* self_handle = nullptr;
+    static bool self_handle_resolved = false;
+    if (!self_handle_resolved) {
+        self_handle_resolved = true;
+        Dl_info info{};
+        if (dladdr(reinterpret_cast<const void*>(&glXGetProcAddress), &info) && info.dli_fname) {
+            self_handle = dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+            if (!self_handle) {
+                self_handle = dlopen(info.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+            }
+        }
+    }
+    if (self_handle) {
+        proc = dlsym(self_handle, real_func_name.c_str());
+    }
+    if (!proc) {
+        proc = dlsym(RTLD_DEFAULT, real_func_name.c_str());
+    }
 
     if (!proc) {
         LOG_W("Failed to get OpenGL function: %s", real_func_name.c_str())
