@@ -1,0 +1,244 @@
+name: ohos-ci
+
+# CI for the OpenHarmony platform line (platform/ohos).
+#
+# Upstream's own build.yml covers the Android AAR. This workflow covers what the platform
+# line needs and upstream does not have:
+#   * conventions — commit format, no binaries, formatting of the lines we touched
+#   * linux-build — a real compile of the translation core, so code errors are caught
+#                   without an OHOS sysroot (the OHOS toolchain is not publicly fetchable)
+#   * ohos-cross-build — the actual aarch64-linux-ohos build, when a sysroot is configured
+#
+# Rules being enforced come from docs/ohos/CONTRIBUTING.md.
+
+on:
+  push:
+    branches:
+      - 'platform/**'
+  pull_request:
+    branches:
+      - 'platform/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ohos-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conventions:
+    name: Conventions and hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve commit range
+        id: range
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          elif [ "${{ github.event_name }}" = "push" ] && \
+               [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+          else
+            # First push of a branch, or manual run: fall back to the upstream base recorded
+            # in the branch. Everything since upstream/main is ours and must satisfy the rules.
+            git remote add mg-upstream https://github.com/MobileGL-Dev/MobileGlues.git
+            git fetch --quiet mg-upstream main
+            base="$(git merge-base mg-upstream/main HEAD)"
+            head="${{ github.sha }}"
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          echo "Range: $base..$head"
+
+      - name: Commit subjects follow the upstream convention
+        run: |
+          set -euo pipefail
+          pattern='^\[(Feat|Fix|Improvement|Chore|Docs)(\|(Feat|Fix|Improvement|Chore|Docs))*\] \([^()]+\): .+'
+          failed=0
+          while read -r sha; do
+            [ -z "$sha" ] && continue
+            subject="$(git log -1 --format=%s "$sha")"
+            case "$subject" in
+              Merge\ *) echo "skip merge:   $sha $subject"; continue ;;
+            esac
+            if printf '%s' "$subject" | grep -Eq "$pattern"; then
+              echo "ok:           $sha $subject"
+            else
+              echo "::error::bad commit subject: $sha $subject"
+              failed=1
+            fi
+          done < <(git rev-list "${{ steps.range.outputs.base }}..${{ steps.range.outputs.head }}")
+          if [ "$failed" -ne 0 ]; then
+            echo "Expected: [Tag] (module): summary   with Tag in Feat|Fix|Improvement|Chore|Docs"
+            echo "See docs/ohos/CONTRIBUTING.md"
+            exit 1
+          fi
+
+      - name: No binary artifacts
+        run: |
+          set -euo pipefail
+          failed=0
+          while read -r path; do
+            [ -z "$path" ] && continue
+            case "$path" in
+              *.a|*.so|*.so.*|*.o|*.obj|*.lib|*.dll|*.dylib|*.hap|*.hsp|*.apk|*.aar|*.jar|*.zip|*.7z)
+                echo "::error file=$path::binary artifacts must not be committed"
+                failed=1 ;;
+            esac
+          done < <(git diff --name-only --diff-filter=A \
+                     "${{ steps.range.outputs.base }}" "${{ steps.range.outputs.head }}")
+          exit "$failed"
+
+      - name: Touched lines match .clang-format
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-format
+          formatter=""
+          for candidate in git-clang-format git-clang-format-18 git-clang-format-17 git-clang-format-16 git-clang-format-15; do
+            if command -v "$candidate" >/dev/null 2>&1; then formatter="$candidate"; break; fi
+          done
+          if [ -z "$formatter" ]; then
+            echo "::error::git-clang-format is unavailable; cannot verify formatting"
+            exit 1
+          fi
+          echo "Using $formatter with $(clang-format --version)"
+          diff="$("$formatter" --diff --extensions c,cpp,h,hpp \
+                    "${{ steps.range.outputs.base }}" "${{ steps.range.outputs.head }}" || true)"
+          case "$diff" in
+            ""|*"no modified files to format"*|*"did not modify any files"*|*"clang-format did not modify any files"*)
+              echo "Formatting clean." ;;
+            *)
+              echo "$diff"
+              echo "::error::touched lines are not clang-format clean"
+              exit 1 ;;
+          esac
+
+  linux-build:
+    name: Build translation core (linux-x64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the submodules the build needs
+        run: |
+          set -euo pipefail
+          # perfetto is only used when PROFILING is on, and it is a very large tree.
+          git submodule update --init --depth 1 \
+            MobileGlues-cpp/3rdparty/glslang \
+            MobileGlues-cpp/3rdparty/SPIRV-Cross \
+            MobileGlues-cpp/3rdparty/glm \
+            MobileGlues-cpp/3rdparty/xxhash \
+            MobileGlues-cpp/include/FastSTL
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # config/gpu_utils.cpp includes the bundled vulkan_core.h, which pulls in the
+          # vk_video headers. Those are not vendored, so they come from the system package.
+          sudo apt-get install -y -qq cmake ninja-build clang ccache libvulkan-dev
+          cmake --version
+          clang --version
+          ls /usr/include/vk_video/ | head -5
+
+      - name: Cache compiler objects
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ohos-ci-ccache-${{ runner.os }}-${{ hashFiles('MobileGlues-cpp/CMakeLists.txt') }}
+          restore-keys: ohos-ci-ccache-${{ runner.os }}-
+
+      - name: Configure
+        env:
+          CCACHE_DIR: ~/.ccache
+        run: |
+          set -euo pipefail
+          cmake -S MobileGlues-cpp -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        env:
+          CCACHE_DIR: ~/.ccache
+        run: cmake --build build --parallel
+
+      - name: Report the produced library
+        run: |
+          set -euo pipefail
+          find build -maxdepth 2 -name 'libmobileglues*' -print -exec ls -l {} \;
+
+  ohos-cross-build:
+    name: Cross-build (aarch64-linux-ohos)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # The OpenHarmony sysroot is not publicly downloadable, so this job runs only where a
+    # sysroot archive URL is configured. It is skipped, never silently passed, elsewhere.
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    steps:
+      - name: Check for a configured sysroot
+        id: gate
+        env:
+          OHOS_SYSROOT_URL: ${{ secrets.OHOS_SYSROOT_URL }}
+        run: |
+          if [ -z "${OHOS_SYSROOT_URL:-}" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::OHOS_SYSROOT_URL is not configured; skipping the cross build."
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.available == 'true'
+
+      - name: Fetch the submodules the build needs
+        if: steps.gate.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          git submodule update --init --depth 1 \
+            MobileGlues-cpp/3rdparty/glslang \
+            MobileGlues-cpp/3rdparty/SPIRV-Cross \
+            MobileGlues-cpp/3rdparty/glm \
+            MobileGlues-cpp/3rdparty/xxhash \
+            MobileGlues-cpp/include/FastSTL
+
+      - name: Fetch the sysroot
+        if: steps.gate.outputs.available == 'true'
+        env:
+          OHOS_SYSROOT_URL: ${{ secrets.OHOS_SYSROOT_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/ohos-sysroot"
+          curl -fsSL "$OHOS_SYSROOT_URL" -o "$HOME/ohos-sysroot.tar.gz"
+          tar -xzf "$HOME/ohos-sysroot.tar.gz" -C "$HOME/ohos-sysroot" --strip-components=1
+
+      - name: Configure and build
+        if: steps.gate.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build clang
+          cmake -S MobileGlues-cpp -B build-ohos -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_C_COMPILER_TARGET=aarch64-linux-ohos \
+            -DCMAKE_CXX_COMPILER_TARGET=aarch64-linux-ohos \
+            -DCMAKE_SYSROOT="$HOME/ohos-sysroot"
+          cmake --build build-ohos --parallel
