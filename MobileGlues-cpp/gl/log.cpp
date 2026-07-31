@@ -7,16 +7,57 @@
 
 #include "log.h"
 #include <unistd.h>
+#include <cstdarg>
 #include <mutex>
 
 #include <GL/gl.h>
 
+#include "../platform/platform.h"
+
 #ifndef __ANDROID__
-// Define a stub for __android_log_print if not on Android
+// Off Android, MobileGlues' logging macros still call __android_log_print. Instead of discarding
+// those records, format them once and hand them to the platform log sink; platforms without one
+// drop them there. That keeps every existing call site unchanged while letting OpenHarmony route
+// the translation layer's records into hilog alongside the rest of the device's logs.
 int __android_log_print(int prio, const char* tag, const char* fmt, ...) {
-    return 0; // Do nothing
+    if (!fmt) return 0;
+
+    // Stack buffer only: this runs on the render thread for every logged GL call, and must not
+    // allocate. Long records are truncated rather than growing the buffer.
+    char message[1024];
+    va_list args;
+    va_start(args, fmt);
+    const int written = vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+    if (written < 0) return 0;
+
+    mg::platform::log_write(mg::platform::log_level_from_android_priority(prio), tag, message);
+    return written;
 }
 #endif
+
+namespace mg::platform {
+
+    // Kept next to the shim that needs it so a new platform backend does not have to repeat the
+    // mapping. The values are the ANDROID_LOG_* scale declared in gl/log.h.
+    LogLevel log_level_from_android_priority(int priority) {
+        switch (priority) {
+        case 2: // ANDROID_LOG_VERBOSE
+            return LogLevel::Verbose;
+        case 3: // ANDROID_LOG_DEBUG
+            return LogLevel::Debug;
+        case 5: // ANDROID_LOG_WARN
+            return LogLevel::Warn;
+        case 6: // ANDROID_LOG_ERROR
+            return LogLevel::Error;
+        case 7: // ANDROID_LOG_FATAL
+            return LogLevel::Fatal;
+        default:
+            return LogLevel::Info;
+        }
+    }
+
+} // namespace mg::platform
 
 #define CASE(e)                                                                                                        \
     case e:                                                                                                            \

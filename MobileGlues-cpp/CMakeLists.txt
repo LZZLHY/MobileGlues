@@ -86,6 +86,14 @@ endif()
 
 set(PROFILING OFF)
 
+# Exactly one platform backend is compiled; see platform/platform.h. OpenHarmony has hilog, the
+# other targets currently have no system log sink and use the generic no-op backend.
+if(OHOS)
+    set(MG_PLATFORM_SOURCE platform/platform_ohos.cpp)
+else()
+    set(MG_PLATFORM_SOURCE platform/platform_generic.cpp)
+endif()
+
 add_library(${CMAKE_PROJECT_NAME} SHARED
     init.cpp
     main.cpp
@@ -120,6 +128,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
     config/config.cpp
     config/gpu_utils.cpp
     config/settings.cpp
+    ${MG_PLATFORM_SOURCE}
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
@@ -148,6 +157,13 @@ elseif(ANDROID)
     target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC
         android
         log
+    )
+elseif(OHOS)
+    # OpenHarmony / HarmonyOS NEXT — EGL/GLES are loaded dynamically via dlopen, and the
+    # platform log sink is hilog.
+    target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC
+        libhilog_ndk.z.so
+        ${CMAKE_DL_LIBS}
     )
     else()
     # Linux — EGL/GLES are loaded dynamically via dlopen
