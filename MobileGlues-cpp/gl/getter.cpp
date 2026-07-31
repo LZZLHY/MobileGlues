@@ -118,6 +118,11 @@ void InitGLESBaseExtensions() {
         extensions.push_back("GL_MG_settings_string_dump");
     }
 
+    // GL_ARB_explicit_attrib_location and GL_ARB_instanced_arrays are core in GLES 3.0 and are
+    // already handled here: explicit locations survive the glslang/SPIRV-Cross shader pipeline,
+    // and glVertexAttribDivisor plus the instanced draw entry points are wired up in
+    // gl/drawing.cpp, gl/gl_native.cpp and gles/loader.cpp. Renderers that gate on the
+    // extension string rather than the GL version refuse to initialize without them.
     const char* base_exts[] = {"GL_ARB_fragment_program",
                                "GL_ARB_vertex_buffer_object",
                                "GL_ARB_vertex_array_object",
@@ -137,6 +142,8 @@ void InitGLESBaseExtensions() {
                                "GL_ARB_clear_texture",
                                "GL_ARB_get_program_binary",
                                "GL_ARB_separate_shader_objects",
+                               "GL_ARB_explicit_attrib_location",
+                               "GL_ARB_instanced_arrays",
                                "GL_ARB_multi_bind",
                                "GL_KHR_no_error"};
 
