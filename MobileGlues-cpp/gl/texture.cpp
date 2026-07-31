@@ -268,7 +268,12 @@ void internal_convert(GLenum* internal_format, GLenum* type, GLenum* format) {
         if (type) *type = GL_UNSIGNED_INT;
         break;
     case GL_DEPTH_COMPONENT32:
-        *internal_format = GL_DEPTH_COMPONENT;
+        // GLES 3.x has no 32-bit integer depth; downgrade to 24-bit sized
+        // (which all GLES 3.0+ implementations are required to support).
+        // amcl patch: previously this turned into the unsized GL_DEPTH_COMPONENT,
+        // which Maleoon 910 / GL ES 3.2 rejects with INVALID_ENUM and leaves
+        // the FBO depth attachment incomplete -> MC RenderTarget crash.
+        *internal_format = GL_DEPTH_COMPONENT24;
         if (type) *type = GL_UNSIGNED_INT;
         break;
     case GL_DEPTH_COMPONENT32F:
@@ -277,9 +282,26 @@ void internal_convert(GLenum* internal_format, GLenum* type, GLenum* format) {
     case GL_DEPTH_COMPONENT:
         LOG_D("Find GL_DEPTH_COMPONENT: internalFormat: %s, format: %s, type: %s", glEnumToString(*internal_format),
               glEnumToString(*format), glEnumToString(*type));
+        // amcl patch: route unsized GL_DEPTH_COMPONENT to a sized internal format
+        // GLES will accept. Pick by user-provided type (MC 1.20.4 RenderTarget
+        // uses GL_FLOAT here, so we end up at DEPTH_COMPONENT32F = highest
+        // fidelity). When type is NULL (glTexStorage* path) default to 24-bit.
         if (type) {
-            *internal_format = GL_DEPTH_COMPONENT;
-            *type = GL_UNSIGNED_INT;
+            switch (*type) {
+            case GL_FLOAT:
+                *internal_format = GL_DEPTH_COMPONENT32F;
+                break;
+            case GL_UNSIGNED_SHORT:
+                *internal_format = GL_DEPTH_COMPONENT16;
+                break;
+            case GL_UNSIGNED_INT:
+            default:
+                *internal_format = GL_DEPTH_COMPONENT24;
+                *type = GL_UNSIGNED_INT;
+                break;
+            }
+        } else {
+            *internal_format = GL_DEPTH_COMPONENT24;
         }
         break;
     case GL_DEPTH_STENCIL:
