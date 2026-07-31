@@ -135,8 +135,18 @@ jobs:
             exit 1
           fi
           echo "Using $formatter with $(clang-format --version)"
-          # No `|| true`: a failure of the tool itself must not be mistaken for clean formatting.
-          diff="$("$formatter" --diff --extensions c,cpp,h,hpp "${{ steps.range.outputs.base }}" HEAD)"
+          # git-clang-format exits 1 when it would reformat something, which is a result and not a
+          # failure. Capture the status explicitly so that outcome can be reported with its diff,
+          # while a genuine tool failure still fails the job instead of looking clean.
+          set +e
+          diff="$("$formatter" --diff --extensions c,cpp,h,hpp "${{ steps.range.outputs.base }}" HEAD 2>&1)"
+          status=$?
+          set -e
+          if [ "$status" -gt 1 ]; then
+            echo "$diff"
+            echo "::error::$formatter failed with status $status"
+            exit 1
+          fi
           case "$diff" in
             ""|*"no modified files to format"*|*"did not modify any files"*|*"clang-format did not modify any files"*)
               echo "Formatting clean." ;;

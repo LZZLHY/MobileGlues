@@ -8,6 +8,7 @@
 #include "DSAWrapper.h"
 #include <cassert>
 #include "../texture.h"
+#include "../../diagnostics/counters.h"
 
 #define DEBUG 0
 
@@ -257,23 +258,41 @@ void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const
         // return;
     }
 
+    const uint64_t namedStartNs = mg::diagnostics::timestamp();
+    const uint64_t uploadBytes = mg::diagnostics::non_negative_bytes(size);
+
     temporarilyBindBuffer(buffer);
     // GL_BUFFER_SIZE is immutable storage metadata rather than pipeline state, so querying it
     // does not synchronize. Use it to decide whether this buffer qualifies for the direct write.
     GLint64 bufSize = 0;
     GLES.glGetBufferParameteri64v(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &bufSize);
-    void* p = (data && bufSize >= DIRECT_MAP_MIN_SIZE)
-                  ? GLES.glMapBufferRange(GL_ARRAY_BUFFER, offset, size, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT)
-                  : nullptr;
+    void* p = nullptr;
+    if (data && bufSize >= DIRECT_MAP_MIN_SIZE) {
+        const uint64_t mapStartNs = mg::diagnostics::timestamp();
+        p = GLES.glMapBufferRange(GL_ARRAY_BUFFER, offset, size, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+        mg::diagnostics::record_direct_map_attempt(mg::diagnostics::elapsed_ns(mapStartNs));
+    }
     if (p) {
+        const uint64_t memcpyStartNs = mg::diagnostics::timestamp();
         memcpy(p, data, static_cast<size_t>(size));
+        const uint64_t memcpyNs = mg::diagnostics::elapsed_ns(memcpyStartNs);
+
+        const uint64_t unmapStartNs = mg::diagnostics::timestamp();
         GLES.glUnmapBuffer(GL_ARRAY_BUFFER);
+        // Unmap is timed separately from the copy: on a write-combined mapping the copy is CPU
+        // bound, while unmap is where the driver does its bookkeeping.
+        mg::diagnostics::record_direct_map_hit(uploadBytes, memcpyNs, mg::diagnostics::elapsed_ns(unmapStartNs));
     } else {
         // Small buffers, and any buffer that cannot be mapped, keep the synchronous path.
+        const uint64_t fallbackStartNs = mg::diagnostics::timestamp();
         glBufferSubData(GL_ARRAY_BUFFER, offset, size, data);
+        mg::diagnostics::record_fallback(uploadBytes, mg::diagnostics::elapsed_ns(fallbackStartNs));
         CHECK_GL_ERROR;
     }
     restoreTemporaryBufferBinding();
+
+    mg::diagnostics::record_named_upload(uploadBytes, bufSize > 0 ? static_cast<uint64_t>(bufSize) : 0,
+                                         mg::diagnostics::elapsed_ns(namedStartNs));
 
     LOG_D("[DSA] Buffer %u sub-data set with size %lld at offset %lld", buffer, size, offset);
 }

@@ -10,6 +10,7 @@
 #include "../gl/log.h"
 #include "../gl/envvars.h"
 #include "gpu_utils.h"
+#include "../diagnostics/counters.h"
 #include "../platform/platform.h"
 #include "../gl/getter.h"
 
@@ -142,6 +143,16 @@ void init_settings() {
     LOG_D("Is Adreno 830? = %s", is830 ? "true" : "false")
     LOG_D("Is Maleoon? = %s", isHuawei ? "true" : "false")
     LOG_D("Is ANGLE supported? = %s", isANGLESupported ? "true" : "false")
+
+    // Diagnostics counters. Environment driven rather than file driven on purpose: they are turned
+    // on for one measurement session on a device, not configured permanently.
+    int diagnosticsRequested = 0;
+    GetEnvVarInt("MG_DIAGNOSTICS", &diagnosticsRequested, 0);
+    global_settings.diagnostics = diagnosticsRequested != 0;
+    mg::diagnostics::configure(global_settings.diagnostics);
+    if (global_settings.diagnostics) {
+        LOG_I("Diagnostics counters enabled (MG_DIAGNOSTICS=%d)", diagnosticsRequested)
+    }
 
     // Identify the platform and the library that actually serves GLES once, at a severity that is
     // always emitted. Every performance report from a device starts with this line, and without it
@@ -432,6 +443,10 @@ std::string dump_settings_string(std::string prefix) {
        << ((global_settings.hide_mg_env_level == HideMGEnvLevel::Disabled)
                ? "Disabled"
                : std::to_string(static_cast<int>(global_settings.hide_mg_env_level)));
+
+    ss << "\n";
+
+    ss << prefix << "Diagnostics: " << (global_settings.diagnostics ? "True" : "False");
 
     ss << "\n";
 

@@ -8,6 +8,7 @@
 #include "buffer.h"
 #include "ankerl/unordered_dense.h"
 #include "texture.h"
+#include "../diagnostics/counters.h"
 
 #define DEBUG 0
 
@@ -753,7 +754,12 @@ void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitf
     LOG()
     if (global_settings.buffer_coherent_as_flush) access &= ~GL_MAP_FLUSH_EXPLICIT_BIT;
     //    access |= GL_MAP_UNSYNCHRONIZED_BIT;
-    return GLES.glMapBufferRange(target, offset, length, access);
+    const uint64_t startNs = mg::diagnostics::timestamp();
+    void* result = GLES.glMapBufferRange(target, offset, length, access);
+    // Mapping can block: without GL_MAP_UNSYNCHRONIZED_BIT the driver waits for readers of the
+    // range, so this is one of the places a stall hides behind a call that looks cheap.
+    mg::diagnostics::record_map(mg::diagnostics::non_negative_bytes(length), mg::diagnostics::elapsed_ns(startNs));
+    return result;
 }
 
 GLboolean glUnmapBuffer(GLenum target) {
@@ -779,7 +785,14 @@ void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfiel
 
 void glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length) {
     LOG()
-    if (!global_settings.buffer_coherent_as_flush) GLES.glFlushMappedBufferRange(target, offset, length);
+    // A coherent mapping publishes writes without cache maintenance, so the driver call is
+    // skipped. Counting the skips separately makes that visible instead of looking like a flush
+    // that silently did nothing.
+    const bool callDriver = !global_settings.buffer_coherent_as_flush;
+    const uint64_t startNs = mg::diagnostics::timestamp();
+    if (callDriver) GLES.glFlushMappedBufferRange(target, offset, length);
+    mg::diagnostics::record_flush(mg::diagnostics::non_negative_bytes(length), callDriver,
+                                  mg::diagnostics::elapsed_ns(startNs));
 }
 
 void glGenVertexArrays(GLsizei n, GLuint* arrays) {

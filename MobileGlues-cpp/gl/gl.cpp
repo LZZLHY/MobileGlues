@@ -12,6 +12,7 @@
 #include "log.h"
 #include "../gles/loader.h"
 #include "../config/settings.h"
+#include "../diagnostics/counters.h"
 #include "mg.h"
 #include "framebuffer.h"
 
@@ -129,13 +130,20 @@ void glClear(GLbitfield mask) {
     //
     // This belongs at the frame boundary rather than on the upload path. Fencing per upload
     // forces a flush that breaks tiled rendering into fragments and costs most of the frame rate.
-    if ((mask & GL_COLOR_BUFFER_BIT) != 0 && GLES.glFenceSync && GLES.glClientWaitSync) {
-        static GLsync _frameFence = nullptr;
-        if (_frameFence) {
-            GLES.glClientWaitSync(_frameFence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ULL);
-            GLES.glDeleteSync(_frameFence);
+    if ((mask & GL_COLOR_BUFFER_BIT) != 0) {
+        if (GLES.glFenceSync && GLES.glClientWaitSync) {
+            static GLsync _frameFence = nullptr;
+            if (_frameFence) {
+                const uint64_t waitStart = mg::diagnostics::timestamp();
+                const GLenum waitResult = GLES.glClientWaitSync(_frameFence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ULL);
+                mg::diagnostics::record_frame_wait(waitResult, mg::diagnostics::elapsed_ns(waitStart));
+                GLES.glDeleteSync(_frameFence);
+            }
+            _frameFence = GLES.glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         }
-        _frameFence = GLES.glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        // The colour clear is the most reliable frame boundary available here: the application
+        // performs exactly one per rendered frame, and unlike a swap it is visible to this layer.
+        mg::diagnostics::on_frame_boundary("direct-map+frame-fence");
     }
 
     if (global_settings.angle == AngleMode::Enabled && mask == GL_DEPTH_BUFFER_BIT &&

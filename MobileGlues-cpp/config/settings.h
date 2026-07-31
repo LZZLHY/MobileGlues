@@ -170,6 +170,10 @@ struct global_settings_t {
     Version custom_gl_version;
     FSR1_Quality_Preset fsr1_setting;
     HideMGEnvLevel hide_mg_env_level;
+    // Emits one aggregate record per second per GL thread for the buffer, upload and
+    // synchronization paths; see diagnostics/counters.h. Off by default, and purely observational:
+    // enabling it must never change rendering behaviour.
+    bool diagnostics;
 };
 
 extern global_settings_t global_settings;

@@ -128,6 +128,8 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
     config/config.cpp
     config/gpu_utils.cpp
     config/settings.cpp
+    diagnostics/counters.cpp
+    diagnostics/instrumented_gl.cpp
     ${MG_PLATFORM_SOURCE}
 )
 

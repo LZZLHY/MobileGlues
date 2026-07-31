@@ -10,6 +10,7 @@
 #include "glcorearb.h"
 #include "log.h"
 #include "../gles/loader.h"
+#include "../diagnostics/counters.h"
 #include "mg.h"
 #include <GLES3/gl32.h>
 
@@ -28,7 +29,7 @@ NATIVE_FUNCTION_HEAD(void, glBlendEquationSeparate, GLenum modeRGB, GLenum modeA
 NATIVE_FUNCTION_HEAD(void, glBlendFunc, GLenum sfactor, GLenum dfactor) NATIVE_FUNCTION_END_NO_RETURN(void, glBlendFunc, sfactor,dfactor)
 NATIVE_FUNCTION_HEAD(void, glBlendFuncSeparate, GLenum sfactorRGB, GLenum dfactorRGB, GLenum sfactorAlpha, GLenum dfactorAlpha) NATIVE_FUNCTION_END_NO_RETURN(void, glBlendFuncSeparate, sfactorRGB,dfactorRGB,sfactorAlpha,dfactorAlpha)
 //NATIVE_FUNCTION_HEAD(void, glBufferData, GLenum target, GLsizeiptr size, const void *data, GLenum usage) NATIVE_FUNCTION_END_NO_RETURN(void, glBufferData, target,size,data,usage)
-NATIVE_FUNCTION_HEAD(void, glBufferSubData, GLenum target, GLintptr offset, GLsizeiptr size, const void *data) NATIVE_FUNCTION_END_NO_RETURN(void, glBufferSubData, target,offset,size,data)
+// glBufferSubData is defined in diagnostics/instrumented_gl.cpp, where it is timed.
 //NATIVE_FUNCTION_HEAD(GLenum, glCheckFramebufferStatus, GLenum target) NATIVE_FUNCTION_END(GLenum, glCheckFramebufferStatus, target)
 //NATIVE_FUNCTION_HEAD(void, glClear, GLbitfield mask) NATIVE_FUNCTION_END_NO_RETURN(void, glClear, mask)
 NATIVE_FUNCTION_HEAD(void, glClearColor, GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) NATIVE_FUNCTION_END_NO_RETURN(void, glClearColor, red,green,blue,alpha)
@@ -215,7 +216,7 @@ NATIVE_FUNCTION_HEAD(void, glClearBufferiv, GLenum buffer, GLint drawbuffer, con
 NATIVE_FUNCTION_HEAD(void, glClearBufferuiv, GLenum buffer, GLint drawbuffer, const GLuint *value) NATIVE_FUNCTION_END_NO_RETURN(void, glClearBufferuiv, buffer,drawbuffer,value)
 NATIVE_FUNCTION_HEAD(void, glClearBufferfv, GLenum buffer, GLint drawbuffer, const GLfloat *value) NATIVE_FUNCTION_END_NO_RETURN(void, glClearBufferfv, buffer,drawbuffer,value)
 NATIVE_FUNCTION_HEAD(void, glClearBufferfi, GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil) NATIVE_FUNCTION_END_NO_RETURN(void, glClearBufferfi, buffer,drawbuffer,depth,stencil)
-NATIVE_FUNCTION_HEAD(void, glCopyBufferSubData, GLenum readTarget, GLenum writeTarget, GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size) NATIVE_FUNCTION_END_NO_RETURN(void, glCopyBufferSubData, readTarget,writeTarget,readOffset,writeOffset,size)
+// glCopyBufferSubData is defined in diagnostics/instrumented_gl.cpp, where it is timed.
 NATIVE_FUNCTION_HEAD(void, glGetUniformIndices, GLuint program, GLsizei uniformCount, const GLchar *const*uniformNames, GLuint *uniformIndices) NATIVE_FUNCTION_END_NO_RETURN(void, glGetUniformIndices, program,uniformCount,uniformNames,uniformIndices)
 NATIVE_FUNCTION_HEAD(void, glGetActiveUniformsiv, GLuint program, GLsizei uniformCount, const GLuint *uniformIndices, GLenum pname, GLint *params) NATIVE_FUNCTION_END_NO_RETURN(void, glGetActiveUniformsiv, program,uniformCount,uniformIndices,pname,params)
 NATIVE_FUNCTION_HEAD(GLuint, glGetUniformBlockIndex, GLuint program, const GLchar *uniformBlockName) NATIVE_FUNCTION_END(GLuint, glGetUniformBlockIndex, program,uniformBlockName)
@@ -227,7 +228,7 @@ NATIVE_FUNCTION_HEAD(void, glDrawArraysInstanced, GLenum mode, GLint first, GLsi
 NATIVE_FUNCTION_HEAD(GLsync, glFenceSync, GLenum condition, GLbitfield flags) NATIVE_FUNCTION_END(GLsync, glFenceSync, condition,flags)
 NATIVE_FUNCTION_HEAD(GLboolean, glIsSync, GLsync sync) NATIVE_FUNCTION_END(GLboolean, glIsSync, sync)
 NATIVE_FUNCTION_HEAD(void, glDeleteSync, GLsync sync) NATIVE_FUNCTION_END_NO_RETURN(void, glDeleteSync, sync)
-NATIVE_FUNCTION_HEAD(GLenum, glClientWaitSync, GLsync sync, GLbitfield flags, GLuint64 timeout) NATIVE_FUNCTION_END(GLenum, glClientWaitSync, sync,flags,timeout)
+// glClientWaitSync is defined in diagnostics/instrumented_gl.cpp, where it is timed.
 NATIVE_FUNCTION_HEAD(void, glWaitSync, GLsync sync, GLbitfield flags, GLuint64 timeout) NATIVE_FUNCTION_END_NO_RETURN(void, glWaitSync, sync,flags,timeout)
 NATIVE_FUNCTION_HEAD(void, glGetInteger64v, GLenum pname, GLint64 *data) NATIVE_FUNCTION_END_NO_RETURN(void, glGetInteger64v, pname,data)
 NATIVE_FUNCTION_HEAD(void, glGetSynciv, GLsync sync, GLenum pname, GLsizei bufSize, GLsizei *length, GLint *values) NATIVE_FUNCTION_END_NO_RETURN(void, glGetSynciv, sync,pname,bufSize,length,values)
