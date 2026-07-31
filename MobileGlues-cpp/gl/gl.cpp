@@ -119,6 +119,20 @@ void glClear(GLbitfield mask) {
 
     CHECK_GL_ERROR_NO_INIT
 
+    // AMCL 2026-06-29 花屏修复：glNamedBufferSubData 走 UNSYNCHRONIZED 直写映射（高帧路径），但会与在途
+    // 绘制竞争——上一帧还在读 dest 的某区域时，本帧已用新地形覆盖它 → 移动时方块闪烁。这里在**帧边界**
+    // （每帧的 color clear）用栅栏把 GPU 落后限制在 1 帧：等上一帧的栅栏完成、再插入本帧栅栏。这样新一帧
+    // 的直写不会覆盖更早帧仍在读取的数据，同时保留 CPU/GPU 1 帧重叠（不像每帧 glFinish 那样杀帧）。
+    // 放帧边界而非上传路径：上传路径里逐次 fence 的 flush 会打断 tile 分块渲染、把帧率打到个位数。
+    if ((mask & GL_COLOR_BUFFER_BIT) != 0 && GLES.glFenceSync && GLES.glClientWaitSync) {
+        static GLsync _frameFence = nullptr;
+        if (_frameFence) {
+            GLES.glClientWaitSync(_frameFence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ULL);
+            GLES.glDeleteSync(_frameFence);
+        }
+        _frameFence = GLES.glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    }
+
     if (global_settings.angle == AngleMode::Enabled && mask == GL_DEPTH_BUFFER_BIT &&
         std::fabs(currentDepthValue - 1.0f) <= 0.001f && framebuffers[current_draw_fbo].color_attachments_all_none) {
         LOG_D("doing depth workaround")

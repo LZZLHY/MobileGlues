@@ -111,42 +111,54 @@ GLenum GetBindingQuery(GLenum target, bool forceTexture = false) {
 
 // buffer
 static thread_local ankerl::unordered_dense::map<GLenum, std::vector<GLuint>> bufferBindingStack;
+//
+// 性能关键路径（AMCL 2026-06-04）。
+//
+// 旧实现每次都 `glGetIntegerv(binding, &prev)` 向驱动查询当前绑定。在移动 tile GPU
+// (Maleoon 910) 上 glGet* 会强制管线同步/刷新；而 MC 26.2 起的新地形上传器
+// (SectionRenderDispatcher.uploadTerrainBuffersToGpu → UberGpuBuffer → StagingBuffer$Cpu →
+//  DSA glNamedBufferSubData) 每帧经本路径调用成千上万次 → gpu-work 线程 CPU 被打满、
+// 帧率跌到个位数（1.21.x/26.1 走旧渲染器无此热路径，故 60fps 正常）。真机线程级 profile
+// 实锤 Render 线程阻塞在 nglNamedBufferSubData。
+//
+// 修复：MobileGlues 自身已在 glBindBuffer 里用 g_bound_buffers_arr 影子跟踪每个 target 的
+// 当前绑定，改用 find_bound_buffer() 查询 —— 零驱动往返、无同步。附带两点收益：
+//   1) find_bound_buffer 返回“虚拟(fake) buffer id”，与配套 glBindBuffer(还原) 期望的入参
+//      一致；旧代码用 glGetIntegerv 拿到的是真实 GLES id，还原时被当 fake id 处理，本是潜在错误。
+//   2) prev==bufferID 时直接跳过冗余重绑定（旧代码无条件重绑 + 还原），并修复旧实现里
+//      “prev==bufferID 时压入两个栈项、还原只弹一项”导致的栈泄漏。
 void temporarilyBindBuffer(GLuint bufferID, GLenum target = GL_ARRAY_BUFFER) {
-    GLenum bindingQuery = GetBindingQuery(target);
-    GLint prev = 0;
-    glGetIntegerv(bindingQuery, &prev);
+    GLuint prev = find_bound_buffer(GetBindingQuery(target));
     if (prev == bufferID) {
-        bufferBindingStack[target].push_back(-1);
-        // return;
+        // 已绑定到目标 buffer：压 -1 哨兵表示“无需还原”，跳过重复绑定。
+        bufferBindingStack[target].push_back(static_cast<GLuint>(-1));
+        LOG_D("[DSA] [TempBind] target=0x%X already bound to %u, skip", target, bufferID);
+        return;
     }
-    bufferBindingStack[target].push_back(static_cast<GLuint>(prev));
-
+    bufferBindingStack[target].push_back(prev);
     LOG_D("[DSA] [TempBind] target=0x%X, prev=%u -> bind=%u", target, prev, bufferID);
-    CHECK_GL_ERROR;
     glBindBuffer(target, bufferID);
-    CHECK_GL_ERROR_NO_INIT;
+    CHECK_GL_ERROR;
 }
 void restoreTemporaryBufferBinding(GLenum target = GL_ARRAY_BUFFER) {
     auto it = bufferBindingStack.find(target);
     if (it == bufferBindingStack.end() || it->second.empty()) {
         LOG_D("[DSA] [Restore] no saved binding for target 0x%X", target);
-        // return;
+        return;
     }
 
     GLuint toRestore = it->second.back();
     it->second.pop_back();
+    if (it->second.empty()) bufferBindingStack.erase(it);
 
     if (toRestore == static_cast<GLuint>(-1)) {
         LOG_D("[DSA] [Restore] target=0x%X, no binding to restore", target);
-        // return;
+        return;
     }
 
     LOG_D("[DSA] [Restore] target=0x%X, bind back to %u", target, toRestore);
-    CHECK_GL_ERROR;
     glBindBuffer(target, toRestore);
-    CHECK_GL_ERROR_NO_INIT;
-
-    if (it->second.empty()) bufferBindingStack.erase(it);
+    CHECK_GL_ERROR;
 }
 
 void glCreateBuffers(GLsizei n, GLuint* buffers) {
@@ -209,6 +221,20 @@ void glNamedBufferData(GLuint buffer, GLsizeiptr size, const void* data, GLenum 
     LOG_D("[DSA] Buffer %u data set with size %lld", buffer, size);
 }
 
+// AMCL 2026-06-29 终解：MC 26.x 地形 uber buffer 被 MG 强制为 COHERENT|PERSISTENT（DYNAMIC_STORAGE
+// + coherent_as_flush），普通 glBufferSubData 对它会隐式同步阻塞（真机 ~1300ms/s，原版个位数帧）。
+// staging 环 + glCopyBufferSubData 更糟：copy 要**读取一致性(非缓存/写合并)内存**，带宽仅 ~4-7MB/s。
+// 正解：直接把 MC 的（缓存内存中的）源数据 memcpy 进 dest 自己的映射——缓存读 + 写合并写，单次拷贝，
+// 实测 0-7ms/s，是真正的高帧路径。用 UNSYNCHRONIZED 映射避免隐式同步阻塞。
+// 注意：UNSYNCHRONIZED 不与驱动做写后读同步，会与在途绘制竞争导致花屏；该竞争由 gl.cpp::glClear 帧边界
+// 处的栅栏（把 GPU 落后限制在 1 帧）消除，二者配套使用，缺一不可。
+//
+// 但 UNSYNCHRONIZED 直写只对**每帧仅绘制一次**的大 buffer（地形 uber buffer，128/32MB）安全——帧边界
+// 栅栏只挡跨帧竞争。GUI 物品图标 / 手部·实体模型走的是**同一帧内反复复用的小动态 buffer**，会发生帧栅栏
+// 挡不住的**帧内**写后读竞争 → 物品栏错乱/手部花屏（MC 26.1.2 实测）。故仅对 >= 16MB 的大 buffer 走直写，
+// 其余小 buffer 保持原始同步 glBufferSubData（小 buffer 上传量本就不是瓶颈——1.21.x/26.1 同步路径即 60fps）。
+static const GLsizeiptr AMCL_DIRECT_MAP_MIN_SIZE = 16 * 1024 * 1024;
+
 void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const void* data) {
     LOG()
     LOG_D("[DSA] glNamedBufferSubData, buffer: %u, offset: %lld, size: %lld, data: %p", buffer, offset, size, data);
@@ -217,9 +243,22 @@ void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const
         LOG_W("[DSA] Invalid parameters for glNamedBufferSubData");
         // return;
     }
+
     temporarilyBindBuffer(buffer);
-    glBufferSubData(GL_ARRAY_BUFFER, offset, size, data);
-    CHECK_GL_ERROR;
+    // GL_BUFFER_SIZE 是不可变存储元数据（非 GPU 管线状态），查询不触发同步；据此只对大 buffer 走直写。
+    GLint64 bufSize = 0;
+    GLES.glGetBufferParameteri64v(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &bufSize);
+    void* p = (data && bufSize >= AMCL_DIRECT_MAP_MIN_SIZE)
+                  ? GLES.glMapBufferRange(GL_ARRAY_BUFFER, offset, size, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT)
+                  : nullptr;
+    if (p) {
+        memcpy(p, data, static_cast<size_t>(size));
+        GLES.glUnmapBuffer(GL_ARRAY_BUFFER);
+    } else {
+        // 小 buffer（GUI/手部/实体）或不可映射的 buffer：走原始同步路径（正确，且非性能瓶颈）。
+        glBufferSubData(GL_ARRAY_BUFFER, offset, size, data);
+        CHECK_GL_ERROR;
+    }
     restoreTemporaryBufferBinding();
 
     LOG_D("[DSA] Buffer %u sub-data set with size %lld at offset %lld", buffer, size, offset);
