@@ -10,6 +10,7 @@
 #include "../gl/log.h"
 #include "../gl/envvars.h"
 #include "gpu_utils.h"
+#include "../platform/platform.h"
 #include "../gl/getter.h"
 
 #define DEBUG 0
@@ -131,6 +132,7 @@ void init_settings() {
     int is730 = isAdreno730(gpu_cstr);
     int is740 = isAdreno740(gpu_cstr);
     int is830 = isAdreno830(gpu_cstr);
+    int isHuawei = isMaleoon(gpu_cstr);
     bool isANGLESupported = checkIfANGLESupported(gpu_cstr);
 
     LOG_D("Has Vulkan 1.2? = %s", hasVk12 ? "true" : "false")
@@ -138,7 +140,18 @@ void init_settings() {
     LOG_D("Is Adreno 730? = %s", is730 ? "true" : "false")
     LOG_D("Is Adreno 740? = %s", is740 ? "true" : "false")
     LOG_D("Is Adreno 830? = %s", is830 ? "true" : "false")
+    LOG_D("Is Maleoon? = %s", isHuawei ? "true" : "false")
     LOG_D("Is ANGLE supported? = %s", isANGLESupported ? "true" : "false")
+
+    // Identify the platform and the library that actually serves GLES once, at a severity that is
+    // always emitted. Every performance report from a device starts with this line, and without it
+    // there is no way to tell a vendor driver apart from a translation layer after the fact.
+    {
+        const std::string driverLibrary = getGLDriverLibrary();
+        LOG_I("Platform = %s, renderer = %s, GLES provider = %s", mg::platform::name(),
+              gpu_cstr && *gpu_cstr ? gpu_cstr : "(unknown)",
+              driverLibrary.empty() ? "(unknown)" : driverLibrary.c_str())
+    }
 
     switch (angleConfig) {
     case AngleConfig::ForceDisable:

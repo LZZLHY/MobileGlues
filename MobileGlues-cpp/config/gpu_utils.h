@@ -13,6 +13,15 @@
 
 std::string getGPUInfo();
 
+// Filesystem path of the shared object that actually provides the GLES entry points, resolved
+// from a loaded symbol rather than from a name guess.
+//
+// The renderer string alone does not say what is underneath: the same string appears whether GLES
+// is served by the vendor driver, by a translation layer such as ANGLE, or by a software
+// implementation, and those have very different performance characteristics. Knowing the library
+// makes a device log self-describing. Returns an empty string when it cannot be determined.
+std::string getGLDriverLibrary();
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -25,6 +34,10 @@ extern "C"
     int isAdreno740(const char* gpu);
 
     int isAdreno830(const char* gpu);
+
+    // Huawei Maleoon, the GPU in HarmonyOS NEXT devices. Reported so that behaviour which depends
+    // on the driver underneath can be selected explicitly instead of being assumed.
+    int isMaleoon(const char* gpu);
 
     int hasVulkan12();
 

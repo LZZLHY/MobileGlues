@@ -163,6 +163,29 @@ int isAdreno830(const char* gpu) {
     return isAdreno(gpu) && (strstr(gpu, "830") != nullptr);
 }
 
+int isMaleoon(const char* gpu) {
+    if (!gpu) return 0;
+    return strstr(gpu, "Maleoon") != nullptr;
+}
+
+std::string getGLDriverLibrary() {
+    void* glesLib = open_lib(gles3_lib, nullptr);
+    if (!glesLib) return std::string();
+
+    // dladdr on a resolved entry point reports the object that actually defines it, which is the
+    // real provider even when the name that was opened is a stub or a symlink chain.
+    void* symbol = dlsym(glesLib, "glGetString");
+    std::string path;
+    if (symbol) {
+        Dl_info info{};
+        if (dladdr(symbol, &info) != 0 && info.dli_fname) {
+            path = info.dli_fname;
+        }
+    }
+    dlclose(glesLib);
+    return path;
+}
+
 static std::optional<int> hasVk12;
 int hasVulkan12() {
     if (hasVk12.has_value()) return hasVk12.value();
