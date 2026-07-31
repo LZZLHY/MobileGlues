@@ -119,6 +119,25 @@ void glClear(GLbitfield mask) {
 
     CHECK_GL_ERROR_NO_INIT
 
+    // glNamedBufferSubData writes large buffers through an UNSYNCHRONIZED mapping, which races
+    // draws that are still in flight: the previous frame may still be reading a range that this
+    // frame has already overwritten with new terrain, which shows up as flickering geometry
+    // while moving. Bounding the GPU to one frame behind at the frame boundary removes that
+    // race: wait for the previous frame's fence, then insert this frame's. A new frame's direct
+    // write can then no longer overwrite data an earlier frame is still reading, while CPU and
+    // GPU still overlap by one frame, unlike a per-frame glFinish.
+    //
+    // This belongs at the frame boundary rather than on the upload path. Fencing per upload
+    // forces a flush that breaks tiled rendering into fragments and costs most of the frame rate.
+    if ((mask & GL_COLOR_BUFFER_BIT) != 0 && GLES.glFenceSync && GLES.glClientWaitSync) {
+        static GLsync _frameFence = nullptr;
+        if (_frameFence) {
+            GLES.glClientWaitSync(_frameFence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ULL);
+            GLES.glDeleteSync(_frameFence);
+        }
+        _frameFence = GLES.glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    }
+
     if (global_settings.angle == AngleMode::Enabled && mask == GL_DEPTH_BUFFER_BIT &&
         std::fabs(currentDepthValue - 1.0f) <= 0.001f && framebuffers[current_draw_fbo].color_attachments_all_none) {
         LOG_D("doing depth workaround")

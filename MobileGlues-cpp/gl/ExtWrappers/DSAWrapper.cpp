@@ -111,42 +111,57 @@ GLenum GetBindingQuery(GLenum target, bool forceTexture = false) {
 
 // buffer
 static thread_local ankerl::unordered_dense::map<GLenum, std::vector<GLuint>> bufferBindingStack;
+//
+// Hot path.
+//
+// This used to ask the driver for the current binding with glGetIntegerv(binding, &prev) on
+// every call. On a mobile tile GPU, glGet* forces a pipeline flush, and since Minecraft 26.2
+// the terrain uploader (SectionRenderDispatcher.uploadTerrainBuffersToGpu -> UberGpuBuffer ->
+// StagingBuffer$Cpu -> DSA glNamedBufferSubData) reaches this path thousands of times per
+// frame, which saturates the GPU worker thread and drops the frame rate to single digits.
+// Older versions use the previous renderer and never hit this path, which is why they are
+// unaffected. Thread-level profiling on device showed the render thread stuck inside
+// nglNamedBufferSubData.
+//
+// MobileGlues already shadows the current binding per target in glBindBuffer, so query that
+// instead: no driver round trip and no synchronization. Two further consequences:
+//   1) find_bound_buffer() returns the fake buffer id, which is what the matching
+//      glBindBuffer() restore call expects. glGetIntegerv returned the real GLES id, which
+//      was then restored as if it were a fake id.
+//   2) A redundant rebind is skipped when the buffer is already bound. That also fixes the
+//      stack leak in the old code, which pushed two entries in that case but popped one.
 void temporarilyBindBuffer(GLuint bufferID, GLenum target = GL_ARRAY_BUFFER) {
-    GLenum bindingQuery = GetBindingQuery(target);
-    GLint prev = 0;
-    glGetIntegerv(bindingQuery, &prev);
+    GLuint prev = find_bound_buffer(GetBindingQuery(target));
     if (prev == bufferID) {
-        bufferBindingStack[target].push_back(-1);
-        // return;
+        // Already bound: push a sentinel meaning "nothing to restore" and skip the rebind.
+        bufferBindingStack[target].push_back(static_cast<GLuint>(-1));
+        LOG_D("[DSA] [TempBind] target=0x%X already bound to %u, skip", target, bufferID);
+        return;
     }
-    bufferBindingStack[target].push_back(static_cast<GLuint>(prev));
-
+    bufferBindingStack[target].push_back(prev);
     LOG_D("[DSA] [TempBind] target=0x%X, prev=%u -> bind=%u", target, prev, bufferID);
-    CHECK_GL_ERROR;
     glBindBuffer(target, bufferID);
-    CHECK_GL_ERROR_NO_INIT;
+    CHECK_GL_ERROR;
 }
 void restoreTemporaryBufferBinding(GLenum target = GL_ARRAY_BUFFER) {
     auto it = bufferBindingStack.find(target);
     if (it == bufferBindingStack.end() || it->second.empty()) {
         LOG_D("[DSA] [Restore] no saved binding for target 0x%X", target);
-        // return;
+        return;
     }
 
     GLuint toRestore = it->second.back();
     it->second.pop_back();
+    if (it->second.empty()) bufferBindingStack.erase(it);
 
     if (toRestore == static_cast<GLuint>(-1)) {
         LOG_D("[DSA] [Restore] target=0x%X, no binding to restore", target);
-        // return;
+        return;
     }
 
     LOG_D("[DSA] [Restore] target=0x%X, bind back to %u", target, toRestore);
-    CHECK_GL_ERROR;
     glBindBuffer(target, toRestore);
-    CHECK_GL_ERROR_NO_INIT;
-
-    if (it->second.empty()) bufferBindingStack.erase(it);
+    CHECK_GL_ERROR;
 }
 
 void glCreateBuffers(GLsizei n, GLuint* buffers) {
@@ -209,6 +224,30 @@ void glNamedBufferData(GLuint buffer, GLsizeiptr size, const void* data, GLenum 
     LOG_D("[DSA] Buffer %u data set with size %lld", buffer, size);
 }
 
+// The Minecraft 26.x terrain uber buffer is requested with GL_DYNAMIC_STORAGE_BIT and, with
+// buffer_coherent_as_flush enabled, is promoted to COHERENT | PERSISTENT storage. A plain
+// glBufferSubData into that buffer blocks on an implicit synchronization, measured at roughly
+// 1300 ms per second on device, i.e. single-digit frame rates. Routing it through a staging
+// buffer and glCopyBufferSubData is worse still, because the copy has to *read* coherent
+// write-combined memory at only a few megabytes per second.
+//
+// Copying the caller's cached source bytes straight into the destination's own mapping is a
+// cached read plus a write-combined write, one copy, measured at 0-7 ms per second. The
+// mapping is UNSYNCHRONIZED so that it does not block on the implicit synchronization.
+//
+// UNSYNCHRONIZED means the driver performs no write-after-read synchronization, so the write
+// races draws that are still in flight. That race is bounded by the frame-boundary fence in
+// gl.cpp glClear, which keeps the GPU at most one frame behind. Neither part is correct
+// without the other.
+//
+// The direct write is only safe for large buffers that are drawn once per frame, such as the
+// terrain uber buffer. Small dynamic buffers reused several times within one frame - GUI item
+// icons, the held item, entity models - hit a write-after-read race inside a single frame,
+// which a frame-boundary fence cannot prevent, and render corrupted. So only buffers at or
+// above the threshold below take the direct path; everything else keeps the original
+// synchronous glBufferSubData, whose upload volume was never the bottleneck.
+static const GLsizeiptr DIRECT_MAP_MIN_SIZE = 16 * 1024 * 1024;
+
 void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const void* data) {
     LOG()
     LOG_D("[DSA] glNamedBufferSubData, buffer: %u, offset: %lld, size: %lld, data: %p", buffer, offset, size, data);
@@ -217,9 +256,23 @@ void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const
         LOG_W("[DSA] Invalid parameters for glNamedBufferSubData");
         // return;
     }
+
     temporarilyBindBuffer(buffer);
-    glBufferSubData(GL_ARRAY_BUFFER, offset, size, data);
-    CHECK_GL_ERROR;
+    // GL_BUFFER_SIZE is immutable storage metadata rather than pipeline state, so querying it
+    // does not synchronize. Use it to decide whether this buffer qualifies for the direct write.
+    GLint64 bufSize = 0;
+    GLES.glGetBufferParameteri64v(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &bufSize);
+    void* p = (data && bufSize >= DIRECT_MAP_MIN_SIZE)
+                  ? GLES.glMapBufferRange(GL_ARRAY_BUFFER, offset, size, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT)
+                  : nullptr;
+    if (p) {
+        memcpy(p, data, static_cast<size_t>(size));
+        GLES.glUnmapBuffer(GL_ARRAY_BUFFER);
+    } else {
+        // Small buffers, and any buffer that cannot be mapped, keep the synchronous path.
+        glBufferSubData(GL_ARRAY_BUFFER, offset, size, data);
+        CHECK_GL_ERROR;
+    }
     restoreTemporaryBufferBinding();
 
     LOG_D("[DSA] Buffer %u sub-data set with size %lld at offset %lld", buffer, size, offset);
