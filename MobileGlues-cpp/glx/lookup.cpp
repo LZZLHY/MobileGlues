@@ -19,8 +19,25 @@
 
 #define DEBUG 0
 
-bool osmesaZinkMode();
-void* osmesaGetProcAddress(const char* name);
+// Optional host interface.
+//
+// A host application may drive a real desktop GL implementation, such as OSMesa with the Zink
+// Gallium driver, instead of this translation layer. When it does, GL entry points must come from
+// there rather than from here. The host opts in by exporting these two C symbols:
+//
+//   int   mg_host_osmesa_zink_mode(void);              non-zero while that mode is active
+//   void* mg_host_osmesa_get_proc_address(const char*); resolves one GL entry point, or null
+//
+// They are looked up at runtime rather than referenced at link time, deliberately. MobileGlues
+// cannot define them, and an undefined reference is not portable: ELF tolerates it in a shared
+// object, Mach-O rejects it, and neither weak nor weak_import declarations made the standalone
+// Apple build link. Resolving by name has no link-time dependency at all, so the library builds
+// alone on every platform and the interface stays inert when nothing provides it.
+extern "C"
+{
+    typedef int (*MgHostZinkModeFn)(void);
+    typedef void* (*MgHostGetProcAddressFn)(const char*);
+}
 
 std::string handle_multidraw_func_name(std::string name) {
     std::string namestr = name;
@@ -54,12 +71,64 @@ std::string handle_multidraw_func_name(std::string name) {
     return namestr;
 }
 
+namespace {
+
+    // Handle scoped to this shared object. Used for the host hooks below, and for the same reason
+    // the GL lookup prefers it: the global scope can contain a different definition of a name this
+    // library also provides.
+    void* mg_self_handle() {
+        static void* handle = nullptr;
+        static bool resolved = false;
+        if (!resolved) {
+            resolved = true;
+            Dl_info info{};
+            if (dladdr(reinterpret_cast<const void*>(&glXGetProcAddress), &info) && info.dli_fname) {
+                handle = dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+                if (!handle) handle = dlopen(info.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+            }
+        }
+        return handle;
+    }
+
+    void* mg_lookup_optional_symbol(const char* name) {
+        void* symbol = nullptr;
+        if (void* self = mg_self_handle()) symbol = dlsym(self, name);
+        if (!symbol) symbol = dlsym(RTLD_DEFAULT, name);
+        return symbol;
+    }
+
+    // Resolved once. A host either provides both hooks or neither is usable, so they are treated
+    // as one unit.
+    bool host_drives_desktop_gl() {
+        static MgHostZinkModeFn zink_mode = nullptr;
+        static bool resolved = false;
+        if (!resolved) {
+            resolved = true;
+            zink_mode = reinterpret_cast<MgHostZinkModeFn>(mg_lookup_optional_symbol("mg_host_osmesa_zink_mode"));
+        }
+        return zink_mode != nullptr && zink_mode() != 0;
+    }
+
+    void* host_get_proc_address(const char* name) {
+        static MgHostGetProcAddressFn get_proc = nullptr;
+        static bool resolved = false;
+        if (!resolved) {
+            resolved = true;
+            get_proc =
+                reinterpret_cast<MgHostGetProcAddressFn>(mg_lookup_optional_symbol("mg_host_osmesa_get_proc_address"));
+        }
+        return get_proc ? get_proc(name) : nullptr;
+    }
+
+} // namespace
+
 void* glXGetProcAddress(const char* name) {
     LOG()
-    // Zink/OSMesa uses a real desktop GL implementation. Resolve the original
-    // function name before MobileGlues applies GLES emulation name rewriting.
-    if (osmesaZinkMode()) {
-        void* proc = osmesaGetProcAddress(name);
+    // When the host drives a real desktop GL implementation, resolve the original function name
+    // there before MobileGlues applies its GLES emulation name rewriting: that rewriting exists to
+    // emulate entry points GLES lacks, which a desktop implementation provides natively.
+    if (host_drives_desktop_gl()) {
+        void* proc = host_get_proc_address(name);
         if (proc) return proc;
     }
     std::string real_func_name = handle_multidraw_func_name(std::string(name));
