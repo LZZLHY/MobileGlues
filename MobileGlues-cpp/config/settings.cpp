@@ -102,10 +102,13 @@ void init_settings() {
     GetEnvVarInt("ZALITH_VERSION_CODE", &zlVersion, 0);
     int pgwVersion = 0;
     GetEnvVarInt("PGW_VERSION_CODE", &pgwVersion, 0);
+    int amclVersion = 0;
+    GetEnvVarInt("AMCL_VERSION_CODE", &amclVersion, 0);
 
     LOG_V("MG_DIR_PATH = %s", mg_directory_path ? mg_directory_path : "(default)")
 
-    if (isInPluginApp == 0 && fclVersion == 0 && zlVersion == 0 && pgwVersion == 0 && !is_custom_mg_dir) {
+    if (isInPluginApp == 0 && fclVersion == 0 && zlVersion == 0 && pgwVersion == 0 && amclVersion == 0 &&
+        !is_custom_mg_dir) {
         LOG_V("Unsupported launcher detected, force using default config.")
         angleConfig = AngleConfig::DisableIfPossible;
         noErrorConfig = NoErrorConfig::Auto;
