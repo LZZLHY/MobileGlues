@@ -137,6 +137,19 @@ void InitGLESBaseExtensions() {
                                "GL_ARB_clear_texture",
                                "GL_ARB_get_program_binary",
                                "GL_ARB_separate_shader_objects",
+                               // amcl patch (0006): advertise two extensions whose
+                               // functionality is core in GLES 3.0+ and already
+                               // implemented/forwarded by MG. Some mods' renderers
+                               // (e.g. Quartz / Phosphophyllite in ATM8) hard-gate on
+                               // these GLCapabilities and crash at window init if absent.
+                               //  - GL_ARB_explicit_attrib_location: layout(location=) in
+                               //    GLSL, native in ESSL 300+; MG's glslang/SPIRV-Cross
+                               //    shader pipeline preserves explicit locations.
+                               //  - GL_ARB_instanced_arrays: glVertexAttribDivisor +
+                               //    glDraw*Instanced, all GLES 3.0 core and already wired
+                               //    in MG (gl/drawing.cpp, gl_native.cpp, gles/loader.cpp).
+                               "GL_ARB_explicit_attrib_location",
+                               "GL_ARB_instanced_arrays",
                                "GL_ARB_multi_bind",
                                "GL_KHR_no_error"};
 
