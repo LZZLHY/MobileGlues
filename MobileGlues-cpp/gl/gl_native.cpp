@@ -11,6 +11,8 @@
 #include "log.h"
 #include "../gles/loader.h"
 #include "mg.h"
+#include "amcl_buffer_perf.h"
+#include "buffer.h"
 #include <GLES3/gl32.h>
 
 #define DEBUG 0
@@ -28,7 +30,17 @@ NATIVE_FUNCTION_HEAD(void, glBlendEquationSeparate, GLenum modeRGB, GLenum modeA
 NATIVE_FUNCTION_HEAD(void, glBlendFunc, GLenum sfactor, GLenum dfactor) NATIVE_FUNCTION_END_NO_RETURN(void, glBlendFunc, sfactor,dfactor)
 NATIVE_FUNCTION_HEAD(void, glBlendFuncSeparate, GLenum sfactorRGB, GLenum dfactorRGB, GLenum sfactorAlpha, GLenum dfactorAlpha) NATIVE_FUNCTION_END_NO_RETURN(void, glBlendFuncSeparate, sfactorRGB,dfactorRGB,sfactorAlpha,dfactorAlpha)
 //NATIVE_FUNCTION_HEAD(void, glBufferData, GLenum target, GLsizeiptr size, const void *data, GLenum usage) NATIVE_FUNCTION_END_NO_RETURN(void, glBufferData, target,size,data,usage)
-NATIVE_FUNCTION_HEAD(void, glBufferSubData, GLenum target, GLintptr offset, GLsizeiptr size, const void *data) NATIVE_FUNCTION_END_NO_RETURN(void, glBufferSubData, target,offset,size,data)
+#if !defined(__APPLE__)
+extern "C" GLAPI GLAPIENTRY void glBufferSubDataARB(GLenum target, GLintptr offset, GLsizeiptr size, const void* data)
+    __attribute__((alias("glBufferSubData")));
+#endif
+extern "C" GLAPI GLAPIENTRY void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void* data) {
+    LOG_D("Use native function: %s @ %s(...)", RENDERERNAME, __FUNCTION__);
+    const uint64_t startNs = amcl::mgperf::nowNs();
+    GLES.glBufferSubData(target, offset, size, data);
+    amcl::mgperf::recordSubData(amcl::mgperf::nonNegativeBytes(size), amcl::mgperf::nowNs() - startNs);
+    CHECK_GL_ERROR
+}
 //NATIVE_FUNCTION_HEAD(GLenum, glCheckFramebufferStatus, GLenum target) NATIVE_FUNCTION_END(GLenum, glCheckFramebufferStatus, target)
 //NATIVE_FUNCTION_HEAD(void, glClear, GLbitfield mask) NATIVE_FUNCTION_END_NO_RETURN(void, glClear, mask)
 NATIVE_FUNCTION_HEAD(void, glClearColor, GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) NATIVE_FUNCTION_END_NO_RETURN(void, glClearColor, red,green,blue,alpha)
@@ -215,7 +227,21 @@ NATIVE_FUNCTION_HEAD(void, glClearBufferiv, GLenum buffer, GLint drawbuffer, con
 NATIVE_FUNCTION_HEAD(void, glClearBufferuiv, GLenum buffer, GLint drawbuffer, const GLuint *value) NATIVE_FUNCTION_END_NO_RETURN(void, glClearBufferuiv, buffer,drawbuffer,value)
 NATIVE_FUNCTION_HEAD(void, glClearBufferfv, GLenum buffer, GLint drawbuffer, const GLfloat *value) NATIVE_FUNCTION_END_NO_RETURN(void, glClearBufferfv, buffer,drawbuffer,value)
 NATIVE_FUNCTION_HEAD(void, glClearBufferfi, GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil) NATIVE_FUNCTION_END_NO_RETURN(void, glClearBufferfi, buffer,drawbuffer,depth,stencil)
-NATIVE_FUNCTION_HEAD(void, glCopyBufferSubData, GLenum readTarget, GLenum writeTarget, GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size) NATIVE_FUNCTION_END_NO_RETURN(void, glCopyBufferSubData, readTarget,writeTarget,readOffset,writeOffset,size)
+#if !defined(__APPLE__)
+extern "C" GLAPI GLAPIENTRY void glCopyBufferSubDataARB(GLenum readTarget, GLenum writeTarget, GLintptr readOffset,
+                                                           GLintptr writeOffset, GLsizeiptr size)
+    __attribute__((alias("glCopyBufferSubData")));
+#endif
+extern "C" GLAPI GLAPIENTRY void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOffset,
+                                                        GLintptr writeOffset, GLsizeiptr size) {
+    LOG_D("Use native function: %s @ %s(...)", RENDERERNAME, __FUNCTION__);
+    const uint64_t startNs = amcl::mgperf::nowNs();
+    if (!tryMappedStagingBufferUpload(readTarget, writeTarget, readOffset, writeOffset, size)) {
+        GLES.glCopyBufferSubData(readTarget, writeTarget, readOffset, writeOffset, size);
+    }
+    amcl::mgperf::recordCopy(amcl::mgperf::nonNegativeBytes(size), amcl::mgperf::nowNs() - startNs);
+    CHECK_GL_ERROR
+}
 NATIVE_FUNCTION_HEAD(void, glGetUniformIndices, GLuint program, GLsizei uniformCount, const GLchar *const*uniformNames, GLuint *uniformIndices) NATIVE_FUNCTION_END_NO_RETURN(void, glGetUniformIndices, program,uniformCount,uniformNames,uniformIndices)
 NATIVE_FUNCTION_HEAD(void, glGetActiveUniformsiv, GLuint program, GLsizei uniformCount, const GLuint *uniformIndices, GLenum pname, GLint *params) NATIVE_FUNCTION_END_NO_RETURN(void, glGetActiveUniformsiv, program,uniformCount,uniformIndices,pname,params)
 NATIVE_FUNCTION_HEAD(GLuint, glGetUniformBlockIndex, GLuint program, const GLchar *uniformBlockName) NATIVE_FUNCTION_END(GLuint, glGetUniformBlockIndex, program,uniformBlockName)
@@ -224,10 +250,32 @@ NATIVE_FUNCTION_HEAD(void, glGetActiveUniformBlockName, GLuint program, GLuint u
 NATIVE_FUNCTION_HEAD(void, glUniformBlockBinding, GLuint program, GLuint uniformBlockIndex, GLuint uniformBlockBinding) NATIVE_FUNCTION_END_NO_RETURN(void, glUniformBlockBinding, program,uniformBlockIndex,uniformBlockBinding)
 NATIVE_FUNCTION_HEAD(void, glDrawArraysInstanced, GLenum mode, GLint first, GLsizei count, GLsizei instancecount) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawArraysInstanced, mode,first,count,instancecount)
 // NATIVE_FUNCTION_HEAD(void, glDrawElementsInstanced, GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawElementsInstanced, mode,count,type,indices,instancecount)
-NATIVE_FUNCTION_HEAD(GLsync, glFenceSync, GLenum condition, GLbitfield flags) NATIVE_FUNCTION_END(GLsync, glFenceSync, condition,flags)
+// Keep submit fences as a direct driver pass-through. An experimental glFlush after every fence did not
+// remove the long submit waits and unnecessarily forced queue submission for unrelated sync objects.
+#if !defined(__APPLE__)
+extern "C" GLAPI GLAPIENTRY GLsync glFenceSyncARB(GLenum condition, GLbitfield flags)
+    __attribute__((alias("glFenceSync")));
+#endif
+extern "C" GLAPI GLAPIENTRY GLsync glFenceSync(GLenum condition, GLbitfield flags) {
+    LOG_D("Use native function: %s @ %s(...)", RENDERERNAME, __FUNCTION__);
+    const GLsync sync = GLES.glFenceSync(condition, flags);
+    CHECK_GL_ERROR
+    return sync;
+}
 NATIVE_FUNCTION_HEAD(GLboolean, glIsSync, GLsync sync) NATIVE_FUNCTION_END(GLboolean, glIsSync, sync)
 NATIVE_FUNCTION_HEAD(void, glDeleteSync, GLsync sync) NATIVE_FUNCTION_END_NO_RETURN(void, glDeleteSync, sync)
-NATIVE_FUNCTION_HEAD(GLenum, glClientWaitSync, GLsync sync, GLbitfield flags, GLuint64 timeout) NATIVE_FUNCTION_END(GLenum, glClientWaitSync, sync,flags,timeout)
+#if !defined(__APPLE__)
+extern "C" GLAPI GLAPIENTRY GLenum glClientWaitSyncARB(GLsync sync, GLbitfield flags, GLuint64 timeout)
+    __attribute__((alias("glClientWaitSync")));
+#endif
+extern "C" GLAPI GLAPIENTRY GLenum glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) {
+    LOG_D("Use native function: %s @ %s(...)", RENDERERNAME, __FUNCTION__);
+    const uint64_t startNs = amcl::mgperf::nowNs();
+    const GLenum result = GLES.glClientWaitSync(sync, flags, timeout);
+    amcl::mgperf::recordSyncWait(result, timeout, amcl::mgperf::nowNs() - startNs);
+    CHECK_GL_ERROR
+    return result;
+}
 NATIVE_FUNCTION_HEAD(void, glWaitSync, GLsync sync, GLbitfield flags, GLuint64 timeout) NATIVE_FUNCTION_END_NO_RETURN(void, glWaitSync, sync,flags,timeout)
 NATIVE_FUNCTION_HEAD(void, glGetInteger64v, GLenum pname, GLint64 *data) NATIVE_FUNCTION_END_NO_RETURN(void, glGetInteger64v, pname,data)
 NATIVE_FUNCTION_HEAD(void, glGetSynciv, GLsync sync, GLenum pname, GLsizei bufSize, GLsizei *length, GLint *values) NATIVE_FUNCTION_END_NO_RETURN(void, glGetSynciv, sync,pname,bufSize,length,values)

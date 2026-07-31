@@ -6,6 +6,7 @@
 // End of Source File Header
 
 #include "DSAWrapper.h"
+#include "../amcl_buffer_perf.h"
 #include <cassert>
 #include "../texture.h"
 
@@ -239,6 +240,8 @@ void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const
     LOG()
     LOG_D("[DSA] glNamedBufferSubData, buffer: %u, offset: %lld, size: %lld, data: %p", buffer, offset, size, data);
 
+    const uint64_t namedStartNs = amcl::mgperf::nowNs();
+    const uint64_t uploadBytes = amcl::mgperf::nonNegativeBytes(size);
     if (buffer == 0 || size <= 0 || offset < 0) {
         LOG_W("[DSA] Invalid parameters for glNamedBufferSubData");
         // return;
@@ -248,19 +251,34 @@ void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const
     // GL_BUFFER_SIZE 是不可变存储元数据（非 GPU 管线状态），查询不触发同步；据此只对大 buffer 走直写。
     GLint64 bufSize = 0;
     GLES.glGetBufferParameteri64v(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &bufSize);
-    void* p = (data && bufSize >= AMCL_DIRECT_MAP_MIN_SIZE)
-                  ? GLES.glMapBufferRange(GL_ARRAY_BUFFER, offset, size, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT)
-                  : nullptr;
+
+    void* p = nullptr;
+    if (data && bufSize >= AMCL_DIRECT_MAP_MIN_SIZE) {
+        const uint64_t mapStartNs = amcl::mgperf::nowNs();
+        p = GLES.glMapBufferRange(GL_ARRAY_BUFFER, offset, size, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+        amcl::mgperf::recordDirectMapAttempt(amcl::mgperf::nowNs() - mapStartNs);
+    }
+
     if (p) {
+        const uint64_t memcpyStartNs = amcl::mgperf::nowNs();
         memcpy(p, data, static_cast<size_t>(size));
+        const uint64_t memcpyNs = amcl::mgperf::nowNs() - memcpyStartNs;
+
+        const uint64_t unmapStartNs = amcl::mgperf::nowNs();
         GLES.glUnmapBuffer(GL_ARRAY_BUFFER);
+        const uint64_t unmapNs = amcl::mgperf::nowNs() - unmapStartNs;
+        amcl::mgperf::recordDirectMapHit(uploadBytes, memcpyNs, unmapNs);
     } else {
         // 小 buffer（GUI/手部/实体）或不可映射的 buffer：走原始同步路径（正确，且非性能瓶颈）。
+        const uint64_t fallbackStartNs = amcl::mgperf::nowNs();
         glBufferSubData(GL_ARRAY_BUFFER, offset, size, data);
+        amcl::mgperf::recordFallback(uploadBytes, amcl::mgperf::nowNs() - fallbackStartNs);
         CHECK_GL_ERROR;
     }
     restoreTemporaryBufferBinding();
 
+    amcl::mgperf::recordNamedUpload(uploadBytes, bufSize > 0 ? static_cast<uint64_t>(bufSize) : 0,
+                                    amcl::mgperf::nowNs() - namedStartNs);
     LOG_D("[DSA] Buffer %u sub-data set with size %lld at offset %lld", buffer, size, offset);
 }
 

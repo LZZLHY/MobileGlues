@@ -8,6 +8,7 @@
 #include "buffer.h"
 #include "ankerl/unordered_dense.h"
 #include "texture.h"
+#include "amcl_buffer_perf.h"
 
 #define DEBUG 0
 
@@ -24,6 +25,21 @@ static std::vector<char> g_gen_array_exists;
 static std::vector<GLuint> g_free_array_ids;
 
 static std::vector<size_t> g_buffer_datasize;
+// Effective immutable-storage flags keyed by MobileGlues' fake buffer ID.
+static std::vector<GLbitfield> g_buffer_storage_flags;
+
+struct mapped_buffer_state {
+    void* pointer = nullptr;
+    GLintptr offset = 0;
+    GLsizeiptr length = 0;
+    GLbitfield access = 0;
+};
+// Persistent mappings are object state, not binding state. Tracking the staging mapping lets the
+// copy wrapper read Sodium's already-written CPU bytes without asking Maleoon to execute a GPU copy.
+static std::vector<mapped_buffer_state> g_mapped_buffers;
+// Sodium creates its large persistent staging buffer before its dynamic-only terrain arenas.
+// This per-GL-thread mode keeps those later arenas device-local while leaving vanilla unchanged.
+static thread_local bool g_sodium_staging_detected = false;
 
 static std::vector<GLuint> g_element_array_buffer_per_vao;
 
@@ -49,6 +65,8 @@ static inline int ensure_buffer_capacity(GLuint id) {
         g_gen_buffers.resize(id + 1, 0);
         g_gen_buffer_exists.resize(id + 1, 0);
         if (g_buffer_datasize.size() <= (size_t)id) g_buffer_datasize.resize(id + 1, 0);
+        if (g_buffer_storage_flags.size() <= (size_t)id) g_buffer_storage_flags.resize(id + 1, 0);
+        if (g_mapped_buffers.size() <= (size_t)id) g_mapped_buffers.resize(id + 1);
     }
     return 0;
 }
@@ -70,6 +88,8 @@ GLuint gen_buffer() {
         g_gen_buffers[id] = 0;
         g_gen_buffer_exists[id] = 1;
         g_buffer_datasize[id] = 0;
+        g_buffer_storage_flags[id] = 0;
+        g_mapped_buffers[id] = {};
         if (id > (GLuint)maxBufferId) maxBufferId = id;
         return id;
     }
@@ -78,6 +98,8 @@ GLuint gen_buffer() {
     g_gen_buffers[maxBufferId] = 0;
     g_gen_buffer_exists[maxBufferId] = 1;
     g_buffer_datasize[maxBufferId] = 0;
+    g_buffer_storage_flags[maxBufferId] = 0;
+    g_mapped_buffers[maxBufferId] = {};
     return (GLuint)maxBufferId;
 }
 
@@ -97,6 +119,8 @@ void remove_buffer(GLuint key) {
         g_gen_buffer_exists[key] = 0;
         g_gen_buffers[key] = 0;
         if (key < g_buffer_datasize.size()) g_buffer_datasize[key] = 0;
+        if (key < g_buffer_storage_flags.size()) g_buffer_storage_flags[key] = 0;
+        if (key < g_mapped_buffers.size()) g_mapped_buffers[key] = {};
         g_free_buffer_ids.push_back(key);
     }
 }
@@ -296,9 +320,13 @@ void InitBufferMap(size_t expectedSize) {
     g_gen_buffers.reserve(expectedSize + 2);
     g_gen_buffer_exists.reserve(expectedSize + 2);
     g_buffer_datasize.reserve(expectedSize + 2);
+    g_buffer_storage_flags.reserve(expectedSize + 2);
+    g_mapped_buffers.reserve(expectedSize + 2);
     g_gen_buffers.resize(1, 0);
     g_gen_buffer_exists.resize(1, 0);
     g_buffer_datasize.resize(1, 0);
+    g_buffer_storage_flags.resize(1, 0);
+    g_mapped_buffers.resize(1);
 }
 
 void InitVertexArrayMap(size_t expectedSize) {
@@ -698,7 +726,13 @@ void glBufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage
     LOG_D("glBufferData, target = %s, size = %d, data = 0x%x, usage = %s", glEnumToString(target), size, data,
           glEnumToString(usage))
     GLES.glBufferData(target, size, data, usage);
-    set_buffer_data_size(find_bound_buffer(target), size);
+    const GLenum bindingQuery = get_binding_query(target);
+    const GLuint buffer = bindingQuery ? find_bound_buffer(bindingQuery) : 0;
+    if (has_buffer(buffer)) {
+        set_buffer_data_size(buffer, static_cast<size_t>(size));
+        g_buffer_storage_flags[buffer] = 0;
+        g_mapped_buffers[buffer] = {};
+    }
     CHECK_GL_ERROR
 }
 
@@ -751,27 +785,64 @@ extern "C"
 
 void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
     LOG()
+    const GLenum bindingQuery = get_binding_query(target);
+    const GLuint buffer = bindingQuery ? find_bound_buffer(bindingQuery) : 0;
+    // Coherent persistent mappings publish writes without an explicit driver flush.
     if (global_settings.buffer_coherent_as_flush) access &= ~GL_MAP_FLUSH_EXPLICIT_BIT;
     //    access |= GL_MAP_UNSYNCHRONIZED_BIT;
-    return GLES.glMapBufferRange(target, offset, length, access);
+    const uint64_t startNs = amcl::mgperf::nowNs();
+    void* result = GLES.glMapBufferRange(target, offset, length, access);
+    amcl::mgperf::recordMap(amcl::mgperf::nonNegativeBytes(length), amcl::mgperf::nowNs() - startNs);
+    if (result && has_buffer(buffer) && (access & GL_MAP_PERSISTENT_BIT) != 0) {
+        g_mapped_buffers[buffer] = {result, offset, length, access};
+    }
+    return result;
 }
 
 GLboolean glUnmapBuffer(GLenum target) {
     LOG()
     LOG_D("%s(%s)", __func__, glEnumToString(target));
-    if (g_gles_caps.GL_OES_mapbuffer) return GLES.glUnmapBuffer(target);
+    const GLenum bindingQuery = get_binding_query(target);
+    const GLuint buffer = bindingQuery ? find_bound_buffer(bindingQuery) : 0;
 
-    GLboolean result = GLES.glUnmapBuffer(target);
-    CHECK_GL_ERROR
+    const GLboolean result = GLES.glUnmapBuffer(target);
+    if (has_buffer(buffer)) g_mapped_buffers[buffer] = {};
+    if (!g_gles_caps.GL_OES_mapbuffer) {
+        CHECK_GL_ERROR
+    }
     return result;
 }
 
 void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfield flags) {
     LOG()
     if (GLES.glBufferStorageEXT) {
-        if (global_settings.buffer_coherent_as_flush &&
-            ((flags & GL_MAP_PERSISTENT_BIT) != 0 || (flags & GL_DYNAMIC_STORAGE_BIT) != 0))
+        static constexpr GLsizeiptr SODIUM_STAGING_MIN_SIZE = 16 * 1024 * 1024;
+        const GLbitfield callerFlags = flags;
+        const GLbitfield sodiumStagingFlags =
+            GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_DYNAMIC_STORAGE_BIT;
+        if (size >= SODIUM_STAGING_MIN_SIZE &&
+            (callerFlags & sodiumStagingFlags) == sodiumStagingFlags) {
+            g_sodium_staging_detected = true;
+        }
+
+        // Sodium's large persistent staging buffer is created before its terrain arenas. Keep later
+        // dynamic-only arenas device-local so an ordered sub-data upload does not update coherent memory.
+        // Without that staging signature (the vanilla path), preserve the established forced-coherent setup.
+        const bool keepDeviceLocalArena =
+            g_sodium_staging_detected && callerFlags == GL_DYNAMIC_STORAGE_BIT;
+        if (global_settings.buffer_coherent_as_flush && !keepDeviceLocalArena &&
+            ((callerFlags & GL_MAP_PERSISTENT_BIT) != 0 ||
+             (callerFlags & GL_DYNAMIC_STORAGE_BIT) != 0)) {
             flags |= (GL_MAP_WRITE_BIT | GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT);
+        }
+
+        const GLenum bindingQuery = get_binding_query(target);
+        const GLuint buffer = bindingQuery ? find_bound_buffer(bindingQuery) : 0;
+        if (has_buffer(buffer)) {
+            g_buffer_storage_flags[buffer] = flags;
+            g_mapped_buffers[buffer] = {};
+            set_buffer_data_size(buffer, static_cast<size_t>(size));
+        }
         GLES.glBufferStorageEXT(target, size, data, flags);
     }
     CHECK_GL_ERROR
@@ -779,7 +850,70 @@ void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfiel
 
 void glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length) {
     LOG()
-    if (!global_settings.buffer_coherent_as_flush) GLES.glFlushMappedBufferRange(target, offset, length);
+    // The forced-coherent staging mapping publishes CPU writes without a cache-maintenance command.
+    // v7 passes those bytes to an ordered driver upload instead of issuing a GPU read from staging.
+    const bool callDriver = !global_settings.buffer_coherent_as_flush;
+    const uint64_t startNs = amcl::mgperf::nowNs();
+    if (callDriver) GLES.glFlushMappedBufferRange(target, offset, length);
+    amcl::mgperf::recordFlush(amcl::mgperf::nonNegativeBytes(length), callDriver,
+                              amcl::mgperf::nowNs() - startNs);
+}
+
+GLboolean tryMappedStagingBufferUpload(GLenum readTarget, GLenum writeTarget, GLintptr readOffset,
+                                       GLintptr writeOffset, GLsizeiptr size) {
+    static constexpr uint64_t SODIUM_STAGING_MIN_SIZE = 16ULL * 1024ULL * 1024ULL;
+
+    if (!global_settings.buffer_coherent_as_flush || !g_sodium_staging_detected ||
+        readTarget != GL_COPY_READ_BUFFER || writeTarget != GL_COPY_WRITE_BUFFER ||
+        readOffset < 0 || writeOffset < 0 || size <= 0) {
+        return GL_FALSE;
+    }
+
+    const GLuint readBuffer = find_bound_buffer(GL_COPY_READ_BUFFER_BINDING);
+    const GLuint writeBuffer = find_bound_buffer(GL_COPY_WRITE_BUFFER_BINDING);
+    if (!has_buffer(readBuffer) || !has_buffer(writeBuffer) || readBuffer == writeBuffer ||
+        readBuffer >= g_mapped_buffers.size() || writeBuffer >= g_mapped_buffers.size()) {
+        return GL_FALSE;
+    }
+
+    const mapped_buffer_state& source = g_mapped_buffers[readBuffer];
+    const uint64_t sourceLength = source.length > 0 ? static_cast<uint64_t>(source.length) : 0;
+    const uint64_t destinationLength = static_cast<uint64_t>(get_buffer_data_size(writeBuffer));
+    const GLbitfield sourceFlags = g_buffer_storage_flags[readBuffer];
+    const GLbitfield destinationFlags = g_buffer_storage_flags[writeBuffer];
+    const GLbitfield requiredSourceFlags =
+        GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_DYNAMIC_STORAGE_BIT;
+    const GLbitfield hostVisibleDestinationFlags =
+        GL_MAP_READ_BIT | GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+
+    // Match only Sodium's large persistent staging -> device-local dynamic arena copies. Arena
+    // defragmentation and every unrelated copy remain on the original glCopyBufferSubData path.
+    if (!source.pointer || sourceLength < SODIUM_STAGING_MIN_SIZE ||
+        (source.access & GL_MAP_PERSISTENT_BIT) == 0 ||
+        (sourceFlags & requiredSourceFlags) != requiredSourceFlags ||
+        (destinationFlags & GL_DYNAMIC_STORAGE_BIT) == 0 ||
+        (destinationFlags & hostVisibleDestinationFlags) != 0 ||
+        g_mapped_buffers[writeBuffer].pointer) {
+        return GL_FALSE;
+    }
+    if (readOffset < source.offset) return GL_FALSE;
+
+    const uint64_t relativeReadOffset = static_cast<uint64_t>(readOffset - source.offset);
+    const uint64_t destinationOffset = static_cast<uint64_t>(writeOffset);
+    const uint64_t copyBytes = static_cast<uint64_t>(size);
+    if (relativeReadOffset > sourceLength || copyBytes > sourceLength - relativeReadOffset ||
+        destinationOffset > destinationLength || copyBytes > destinationLength - destinationOffset) {
+        return GL_FALSE;
+    }
+
+    const void* sourceBytes =
+        static_cast<const unsigned char*>(source.pointer) + relativeReadOffset;
+    const uint64_t uploadStartNs = amcl::mgperf::nowNs();
+    // Unlike v5/v6, this never maps or overwrites an in-use destination. The GL command stream orders
+    // the update after earlier arena readers and before later draws, while the arena stays device-local.
+    GLES.glBufferSubData(writeTarget, writeOffset, size, sourceBytes);
+    amcl::mgperf::recordStagingUpload(copyBytes, amcl::mgperf::nowNs() - uploadStartNs);
+    return GL_TRUE;
 }
 
 void glGenVertexArrays(GLsizei n, GLuint* arrays) {

@@ -13,6 +13,7 @@
 #include "../gles/loader.h"
 #include "../config/settings.h"
 #include "mg.h"
+#include "amcl_buffer_perf.h"
 #include "framebuffer.h"
 
 #define DEBUG 0
@@ -119,18 +120,29 @@ void glClear(GLbitfield mask) {
 
     CHECK_GL_ERROR_NO_INIT
 
-    // AMCL 2026-06-29 花屏修复：glNamedBufferSubData 走 UNSYNCHRONIZED 直写映射（高帧路径），但会与在途
-    // 绘制竞争——上一帧还在读 dest 的某区域时，本帧已用新地形覆盖它 → 移动时方块闪烁。这里在**帧边界**
-    // （每帧的 color clear）用栅栏把 GPU 落后限制在 1 帧：等上一帧的栅栏完成、再插入本帧栅栏。这样新一帧
-    // 的直写不会覆盖更早帧仍在读取的数据，同时保留 CPU/GPU 1 帧重叠（不像每帧 glFinish 那样杀帧）。
-    // 放帧边界而非上传路径：上传路径里逐次 fence 的 flush 会打断 tile 分块渲染、把帧率打到个位数。
-    if ((mask & GL_COLOR_BUFFER_BIT) != 0 && GLES.glFenceSync && GLES.glClientWaitSync) {
-        static GLsync _frameFence = nullptr;
-        if (_frameFence) {
-            GLES.glClientWaitSync(_frameFence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ULL);
-            GLES.glDeleteSync(_frameFence);
+    // AMCL 2026-07-31：只有 >= 16 MiB buffer 的 UNSYNCHRONIZED direct-map 写入才需要跨帧保护。
+    // 这覆盖 vanilla glNamedBufferSubData 的大 buffer 直写。Sodium staging -> arena 在 v7 中改为
+    // 对 device-local arena 的有序 glBufferSubData，不映射目标且不调用 recordDirectMapHit()，因此
+    // 不会创建这里的自定义 fence。未命中 direct-map 时也绝不创建 fence，避免阻塞 MC 提交环。
+    //
+    // 只在 recordDirectMapHit() 标记本段确实发生过直写后建立 fence，并在下一 color clear 等待/回收。
+    // 不能预先创建“候选 fence”：Maleoon 上未 flush 就删除的大量候选 sync 会使提交等待恶化到
+    // 每轮 1.13–1.16 秒。
+    if ((mask & GL_COLOR_BUFFER_BIT) != 0) {
+        const bool hadDirectMapWrite = amcl::mgperf::consumeDirectMapWrite();
+        if (GLES.glFenceSync && GLES.glClientWaitSync) {
+            static GLsync _frameFence = nullptr;
+            if (_frameFence) {
+                const uint64_t waitStartNs = amcl::mgperf::nowNs();
+                const GLenum waitResult =
+                    GLES.glClientWaitSync(_frameFence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ULL);
+                amcl::mgperf::recordFrameWait(waitResult, amcl::mgperf::nowNs() - waitStartNs);
+                GLES.glDeleteSync(_frameFence);
+                _frameFence = nullptr;
+            }
+            if (hadDirectMapWrite) _frameFence = GLES.glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         }
-        _frameFence = GLES.glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        amcl::mgperf::onColorClear("staging-device-local-subdata-v7");
     }
 
     if (global_settings.angle == AngleMode::Enabled && mask == GL_DEPTH_BUFFER_BIT &&

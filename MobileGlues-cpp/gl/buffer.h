@@ -84,6 +84,9 @@ extern "C"
 
     GLAPI GLAPIENTRY void glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length);
 
+    GLboolean tryMappedStagingBufferUpload(GLenum readTarget, GLenum writeTarget, GLintptr readOffset,
+                                           GLintptr writeOffset, GLsizeiptr size);
+
     GLAPI GLAPIENTRY void glGenVertexArrays(GLsizei n, GLuint* arrays);
 
     GLAPI GLAPIENTRY void glDeleteVertexArrays(GLsizei n, const GLuint* arrays);
