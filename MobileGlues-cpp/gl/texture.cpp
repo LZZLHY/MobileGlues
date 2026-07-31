@@ -268,7 +268,11 @@ void internal_convert(GLenum* internal_format, GLenum* type, GLenum* format) {
         if (type) *type = GL_UNSIGNED_INT;
         break;
     case GL_DEPTH_COMPONENT32:
-        *internal_format = GL_DEPTH_COMPONENT;
+        // GLES 3.x has no 32-bit integer depth format, so downgrade to the sized 24-bit one
+        // that every GLES 3.0+ implementation is required to support. The unsized
+        // GL_DEPTH_COMPONENT used before is rejected with INVALID_ENUM by conformant drivers
+        // and leaves the depth attachment, and therefore the framebuffer, incomplete.
+        *internal_format = GL_DEPTH_COMPONENT24;
         if (type) *type = GL_UNSIGNED_INT;
         break;
     case GL_DEPTH_COMPONENT32F:
@@ -277,9 +281,25 @@ void internal_convert(GLenum* internal_format, GLenum* type, GLenum* format) {
     case GL_DEPTH_COMPONENT:
         LOG_D("Find GL_DEPTH_COMPONENT: internalFormat: %s, format: %s, type: %s", glEnumToString(*internal_format),
               glEnumToString(*format), glEnumToString(*type));
+        // Route the unsized GL_DEPTH_COMPONENT to a sized internal format GLES accepts,
+        // chosen from the type the caller supplied so no precision is silently lost.
+        // With no type available, as on the glTexStorage* path, default to 24-bit.
         if (type) {
-            *internal_format = GL_DEPTH_COMPONENT;
-            *type = GL_UNSIGNED_INT;
+            switch (*type) {
+            case GL_FLOAT:
+                *internal_format = GL_DEPTH_COMPONENT32F;
+                break;
+            case GL_UNSIGNED_SHORT:
+                *internal_format = GL_DEPTH_COMPONENT16;
+                break;
+            case GL_UNSIGNED_INT:
+            default:
+                *internal_format = GL_DEPTH_COMPONENT24;
+                *type = GL_UNSIGNED_INT;
+                break;
+            }
+        } else {
+            *internal_format = GL_DEPTH_COMPONENT24;
         }
         break;
     case GL_DEPTH_STENCIL:
