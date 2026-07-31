@@ -41,43 +41,65 @@ jobs:
         id: range
         run: |
           set -euo pipefail
+          # The upstream merge base is the reliable fallback: everything the platform line adds
+          # is reachable from it, and unlike github.event.before it survives a force push.
+          git remote add mg-upstream https://github.com/MobileGL-Dev/MobileGlues.git
+          git fetch --quiet mg-upstream main
+          fallback="$(git merge-base mg-upstream/main HEAD)"
+
+          base=""
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             base="${{ github.event.pull_request.base.sha }}"
-            head="${{ github.event.pull_request.head.sha }}"
           elif [ "${{ github.event_name }}" = "push" ] && \
                [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
             base="${{ github.event.before }}"
-            head="${{ github.sha }}"
-          else
-            # First push of a branch, or manual run: fall back to the upstream base recorded
-            # in the branch. Everything since upstream/main is ours and must satisfy the rules.
-            git remote add mg-upstream https://github.com/MobileGL-Dev/MobileGlues.git
-            git fetch --quiet mg-upstream main
-            base="$(git merge-base mg-upstream/main HEAD)"
-            head="${{ github.sha }}"
           fi
+          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "Base ${base:-<none>} is unavailable (branch creation or force push); using the upstream merge base."
+            base="$fallback"
+          fi
+
+          count="$(git rev-list --count "${base}..HEAD")"
+          if [ "$count" -eq 0 ]; then
+            echo "Range ${base}..HEAD is empty; using the upstream merge base instead."
+            base="$fallback"
+            count="$(git rev-list --count "${base}..HEAD")"
+          fi
+          # Checking nothing must fail rather than report success.
+          if [ "$count" -eq 0 ]; then
+            echo "::error::resolved an empty commit range; nothing would be verified"
+            exit 1
+          fi
+
           echo "base=$base" >> "$GITHUB_OUTPUT"
-          echo "head=$head" >> "$GITHUB_OUTPUT"
-          echo "Range: $base..$head"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Range: ${base}..${{ github.sha }} ($count commits)"
 
       - name: Commit subjects follow the upstream convention
         run: |
           set -euo pipefail
           pattern='^\[(Feat|Fix|Improvement|Chore|Docs)(\|(Feat|Fix|Improvement|Chore|Docs))*\] \([^()]+\): .+'
+          commits="$(git rev-list "${{ steps.range.outputs.base }}..HEAD")"
+          checked=0
           failed=0
-          while read -r sha; do
-            [ -z "$sha" ] && continue
+          for sha in $commits; do
             subject="$(git log -1 --format=%s "$sha")"
             case "$subject" in
               Merge\ *) echo "skip merge:   $sha $subject"; continue ;;
             esac
+            checked=$((checked + 1))
             if printf '%s' "$subject" | grep -Eq "$pattern"; then
               echo "ok:           $sha $subject"
             else
               echo "::error::bad commit subject: $sha $subject"
               failed=1
             fi
-          done < <(git rev-list "${{ steps.range.outputs.base }}..${{ steps.range.outputs.head }}")
+          done
+          if [ "$checked" -eq 0 ]; then
+            echo "::error::no commit subjects were verified"
+            exit 1
+          fi
+          echo "Verified $checked commit subject(s)."
           if [ "$failed" -ne 0 ]; then
             echo "Expected: [Tag] (module): summary   with Tag in Feat|Fix|Improvement|Chore|Docs"
             echo "See docs/ohos/CONTRIBUTING.md"
@@ -87,16 +109,16 @@ jobs:
       - name: No binary artifacts
         run: |
           set -euo pipefail
+          added="$(git diff --name-only --diff-filter=A "${{ steps.range.outputs.base }}" HEAD)"
           failed=0
-          while read -r path; do
-            [ -z "$path" ] && continue
+          for path in $added; do
             case "$path" in
               *.a|*.so|*.so.*|*.o|*.obj|*.lib|*.dll|*.dylib|*.hap|*.hsp|*.apk|*.aar|*.jar|*.zip|*.7z)
                 echo "::error file=$path::binary artifacts must not be committed"
                 failed=1 ;;
             esac
-          done < <(git diff --name-only --diff-filter=A \
-                     "${{ steps.range.outputs.base }}" "${{ steps.range.outputs.head }}")
+          done
+          echo "Checked $(printf '%s\n' "$added" | grep -c . || true) added path(s)."
           exit "$failed"
 
       - name: Touched lines match .clang-format
@@ -113,8 +135,8 @@ jobs:
             exit 1
           fi
           echo "Using $formatter with $(clang-format --version)"
-          diff="$("$formatter" --diff --extensions c,cpp,h,hpp \
-                    "${{ steps.range.outputs.base }}" "${{ steps.range.outputs.head }}" || true)"
+          # No `|| true`: a failure of the tool itself must not be mistaken for clean formatting.
+          diff="$("$formatter" --diff --extensions c,cpp,h,hpp "${{ steps.range.outputs.base }}" HEAD)"
           case "$diff" in
             ""|*"no modified files to format"*|*"did not modify any files"*|*"clang-format did not modify any files"*)
               echo "Formatting clean." ;;
