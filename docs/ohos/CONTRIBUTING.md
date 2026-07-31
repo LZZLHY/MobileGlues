@@ -13,6 +13,10 @@ reviewable as it grows.
 | `wip/<topic>` | Investigations, instrumentation, throwaway experiments. May be broken. |
 | `upstream/<topic>` | A single change rebased onto upstream `main`, used to open a PR upstream. |
 
+This repository is consumed as a git submodule inside the launcher, so a commit here is only
+half of a change: the consuming repository pins the exact commit and must be updated in the
+same breath. Never leave work only in the working tree, and never leave the pin behind.
+
 `platform/ohos` follows upstream's own naming for platform work (`platform/linux`).
 Experiments never land on it; they live on `wip/*` so that bisecting the platform line
 stays meaningful.

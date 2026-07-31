@@ -29,17 +29,32 @@ Vulkan. On HarmonyOS NEXT it runs directly on the vendor GLES driver. Buffer ren
 coherent memory and synchronization have very different costs in those two setups, so
 defaults that are free on ANGLE can dominate the frame here. See `PERF-MALEOON.md`.
 
-## Build
+## How it is consumed
 
-MobileGlues is not built standalone for this platform. AMCL's CMake compiles the sources
-listed in `prebuilt/mobileglues/cmake-snapshot.txt` into `libglfw.so` with the OHOS
-toolchain. To reproduce a build:
+MobileGlues is not built standalone for this platform. AMCL checks this repository out as a
+git submodule at `prebuilt/mobileglues/mg_src` and compiles the source list in
+`prebuilt/mobileglues/cmake-snapshot.txt` directly into `libglfw.so` with the OHOS toolchain.
+LWJGL then resolves GL through `org.lwjgl.opengl.libname`.
+
+Because the submodule is a real repository inside the build tree, the development loop has no
+copy step: edit, build, then commit and push from the same directory.
 
 ```bash
-# In the AMCL repository, with deps.lock pointing at this branch
-bash setup_deps.sh --force --mobileglues-only
+# In the AMCL repository
+cd prebuilt/mobileglues/mg_src
+git checkout platform/ohos              # setup leaves a detached HEAD at the pinned commit
+# edit, then build from the repository root
+cd ../../..
 DEVECO_SDK_HOME=<sdk> hvigorw assembleHap --mode module -p product=default --no-daemon
 ```
+
+After pushing, update both the pin in AMCL's `deps.lock` and the superproject gitlink; AMCL's
+CI verifies that the two agree, so the pinned version and the version that actually built are
+never allowed to diverge.
+
+Only the submodules this build needs are initialized, shallowly: `glslang`, `SPIRV-Cross`,
+`glm`, `xxhash` and `FastSTL`. `perfetto` is deliberately skipped, since it is only compiled
+with `PROFILING=ON` and cloning it costs minutes.
 
 Cross-compilation flags used by AMCL:
 
