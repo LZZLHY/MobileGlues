@@ -328,6 +328,161 @@ bool checkIfAtomicCounterBufferEmulated(const std::string& glslCode) {
     return glslCode.find(atomicCounterEmulatedWatermark) != std::string::npos;
 }
 
+// ---------------------------------------------------------------------------
+// Fragment outputs declared as arrays, indexed with a non-constant expression
+// ---------------------------------------------------------------------------
+// GLSL ES forbids it outright: "Arrays of fragment outputs may only be indexed
+// by a constant integral expression" (ESSL 3.00 / 3.20 §4.3.6). Desktop GLSL
+// allows it, so a translated shader can come out of SPIRV-Cross perfectly valid
+// as desktop GLSL and still be rejected by the GLES driver's front end. On
+// Maleoon that reads:
+//
+//   S0015: Outputs declared as arrays may only be indexed by a constant
+//          integral expression.
+//
+// Minecraft 26.3 hits this on nearly every fragment shader, because its new
+// order-independent-transparency include writes the transmittance coefficients
+// through a loop (assets/minecraft/shaders/include/oit_add_transmittance.glsl):
+//
+//   layout(location = 0) out vec4 coeff[COEFF_ATTACHMENT_COUNT];
+//   for (int a = 0; a < COEFF_ATTACHMENT_COUNT; a++)
+//       for (int i = 0; i < 4; i++)
+//           coeff[a][i] = coefficients[a * 4 + i];
+//
+// Neither glslang nor SPIRV-Cross can fix this for us: the loop survives the
+// round trip (there is no SPIRV-Tools in tree to unroll it), and SPIRV-Cross has
+// no option for flattening plain I/O arrays (FORCE_FLATTENED_IO_BLOCKS only
+// covers interface blocks).
+//
+// The rewrite below keeps the shader's own code untouched and only changes what
+// the name refers to:
+//
+//   layout(location = L) out T name[N];        // illegal to index dynamically
+//     ->  layout(location = L+k) out T name__mg_out_k;   // k = 0..N-1
+//         T name[N];                           // ordinary global array: legal
+//         void main() { <original body renamed>; name__mg_out_k = name[k]; ... }
+//
+// Every existing read/write of name[...] stays exactly as written, because a
+// non-output array may be indexed dynamically. The values reach the real outputs
+// in a wrapper that runs after the original main() returns.
+//
+// Why a wrapper instead of appending the copies to the end of main(): the
+// original main() may `return` early, and a `discard` must still skip the copy
+// entirely. Wrapping gets both right for free -- an early return lands in the
+// wrapper, and discard kills the fragment before it.
+//
+// Deliberately conservative: the rewrite only fires for a declaration that has
+// an explicit location (otherwise the extra outputs would need locations we are
+// not entitled to invent) and only when at least one index really is not a
+// literal. Anything else is left exactly as SPIRV-Cross emitted it.
+static bool index_is_all_literal(const std::string& code, size_t open_bracket) {
+    const size_t close = code.find(']', open_bracket);
+    if (close == std::string::npos) return false;
+    bool digit_seen = false;
+    for (size_t i = open_bracket + 1; i < close; ++i) {
+        const char c = code[i];
+        if (std::isdigit(static_cast<unsigned char>(c))) {
+            digit_seen = true;
+        } else if (!std::isspace(static_cast<unsigned char>(c))) {
+            return false;
+        }
+    }
+    return digit_seen;
+}
+
+// True when `name` is used at least once with an index that is not a literal.
+static bool has_dynamic_index(const std::string& code, const std::string& name, size_t decl_end) {
+    size_t pos = decl_end;
+    while ((pos = code.find(name, pos)) != std::string::npos) {
+        const size_t after = pos + name.length();
+        // Reject substring hits: name must be a whole identifier.
+        const bool left_ok =
+            (pos == 0) || !(std::isalnum(static_cast<unsigned char>(code[pos - 1])) || code[pos - 1] == '_');
+        size_t scan = after;
+        while (scan < code.length() && std::isspace(static_cast<unsigned char>(code[scan])))
+            ++scan;
+        if (left_ok && scan < code.length() && code[scan] == '[' && !index_is_all_literal(code, scan)) {
+            return true;
+        }
+        pos = after;
+    }
+    return false;
+}
+
+std::string flattenDynamicFragmentOutputArrays(const std::string& essl, GLenum shaderType, int& rewritten) {
+    rewritten = 0;
+    if (shaderType != GL_FRAGMENT_SHADER) return essl;
+    if (essl.find(" out ") == std::string::npos) return essl;
+
+    // layout(location = L) out [precision] type name[N];
+    static const std::regex decl_pattern(
+        R"(layout\s*\(\s*location\s*=\s*(\d+)\s*\)\s*out\s+((?:highp|mediump|lowp)\s+)?(\w+)\s+(\w+)\s*\[\s*(\d+)\s*\]\s*;)");
+
+    std::string result;
+    std::string copy_back;
+    size_t cursor = 0;
+
+    auto begin = std::sregex_iterator(essl.begin(), essl.end(), decl_pattern);
+    auto end = std::sregex_iterator();
+    for (auto it = begin; it != end; ++it) {
+        const std::smatch& m = *it;
+        const size_t decl_pos = static_cast<size_t>(m.position(0));
+        const size_t decl_len = static_cast<size_t>(m.length(0));
+
+        const int location = std::atoi(m[1].str().c_str());
+        const std::string precision = m[2].matched ? m[2].str() : "";
+        const std::string type = m[3].str();
+        const std::string name = m[4].str();
+        const int count = std::atoi(m[5].str().c_str());
+
+        if (count <= 0 || count > 32 || !has_dynamic_index(essl, name, decl_pos + decl_len)) {
+            continue; // legal as written, or something we should not touch
+        }
+
+        result.append(essl, cursor, decl_pos - cursor);
+
+        std::string trimmed_precision = precision;
+        trim(trimmed_precision);
+        const std::string prec = trimmed_precision.empty() ? "" : trimmed_precision + " ";
+
+        for (int k = 0; k < count; ++k) {
+            result += "layout(location = " + std::to_string(location + k) + ") out " + prec + type + " " + name +
+                      "__mg_out_" + std::to_string(k) + ";\n";
+            copy_back +=
+                "    " + name + "__mg_out_" + std::to_string(k) + " = " + name + "[" + std::to_string(k) + "];\n";
+        }
+        // The name the shader body already uses now denotes an ordinary global
+        // array, which may be indexed with anything.
+        result += prec + type + " " + name + "[" + std::to_string(count) + "];";
+
+        cursor = decl_pos + decl_len;
+        ++rewritten;
+        LOG_I("[Shader] Flattened dynamically indexed fragment output array: %s %s[%d] @location=%d", type.c_str(),
+              name.c_str(), count, location)
+    }
+
+    if (rewritten == 0) return essl;
+    result.append(essl, cursor, std::string::npos);
+
+    // Move the original entry point aside and copy the staging arrays out after
+    // it returns. Bail out (leaving the declarations rewritten but the copies
+    // absent would be worse than not touching the shader at all) if the entry
+    // point is not in the shape we expect.
+    static const std::regex main_pattern(R"(\bvoid\s+main\s*\(\s*\))");
+    std::smatch main_match;
+    if (!std::regex_search(result, main_match, main_pattern)) {
+        LOG_E("[Shader] Cannot rewrite dynamically indexed fragment outputs: no 'void main()' found; "
+              "leaving the shader untouched.")
+        rewritten = 0;
+        return essl;
+    }
+    result.replace(static_cast<size_t>(main_match.position(0)), static_cast<size_t>(main_match.length(0)),
+                   "void mg__orig_main()");
+    result += "\nvoid main()\n{\n    mg__orig_main();\n" + copy_back + "}\n";
+
+    return result;
+}
+
 std::string GLSLtoGLSLES(const char* glsl_code, GLenum glsl_type, uint essl_version, uint glsl_version,
                          int& return_code) {
     std::string sha256_string(glsl_code);
@@ -885,6 +1040,13 @@ std::string GLSLtoGLSLES_2(const char* glsl_code, GLenum glsl_type, uint essl_ve
         essl = removeLayoutBinding(essl);
     }
     essl = processOutColorLocations(essl);
+    // Must run before forceSupporterOutput(): that one inserts precision
+    // statements relative to the header, and this one only rewrites declarations
+    // and the entry point, so order between them is not otherwise significant.
+    {
+        int flattened = 0;
+        essl = flattenDynamicFragmentOutputArrays(essl, glsl_type, flattened);
+    }
     essl = forceSupporterOutput(essl);
 
     LOG_D("Originally GLSL to GLSL ES Complete: \n%s", essl.c_str())
