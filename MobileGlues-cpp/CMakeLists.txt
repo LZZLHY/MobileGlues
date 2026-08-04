@@ -163,6 +163,13 @@ elseif(ANDROID)
 elseif(OHOS)
     # OpenHarmony / HarmonyOS NEXT — EGL/GLES are loaded dynamically via dlopen, and the
     # platform log sink is hilog.
+    #
+    # MG_PLATFORM_OHOS gates driver policy that is only correct for the native Maleoon GLES
+    # driver, so it must never be visible to another platform's translation units. Every use is
+    # written as #if defined(MG_PLATFORM_OHOS) around an addition, or #if !defined(...) around
+    # code that stays as it was, so preprocessing this tree with the macro undefined reproduces
+    # the shared sources exactly.
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE MG_PLATFORM_OHOS=1)
     target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC
         libhilog_ndk.z.so
         ${CMAKE_DL_LIBS}

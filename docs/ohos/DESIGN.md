@@ -113,6 +113,26 @@ last writer and last readers of a buffer range, and wait only when a range is ab
 reused while still referenced. A wait must be the exception, and its cost must be visible in
 the counters when it happens.
 
+A coarse first step is in place, at whole-buffer and whole-frame granularity: `gl/buffer.cpp`
+marks a buffer when the application makes it reachable as a vertex source, the mark is cleared
+once per present in `eglSwapBuffers`, and `glNamedBufferSubData` refuses the unsynchronized
+path for a marked buffer. That is enough to make the fast path correct rather than
+correct-by-assumption — see the size-threshold section in
+[`PERF-MALEOON.md`](PERF-MALEOON.md) — but it is deliberately pessimistic: once a Sodium arena
+has been bound in a frame, every later upload to that arena in the same frame falls back, even
+for ranges no draw touches. Per-range tracking is what recovers those.
+
+The frame fence itself stays in `gl.cpp` `glClear`. A colour clear is not one per present — the
+measured ratio on a Maleoon 920 is 1.5 to 4.3 — so the fence fires several times per frame, but
+that is left alone deliberately: it costs 20 to 55 ms/s, and firing more often keeps the GPU
+closer to the CPU, which narrows the window the mark table has to cover. Only the mark clearing
+needs the real boundary, because a mark dropped mid-frame would let a buffer that is still going
+to be drawn qualify for an unsynchronized write.
+
+The same sub-frame ratio does invalidate per-frame *reporting*: every counter aggregated on the
+colour clear counts sub-frames. Derive nothing per-frame from those windows without dividing by
+the measured clear-to-present ratio first.
+
 ### Phase 4 — validation
 
 Turn the scenario matrix in [`CONTRIBUTING.md`](CONTRIBUTING.md#device-verification-gate)
