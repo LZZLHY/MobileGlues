@@ -91,7 +91,8 @@ Each was implemented and measured on device. None is a candidate; the numbers ar
 | Per-buffer non-coherent storage with explicit flush | Flushes did reach the driver, but even idle regressed badly: one window showed 14.3 s wall time for 3 color clears | Rejected |
 | Unsynchronized CPU copy from the staging mapping into the arena | Large throughput win, 237-270 clears/s | Rejected: black terrain chunks — in-flight readers race the write |
 | Same, with one synchronizing fence per staging batch | Correct output restored | Rejected: 261-454 ms/s of explicit waiting, 41-66 waits/s, single waits up to 18.8 ms; the user reported stalling in every scenario |
-| Drop the `buffer_coherent_as_flush` promotion for exact `GL_DYNAMIC_STORAGE_BIT` | Already in the table above as non-coherent storage with explicit flush | Rejected, and re-implemented once by mistake in the 2026-08-03 round without reading this table first |
+| ~~Drop the `buffer_coherent_as_flush` promotion for exact `GL_DYNAMIC_STORAGE_BIT`~~ | **This row was wrong and cost a lot of time — see the correction below** | ~~Rejected~~ |
+| Drop the promotion for *every* store declaring `GL_DYNAMIC_STORAGE_BIT`, including those the application also requested `MAP_WRITE \| MAP_PERSISTENT` on | Stalls 33 to 42, upload 180 to 219 us per call, median frame rate 55.5 to 42.1; the real `glFlushMappedBufferRange` handed back to the driver measured 5091 us per call | Rejected: a store that *is* mapped every frame needs its coherence |
 | Staging ring plus `glCopyBufferSubData` instead of a direct write | Already in the table above | Rejected, and re-implemented once by mistake in the same round; the user's screenshot of black and scrambled terrain is exactly the failure this table already recorded |
 | Adaptive routing that picks staged versus direct from observed per-target cost | Two designs, neither worked: the first never triggered because cheap uploads always interleave, the second marked before checking eligibility so every mark was reverted | Rejected: cost is not a usable signal here, eligibility is structural |
 | Completing multi-draw-indirect and base-instance support | Nothing in the game calls them: `multiDrawIndexed`, `multiDraw`, `drawIndexedIndirect` and `drawIndirect` have no callers under `net/minecraft/**`, and `gl_DrawID` / `gl_BaseInstance` / `gl_InstanceID` appear in none of the 80 vanilla shaders | Rejected: no reachable caller, so no possible gain |
@@ -101,6 +102,39 @@ Each was implemented and measured on device. None is a candidate; the numbers ar
 The pattern is consistent: on this driver, making a host-visible copy correct costs more than
 the copy, and removing the synchronization corrupts geometry. Adding another fence anywhere in
 this design cannot win.
+
+### Correction: one row above was a misclassification, and it hid the answer
+
+"Drop the promotion for exact `GL_DYNAMIC_STORAGE_BIT`" was struck through above because its
+recorded verdict pointed at a *different* experiment. The two are not the same change:
+
+| | What the store ends up as | What updates it | Cost of the update |
+| --- | --- | --- | --- |
+| Non-coherent storage with explicit flush *(rejected)* | host-visible, still **mapped**, coherence removed | a mapped write plus `glFlushMappedBufferRange` | the real flush measured **5091 us** per call |
+| Withhold the promotion from the exact request *(this one)* | device-local, **not mappable at all** | `glBufferSubData` only | measured **11.6 us** per call |
+
+The first keeps the mapping and therefore keeps the cache maintenance. The second has no
+mapping, so there is nothing to synchronize and nothing to flush. Collapsing them into one row
+is what left the second unexplored through several rounds of work.
+
+The rejected 2026-08-03 policy header states the measured result of exactly this half:
+
+> The other half of the policy is kept: an exact `DYNAMIC_STORAGE` request below the threshold
+> stays unmapped instead of being promoted to `COHERENT | PERSISTENT`, and that is what removed
+> the old ~1300 ms/s implicit-synchronization stall on `glBufferSubData`.
+
+The same header records `per ordered glBufferSubData on the same buffers: 11.6 us` against
+`per direct upload 3946 us`, and attributes the 36 % of wall clock spent inside
+`glMapBufferRange` to "exactly the stutter felt while moving". It also names a configuration,
+`maleoon-unmapped-ordered`, that was never built: the constant selected `maleoon-staged-copy`
+instead, which layered a second buffer and a GPU copy on top and was rejected on its own
+merits. So the measurements for the unmapped half exist, and the route that uses them does not
+appear anywhere in this table.
+
+What generalises: **when an entry here says "already covered above", check that the two changes
+produce the same end state.** Both of these drop `GL_MAP_COHERENT_BIT`, and that similarity was
+enough to merge them, but one leaves the buffer mappable and the other does not, and on this
+driver that difference is the whole cost.
 
 ## The size threshold was the wrong test
 
