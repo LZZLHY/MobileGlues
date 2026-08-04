@@ -68,6 +68,15 @@ extern "C"
     void mg_buffer_note_unsynchronized_write(void);
     GLboolean mg_buffer_take_unsynchronized_write_flag(void);
 
+    // Try to satisfy a host upload without letting the CPU touch the destination, by staging the
+    // bytes and issuing a GPU copy. Returns GL_TRUE when it handled the upload, GL_FALSE when the
+    // caller must perform the ordinary glBufferSubData.
+    //
+    // Eligibility is decided inside: only a large device-local store of the exact-DYNAMIC_STORAGE
+    // class qualifies, because that is the only one where a direct write waits for the draws reading
+    // it - measured at 55 to 188 ms per call against 149 us for small stores. See buffer.cpp.
+    GLboolean mg_buffer_staged_upload(GLenum target, GLintptr offset, GLsizeiptr size, const void* data);
+
 #endif
 
     GLAPI GLAPIENTRY void glGenBuffers(GLsizei n, GLuint* buffers);

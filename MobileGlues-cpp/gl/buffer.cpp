@@ -49,15 +49,25 @@ static inline bool is_exact_dynamic_storage(GLbitfield requested) {
     return requested == GL_DYNAMIC_STORAGE_BIT;
 }
 
-static void record_requested_storage(GLuint buffer, GLbitfield requested) {
+// Immutable store size, recorded next to the flags so an upload never has to ask the driver for it.
+static std::vector<GLsizeiptr> g_buffer_immutable_size;
+
+static void record_requested_storage(GLuint buffer, GLbitfield requested, GLsizeiptr size) {
     if (buffer == 0) return;
     if (static_cast<size_t>(buffer) >= g_buffer_requested_storage.size()) {
         // Grown in blocks so a run of fresh ids does not reallocate on every allocation.
         g_buffer_requested_storage.resize(static_cast<size_t>(buffer) + 64, 0);
         g_buffer_has_requested_storage.resize(static_cast<size_t>(buffer) + 64, 0);
+        g_buffer_immutable_size.resize(static_cast<size_t>(buffer) + 64, 0);
     }
     g_buffer_requested_storage[buffer] = requested;
     g_buffer_has_requested_storage[buffer] = 1;
+    g_buffer_immutable_size[buffer] = size > 0 ? size : 0;
+}
+
+static GLsizeiptr recorded_immutable_size(GLuint buffer) {
+    if (buffer == 0 || static_cast<size_t>(buffer) >= g_buffer_immutable_size.size()) return 0;
+    return g_buffer_immutable_size[buffer];
 }
 
 GLboolean mg_buffer_is_unmapped_dynamic_store(GLuint buffer) {
@@ -843,6 +853,88 @@ GLboolean glUnmapBuffer(GLenum target) {
     return result;
 }
 
+#if defined(MG_PLATFORM_OHOS)
+
+// Route a host upload into a large device-local store through a staging buffer and a GPU copy.
+//
+// Placed here rather than with the other platform state near the top of this file because it needs
+// glBindBuffer and the binding-query helper, both of which are defined above this point.
+//
+// Measured on a Maleoon 920 running MC 26.1.2, one-second windows: in the 21 of 75 windows that
+// touched the 128 MiB terrain store, the worst single glBufferSubData was a mean of 65 ms, a median
+// of 55 ms and a peak of 188 ms. In the 54 windows that touched only small stores the same figure
+// was a mean of 149 us. The cost is not the byte count, it is writing a large store that in-flight
+// draws are reading, and a single 188 ms call is what is felt as stutter while moving.
+//
+// It is not the promotion to host-coherent memory either. That was removed first, and the store is
+// now device-local and unmappable, which made the single call worse rather than better: the driver
+// can no longer rename the allocation, so it waits for the readers instead. Every route tried on
+// this driver that has the CPU touch the destination pays that wait - mapped or unmapped, coherent
+// or not.
+//
+// So the CPU stops touching the destination. The bytes go into a small private staging store and one
+// glCopyBufferSubData moves them across. Previously measured on this device: 15.9 us for the staging
+// write and 109 us for the copy, against 3946 us for a mapped write and the 55-188 ms above.
+//
+// Correctness comes from two properties rather than from a fence:
+//
+//   - The staging store is respecified with glBufferData on every upload, so the driver orphans the
+//     previous allocation. A copy that has not executed yet keeps reading the memory it was issued
+//     against, so the CPU cannot overwrite bytes a pending copy still needs.
+//   - The copy is an ordinary GPU command, queued behind the draws that read the destination,
+//     exactly like the glBufferSubData it replaces. Nothing is unsynchronized, so there is no hazard
+//     to bound and no gate that can be wrong.
+//
+// This is the route the reverted 2026-08-03 work named `maleoon-staged-copy`. It was judged a
+// negative optimisation together with an unrelated group of changes - a zero-timeout fence poll
+// bypass that issued glFlush, which ends the render pass on a tiled GPU - and the bisect switches
+// written to tell the two apart were never used. Nothing from that group is reinstated here.
+static constexpr GLsizeiptr STAGED_UPLOAD_MIN_DEST_SIZE = 16 * 1024 * 1024;
+static GLuint g_staging_buffer = 0;
+
+GLboolean mg_buffer_staged_upload(GLenum target, GLintptr offset, GLsizeiptr size, const void* data) {
+    if (!data || size <= 0 || offset < 0) return GL_FALSE;
+    // The copy binding points are borrowed below, so a caller already using one as its destination
+    // takes the ordinary path instead of having its binding clobbered.
+    if (target == GL_COPY_READ_BUFFER || target == GL_COPY_WRITE_BUFFER) return GL_FALSE;
+    if (!GLES.glGenBuffers || !GLES.glBindBuffer || !GLES.glBufferData || !GLES.glCopyBufferSubData) {
+        return GL_FALSE;
+    }
+
+    const GLenum bindingQuery = get_binding_query(target);
+    if (!bindingQuery) return GL_FALSE;
+    const GLuint destination = find_bound_buffer(bindingQuery);
+    // Only the class this layer deliberately left device-local, and only once it is large enough that
+    // a direct write waits. Small stores measured 114 to 772 us and are left alone.
+    if (mg_buffer_is_unmapped_dynamic_store(destination) != GL_TRUE) return GL_FALSE;
+    const GLsizeiptr destinationSize = recorded_immutable_size(destination);
+    if (destinationSize < STAGED_UPLOAD_MIN_DEST_SIZE) return GL_FALSE;
+    // Bounds expressed without offset + size so a hostile pair cannot overflow into a valid answer.
+    if (offset > destinationSize - size) return GL_FALSE;
+
+    if (g_staging_buffer == 0) {
+        GLES.glGenBuffers(1, &g_staging_buffer);
+        if (g_staging_buffer == 0) return GL_FALSE;
+    }
+
+    const uint64_t startNs = mg::diagnostics::timestamp();
+    // Bound with the raw entry point on purpose: this is a private object with no MobileGlues id, so
+    // it must not enter the shadow binding state the application observes.
+    const GLuint previousCopyRead = find_bound_buffer(GL_COPY_READ_BUFFER_BINDING);
+    GLES.glBindBuffer(GL_COPY_READ_BUFFER, g_staging_buffer);
+    GLES.glBufferData(GL_COPY_READ_BUFFER, size, data, GL_STREAM_DRAW);
+    GLES.glCopyBufferSubData(GL_COPY_READ_BUFFER, target, 0, offset, size);
+    // Restored through the wrapper so the application's binding is re-established from its shadow id,
+    // including the unbound case.
+    glBindBuffer(GL_COPY_READ_BUFFER, previousCopyRead);
+    // Recorded as a copy and deliberately not as sub-data: keeping subdata_* free of this route
+    // leaves it as a clean signal that no CPU write reached a large store.
+    mg::diagnostics::record_copy(mg::diagnostics::non_negative_bytes(size), mg::diagnostics::elapsed_ns(startNs));
+    return GL_TRUE;
+}
+
+#endif
+
 void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfield flags) {
     LOG()
     if (GLES.glBufferStorageEXT) {
@@ -882,7 +974,7 @@ void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfiel
             global_settings.buffer_coherent_as_flush && is_exact_dynamic_storage(flags);
         const GLenum bindingQuery = get_binding_query(target);
         if (preserve_unmapped_dynamic && bindingQuery) {
-            record_requested_storage(find_bound_buffer(bindingQuery), flags);
+            record_requested_storage(find_bound_buffer(bindingQuery), flags, size);
         }
         if (global_settings.buffer_coherent_as_flush && !preserve_unmapped_dynamic &&
             ((flags & GL_MAP_PERSISTENT_BIT) != 0 || (flags & GL_DYNAMIC_STORAGE_BIT) != 0))
