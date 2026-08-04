@@ -52,28 +52,6 @@ extern "C"
 
     void InitVertexArrayMap(size_t expectedSize);
 
-#if defined(MG_PLATFORM_OHOS)
-
-    // Frame-scoped test for "the application has made this buffer reachable as a vertex source
-    // since the last frame boundary", i.e. a draw issued in this frame may still be reading it.
-    // Used by glNamedBufferSubData to decide whether an unsynchronized write is safe; see the
-    // implementation in buffer.cpp for the reasoning.
-    GLboolean mg_buffer_used_as_vertex_source_this_frame(GLuint buffer);
-
-    // Bracket a bind that MobileGlues performs for its own bookkeeping rather than on the
-    // application's behalf, so that it does not set the mark above. The direct-state-access
-    // helpers bind their target on every call, so without this the mark is always set before
-    // the test reads it and the fast upload path is never taken. See buffer.cpp for the full
-    // account; it cost a shipped release to learn. Depth-counted and thread-local, so nesting
-    // and concurrent use are both safe.
-    void mg_buffer_begin_internal_bind(void);
-    void mg_buffer_end_internal_bind(void);
-
-    // Called once per presented frame, from the same place that manages the frame fence.
-    void mg_buffer_clear_vertex_source_marks(void);
-
-#endif
-
     GLAPI GLAPIENTRY void glGenBuffers(GLsizei n, GLuint* buffers);
 
     GLAPI GLAPIENTRY void glDeleteBuffers(GLsizei n, const GLuint* buffers);

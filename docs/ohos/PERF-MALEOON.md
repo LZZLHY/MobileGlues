@@ -127,7 +127,43 @@ separate-attribute vertex array path uses the latter.
 
 Vanilla keeps the fast path unchanged, because its uploads all happen before the bind.
 
-### That gate was implemented, shipped once, and reverted: it marked from our own bind
+### The gate is a dead end at this granularity, measured twice on device ★read before touching it
+
+Two versions of it were built, shipped and measured. They are the two ends of one knob, and
+neither end is acceptable:
+
+| Build | What the gate did | Terrain | Frame rate (26.1.2-neoforge, Maleoon 920) |
+| --- | --- | --- | --- |
+| v1, `fa9d6fa`, versionCode 1000476 | Marked from `glBindBuffer`, which this layer calls itself on every upload, so it blocked nearly every large upload | Corruption and flicker **fixed** | **Collapsed**, on every version, with and without Sodium |
+| v2, `bb4f560`, versionCode 1000477 | Marked only from application binds | Corruption **back** | **Normal**: steady 60, bursts to 120 |
+
+v2's counters say why it is not a fix: `direct_attempts` fell to **4 to 12 per second** against
+about 400 `named_calls`, so the gate essentially never fires and the build is behaviourally the
+same as no gate. The reason is that MC attaches the vertex buffer to a vertex array object once
+and afterwards only rebinds the VAO, so no per-frame bind reaches `glBindBuffer` or
+`glBindVertexBuffer` and the arena is never re-marked. v1 only appeared to work because the
+self-marking bug it contained was, accidentally, the thing that made it correct.
+
+Marking from VAO reachability instead would close that hole and land straight back on v1's
+behaviour: the arena would be marked every frame, every interleaved upload would take the
+synchronous path, and the frame rate would collapse again. **Correctness and throughput are the
+same knob at per-buffer, per-frame granularity.** Do not spend another round moving the marking
+around; the granularity is the problem, not the placement.
+
+Also record two measurement errors from that round, both of which produced confident wrong
+answers:
+
+- **A frame rate read during world load.** A 29 fps sample was taken while chunks were still
+  streaming and treated as steady state; the same build measured 60 fps a few minutes later.
+  Always confirm the scene is settled, and prefer several spaced samples of the present interval
+  from `hidumper -s RenderService -a 'ScreenNode fps'` over a single reading.
+- **Treating `named_total_us` as MobileGlues' share of the frame.** It measures CPU time inside
+  the call. A synchronous write into coherent storage costs a GPU serialization that is charged
+  later, to the fence wait in `glClear`, so summing the instrumented counters and concluding
+  "this layer is only 28 % of wall time, therefore it cannot explain the frame rate" is invalid.
+  It was used to argue the gate was innocent, and the device A/B above says the opposite.
+
+### How v1 failed in detail: it marked from our own bind
 
 The analysis above is still correct. The implementation was not, and the way it failed is worth
 more than the code was.
