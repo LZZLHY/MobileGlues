@@ -28,6 +28,77 @@ static std::vector<size_t> g_buffer_datasize;
 
 static std::vector<GLuint> g_element_array_buffer_per_vao;
 
+#if defined(MG_PLATFORM_OHOS)
+#include <atomic>
+
+// Immutable-storage flags as the application requested them, per MobileGlues buffer id.
+//
+// Requested and effective flags have to stay separate. Whether an upload may map a buffer is a
+// property of what the application asked for, not of what this layer decided to hand the driver,
+// and inferring one from the other is how a private capability turns into an assumed one.
+//
+// Only exact-DYNAMIC_STORAGE stores are recorded, because that is the only class whose handling
+// differs; everything else reads back as "not that class" and keeps the generic path.
+static std::vector<GLbitfield> g_buffer_requested_storage;
+static std::vector<char> g_buffer_has_requested_storage;
+
+// An immutable store requested with GL_DYNAMIC_STORAGE_BIT and nothing else. The application is
+// saying "I will fill this with glBufferSubData and I will never map it", which is exactly what
+// Minecraft's 26.x terrain uber buffer and Sodium's terrain arenas ask for.
+static inline bool is_exact_dynamic_storage(GLbitfield requested) {
+    return requested == GL_DYNAMIC_STORAGE_BIT;
+}
+
+static void record_requested_storage(GLuint buffer, GLbitfield requested) {
+    if (buffer == 0) return;
+    if (static_cast<size_t>(buffer) >= g_buffer_requested_storage.size()) {
+        // Grown in blocks so a run of fresh ids does not reallocate on every allocation.
+        g_buffer_requested_storage.resize(static_cast<size_t>(buffer) + 64, 0);
+        g_buffer_has_requested_storage.resize(static_cast<size_t>(buffer) + 64, 0);
+    }
+    g_buffer_requested_storage[buffer] = requested;
+    g_buffer_has_requested_storage[buffer] = 1;
+}
+
+GLboolean mg_buffer_is_unmapped_dynamic_store(GLuint buffer) {
+    if (buffer == 0 || static_cast<size_t>(buffer) >= g_buffer_has_requested_storage.size()) {
+        return GL_FALSE;
+    }
+    if (!g_buffer_has_requested_storage[buffer]) return GL_FALSE;
+    return is_exact_dynamic_storage(g_buffer_requested_storage[buffer]) ? GL_TRUE : GL_FALSE;
+}
+
+// Whether an unsynchronized mapped write has been issued since the last frame boundary.
+//
+// The frame fence in gl.cpp glClear exists only to bound the cross-frame hazard those writes
+// create. With exact-DYNAMIC_STORAGE stores left unmapped, the terrain uploader no longer takes
+// that path at all, and on a version where nothing does the fence is pure cost - measured at 269
+// to 416 ms per second, and in the movement scenarios of the original baseline 590 to 720 ms per
+// second with single waits reaching the one second timeout.
+//
+// So the boundary asks whether there is anything to bound. Note what this deliberately does *not*
+// do: it does not create a fence at every clear and skip only the wait. That was tried on this
+// driver and rejected, because deleting a sync object that was never flushed is not free here and
+// submit waits grew to over a second. If no unsynchronized write happened, no fence is created,
+// so there is none to delete. Any fence still outstanding from an earlier write stays outstanding
+// and is waited on at the next boundary that actually needs one, by which time it has long since
+// signalled.
+//
+// Relaxed atomic rather than thread_local: the write and the boundary are both on the GL thread
+// today, but losing the flag across threads would silently drop a fence that is needed, whereas a
+// spurious one only costs a wait on an already-signalled object.
+static std::atomic<bool> g_unsynchronized_write_pending{false};
+
+void mg_buffer_note_unsynchronized_write(void) {
+    g_unsynchronized_write_pending.store(true, std::memory_order_relaxed);
+}
+
+GLboolean mg_buffer_take_unsynchronized_write_flag(void) {
+    return g_unsynchronized_write_pending.exchange(false, std::memory_order_relaxed) ? GL_TRUE : GL_FALSE;
+}
+
+#endif
+
 enum BindingIndex : int {
     BI_ARRAY_BUFFER = 0,
     BI_ATOMIC_COUNTER,
@@ -775,9 +846,52 @@ GLboolean glUnmapBuffer(GLenum target) {
 void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfield flags) {
     LOG()
     if (GLES.glBufferStorageEXT) {
+#if defined(MG_PLATFORM_OHOS)
+        // Leave an exact GL_DYNAMIC_STORAGE_BIT request device-local and unmapped.
+        //
+        // buffer_coherent_as_flush is on whenever ANGLE is off, and it promotes anything dynamic or
+        // persistent to MAP_WRITE | COHERENT | PERSISTENT. That is right on ANGLE, where GLES is
+        // emulated over Vulkan and buffer renaming is cheap. On the native Maleoon driver it puts
+        // Minecraft's terrain uber buffer and Sodium's terrain arenas - pure GPU-read resources the
+        // application never maps - into host-coherent memory, and everything downstream of that has
+        // been expensive:
+        //
+        //   - glBufferSubData into the promoted store performs an implicit synchronization,
+        //     measured at about 1300 ms per second, which is why an unsynchronized mapped write was
+        //     introduced to avoid it;
+        //   - mapping the store instead does not avoid it, because this driver does not implement
+        //     GL_MAP_INVALIDATE_RANGE_BIT's discard: mapping the 139 MiB destination still waits for
+        //     the draws reading it. Measured over 226 s of gameplay and 20451 uploads,
+        //     glMapBufferRange was 3939 us of a 3946 us upload and burned 36 % of wall clock. That
+        //     is the stutter felt when moving;
+        //   - and dropping only GL_MAP_COHERENT_BIT while keeping the store mapped is worse again,
+        //     because the real glFlushMappedBufferRange it hands back measured 5091 us per call.
+        //
+        // Withholding the promotion from this class removes the cause rather than compensating for
+        // it. The store is then not mappable at all, so there is no mapping to synchronize and
+        // nothing to flush, and the only way to update it is glBufferSubData - which on these same
+        // buffers measured 11.6 us, and which the driver orders behind the draws that read it. That
+        // ordering is what makes the terrain correct without a gate or a fence.
+        //
+        // Deliberately restricted to the exact request. A store the application asked for with
+        // GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT - Sodium's staging buffer - keeps the promotion:
+        // it is mapped every frame, and taking coherence away from a mapping is the 5091 us case
+        // above. Withholding the promotion from that class as well was tried on 2026-08-03 and made
+        // everything worse; this change must not be widened into it.
+        const bool preserve_unmapped_dynamic =
+            global_settings.buffer_coherent_as_flush && is_exact_dynamic_storage(flags);
+        const GLenum bindingQuery = get_binding_query(target);
+        if (preserve_unmapped_dynamic && bindingQuery) {
+            record_requested_storage(find_bound_buffer(bindingQuery), flags);
+        }
+        if (global_settings.buffer_coherent_as_flush && !preserve_unmapped_dynamic &&
+            ((flags & GL_MAP_PERSISTENT_BIT) != 0 || (flags & GL_DYNAMIC_STORAGE_BIT) != 0))
+            flags |= (GL_MAP_WRITE_BIT | GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT);
+#else
         if (global_settings.buffer_coherent_as_flush &&
             ((flags & GL_MAP_PERSISTENT_BIT) != 0 || (flags & GL_DYNAMIC_STORAGE_BIT) != 0))
             flags |= (GL_MAP_WRITE_BIT | GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT);
+#endif
         GLES.glBufferStorageEXT(target, size, data, flags);
     }
     CHECK_GL_ERROR

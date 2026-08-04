@@ -52,6 +52,24 @@ extern "C"
 
     void InitVertexArrayMap(size_t expectedSize);
 
+#if defined(MG_PLATFORM_OHOS)
+
+    // True for an immutable store the application requested with GL_DYNAMIC_STORAGE_BIT and nothing
+    // else, which on this platform is deliberately left device-local and unmapped instead of being
+    // promoted to coherent host-visible storage. Such a store cannot be mapped, so an upload must go
+    // through glBufferSubData and let the driver order it behind the draws that read the buffer.
+    // See the reasoning on glBufferStorage in buffer.cpp.
+    GLboolean mg_buffer_is_unmapped_dynamic_store(GLuint buffer);
+
+    // Record that an unsynchronized mapped write was issued, and test-and-clear that record at the
+    // frame boundary. The frame fence in gl.cpp glClear exists only to bound the hazard those
+    // writes create, so a boundary with none to bound creates no fence at all. See buffer.cpp for
+    // why the fence is not merely left unwaited.
+    void mg_buffer_note_unsynchronized_write(void);
+    GLboolean mg_buffer_take_unsynchronized_write_flag(void);
+
+#endif
+
     GLAPI GLAPIENTRY void glGenBuffers(GLsizei n, GLuint* buffers);
 
     GLAPI GLAPIENTRY void glDeleteBuffers(GLsizei n, const GLuint* buffers);
