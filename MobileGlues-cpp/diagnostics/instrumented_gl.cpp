@@ -26,9 +26,6 @@
 #include "../gl/mg.h"
 #include "../gles/loader.h"
 #include "counters.h"
-#if defined(MG_PLATFORM_OHOS)
-#include "../gl/buffer.h"
-#endif
 
 // Per-file verbosity switch, as in every other translation unit here: the logging macros test it.
 #define DEBUG 0
@@ -41,19 +38,6 @@ extern "C" GLAPI GLAPIENTRY void glBufferSubDataARB(GLenum target, GLintptr offs
 #endif
 extern "C" GLAPI GLAPIENTRY void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void* data) {
     LOG_D("Use native function: %s @ %s(...)", RENDERERNAME, __FUNCTION__);
-#if defined(MG_PLATFORM_OHOS)
-    // Writing a large store that in-flight draws are reading costs 55 to 188 ms per call on this
-    // driver, whatever the byte count. Where that applies, the bytes are staged and a GPU copy moves
-    // them instead; see mg_buffer_staged_upload in gl/buffer.cpp for the measurements and for why
-    // the copy needs no fence. Every other upload, including all small ones, falls through unchanged.
-    //
-    // Hooked here because this is the single definition of glBufferSubData in the layer: the
-    // direct-state-access wrapper's own fallback path lands here too, so one hook covers both.
-    if (mg_buffer_staged_upload(target, offset, size, data) == GL_TRUE) {
-        CHECK_GL_ERROR
-        return;
-    }
-#endif
     const uint64_t startNs = mg::diagnostics::timestamp();
     GLES.glBufferSubData(target, offset, size, data);
     mg::diagnostics::record_sub_data(mg::diagnostics::non_negative_bytes(size), mg::diagnostics::elapsed_ns(startNs));

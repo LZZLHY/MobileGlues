@@ -15,9 +15,6 @@
 #include "../diagnostics/counters.h"
 #include "mg.h"
 #include "framebuffer.h"
-#if defined(MG_PLATFORM_OHOS)
-#include "buffer.h"
-#endif
 
 #define DEBUG 0
 
@@ -134,21 +131,7 @@ void glClear(GLbitfield mask) {
     // This belongs at the frame boundary rather than on the upload path. Fencing per upload
     // forces a flush that breaks tiled rendering into fragments and costs most of the frame rate.
     if ((mask & GL_COLOR_BUFFER_BIT) != 0) {
-#if defined(MG_PLATFORM_OHOS)
-        // Only fence if there is something to fence. The hazard is created by the unsynchronized
-        // mapped write in glNamedBufferSubData, and with exact-DYNAMIC_STORAGE stores left unmapped
-        // (see gl/buffer.cpp glBufferStorage) the terrain uploader no longer takes that path, so on
-        // those versions this wait was paying 269 to 416 ms per second for nothing - and 590 to 720
-        // ms per second while moving, with single waits reaching the one second timeout.
-        //
-        // No fence is created when none is needed, rather than creating one and skipping the wait:
-        // on this driver deleting a sync object that was never flushed is not free, and that variant
-        // was measured pushing submit waits past a second.
-        const bool unsynchronizedWritePending = mg_buffer_take_unsynchronized_write_flag() == GL_TRUE;
-        if (unsynchronizedWritePending && GLES.glFenceSync && GLES.glClientWaitSync) {
-#else
         if (GLES.glFenceSync && GLES.glClientWaitSync) {
-#endif
             static GLsync _frameFence = nullptr;
             if (_frameFence) {
                 const uint64_t waitStart = mg::diagnostics::timestamp();
@@ -160,15 +143,7 @@ void glClear(GLbitfield mask) {
         }
         // The colour clear is the most reliable frame boundary available here: the application
         // performs exactly one per rendered frame, and unlike a swap it is visible to this layer.
-#if defined(MG_PLATFORM_OHOS)
-        // Names the policy in the counter dumps so a run can be attributed without guessing which
-        // build produced it. "unmapped-ordered" is the storage decision in gl/buffer.cpp: exact
-        // GL_DYNAMIC_STORAGE_BIT stores stay device-local and are updated through the ordered
-        // command stream, so the fence above is conditional rather than per-clear.
-        mg::diagnostics::on_frame_boundary("unmapped-ordered");
-#else
         mg::diagnostics::on_frame_boundary("direct-map+frame-fence");
-#endif
     }
 
     if (global_settings.angle == AngleMode::Enabled && mask == GL_DEPTH_BUFFER_BIT &&

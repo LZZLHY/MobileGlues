@@ -9,9 +9,6 @@
 #include <cassert>
 #include "../texture.h"
 #include "../../diagnostics/counters.h"
-#if defined(MG_PLATFORM_OHOS)
-#include "../buffer.h"
-#endif
 
 #define DEBUG 0
 
@@ -270,33 +267,12 @@ void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const
     GLint64 bufSize = 0;
     GLES.glGetBufferParameteri64v(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &bufSize);
     void* p = nullptr;
-#if defined(MG_PLATFORM_OHOS)
-    // A store the application requested as exactly GL_DYNAMIC_STORAGE_BIT is left device-local and
-    // unmapped here, so it has no mapping to write through; see glBufferStorage in gl/buffer.cpp.
-    // Skip the attempt rather than relying on glMapBufferRange to fail: the failure is correct but it
-    // raises GL_INVALID_OPERATION on the hottest path in the terrain uploader, which the application
-    // would then observe through glGetError.
-    //
-    // The ordinary glBufferSubData below is not a fallback for this class, it is the intended route.
-    // On this driver it measured 11.6 us against 3946 us for the mapped write, and the driver orders
-    // it behind the draws reading the buffer, which is what removes the terrain corruption that the
-    // unsynchronized mapped write caused.
-    const bool mappableDestination = mg_buffer_is_unmapped_dynamic_store(buffer) == GL_FALSE;
-    if (data && bufSize >= DIRECT_MAP_MIN_SIZE && mappableDestination) {
-#else
     if (data && bufSize >= DIRECT_MAP_MIN_SIZE) {
-#endif
         const uint64_t mapStartNs = mg::diagnostics::timestamp();
         p = GLES.glMapBufferRange(GL_ARRAY_BUFFER, offset, size, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
         mg::diagnostics::record_direct_map_attempt(mg::diagnostics::elapsed_ns(mapStartNs));
     }
     if (p) {
-#if defined(MG_PLATFORM_OHOS)
-        // The write below performs no write-after-read synchronization, so the frame boundary has to
-        // fence. Recording it here means a boundary only pays for a fence when one of these actually
-        // happened; see gl/buffer.cpp and gl.cpp glClear.
-        mg_buffer_note_unsynchronized_write();
-#endif
         const uint64_t memcpyStartNs = mg::diagnostics::timestamp();
         memcpy(p, data, static_cast<size_t>(size));
         const uint64_t memcpyNs = mg::diagnostics::elapsed_ns(memcpyStartNs);
