@@ -103,6 +103,58 @@ The pattern is consistent: on this driver, making a host-visible copy correct co
 the copy, and removing the synchronization corrupts geometry. Adding another fence anywhere in
 this design cannot win.
 
+### 2026-08-04: three upload routes measured against each other, and the conclusion ★
+
+All three were built, shipped to the device and judged by the user on frame rate *and* on
+camera smoothness, which is the axis the counters do not show. Terrain correctness was judged
+on 26.2 with Sodium.
+
+| Route | Destination storage | What writes it | Terrain | Frame rate | Smooth |
+| --- | --- | --- | --- | --- | --- |
+| Baseline (`2ea790f`) | promoted to `MAP_WRITE\|COHERENT\|PERSISTENT` | CPU, unsynchronized mapped write | **corrupt** | normal | **yes** |
+| Gate v1 (`fa9d6fa`) | same | CPU, synchronous `glBufferSubData` (gate blocked the fast path) | correct | collapsed | no |
+| Withhold the promotion (`afa51bf`) | device-local, unmappable | CPU, synchronous `glBufferSubData` | correct | low | no |
+| Staged GPU copy (`458b4c5`) | device-local, unmappable | staging store + `glCopyBufferSubData` | correct | **single digits** | no |
+
+Measured single `glBufferSubData` into the 128 MiB terrain store with the promotion withheld,
+across 75 one-second windows: in the 21 windows that touched it, mean 65 ms, median 55 ms,
+peak 188 ms. In the 54 windows that touched only small stores, mean 149 us. The cost tracks the
+destination, not the byte count.
+
+**The only fast configuration is the unsynchronized mapped write into promoted host-coherent
+storage, and it is the only incorrect one.** Every route that stops the CPU writing coherent
+memory is slower, and the two that remove the mapping entirely are the slowest of all — which
+suggests the driver depends on being able to rename a host-visible allocation, and waits for the
+readers when it cannot.
+
+Two figures recorded earlier in this file **do not reproduce** and must not be used again to
+justify a route: `per ordered glBufferSubData on the same buffers: 11.6 us`, and the
+`15.9 us` staging write plus `109 us` copy. Whatever they measured, it was not the terrain store
+under load.
+
+What this makes untrue: that the cost of updating the terrain store can be avoided by picking a
+different storage class or a different upload route. Three have now been measured and the
+ranking is unambiguous.
+
+What is left, and it is not another upload route:
+
+- **Per-range hazard tracking (Phase 3) is the only remaining candidate**, because the fast
+  write is fast precisely by doing no synchronization. It can only be made correct by not
+  overwriting bytes an in-flight draw reads, which means knowing which ranges those are. Note
+  the difficulty honestly: a vertex array binding gives an offset and a stride but no length, so
+  the readable range cannot be derived from bindings alone.
+- **Or accept the corruption on 26.2 with Sodium**, which is what upstream did: issue `#432`
+  reports the same thing on Android with a Mali-G57 and is marked `Not planned`, and PSA `#313`
+  states Sodium is not a supported configuration. An unplayable frame rate for every user is
+  worse than corrupt terrain in one configuration.
+- **And before either: profile the render thread.** Every round in this area that started from a
+  mechanism instead of a profile has been wrong, including all three above. `-DAMCL_STACK_SAMPLER=ON`
+  exists for this.
+
+One method note, because it caused a false conclusion mid-round: a 29 fps reading was taken while
+chunks were still streaming and treated as steady state; the same build measured 60 fps once the
+scene settled. Sample the present interval several times, spaced, after movement stops.
+
 ### Correction: one row above was a misclassification, and it hid the answer
 
 "Drop the promotion for exact `GL_DYNAMIC_STORAGE_BIT`" was struck through above because its
