@@ -28,59 +28,6 @@ static std::vector<size_t> g_buffer_datasize;
 
 static std::vector<GLuint> g_element_array_buffer_per_vao;
 
-#if defined(MG_PLATFORM_OHOS)
-
-// Frame-scoped record of which buffers the application has bound as a vertex source.
-//
-// glNamedBufferSubData writes large buffers through an UNSYNCHRONIZED mapping, which performs no
-// write-after-read synchronization at all. The frame-boundary fence bounds that race across
-// frames, but it cannot bound it within a frame: if the application draws from a buffer and then
-// writes the same buffer again before the frame ends, the write lands in memory that a draw of
-// this frame is still reading.
-//
-// Buffer size was used as a proxy for "drawn at most once per frame". That holds for the vanilla
-// terrain uber buffer, which is fully uploaded before anything is drawn from it. It does not hold
-// for Sodium, whose terrain arenas are drawn repeatedly inside one frame across the solid, cutout
-// and translucent passes with fresh chunk uploads interleaved between the passes. Being large is
-// exactly what those arenas have in common with the uber buffer, so the proxy admits the case it
-// was meant to exclude, and Sodium terrain renders scrambled.
-//
-// This replaces the proxy with the condition it was standing in for. A buffer is marked the moment
-// it becomes reachable as a vertex source and the marks are cleared at the frame boundary, so an
-// unsynchronized write is only taken for a buffer no draw in this frame can read. The only draws
-// that can still be in flight are then the previous frame's, which is what the fence covers.
-//
-// Marking on bind rather than on draw is deliberate. It needs no hook in the draw path, and it
-// fails toward the synchronous path: a bind that is never drawn from only costs performance, while
-// a draw whose source binding was missed would cost correctness. Vanilla keeps the direct path
-// either way, because its terrain uploads all happen before the uber buffer is bound for drawing.
-static std::vector<char> g_vertex_source_this_frame;
-
-static void mark_vertex_source(GLuint buffer) {
-    if (buffer == 0) return;
-    if (static_cast<size_t>(buffer) >= g_vertex_source_this_frame.size()) {
-        // Grown in blocks so a run of fresh buffer ids does not reallocate on every bind.
-        g_vertex_source_this_frame.resize(static_cast<size_t>(buffer) + 64, 0);
-    }
-    g_vertex_source_this_frame[buffer] = 1;
-}
-
-GLboolean mg_buffer_used_as_vertex_source_this_frame(GLuint buffer) {
-    if (buffer == 0 || static_cast<size_t>(buffer) >= g_vertex_source_this_frame.size()) {
-        return GL_FALSE;
-    }
-    return g_vertex_source_this_frame[buffer] ? GL_TRUE : GL_FALSE;
-}
-
-void mg_buffer_clear_vertex_source_marks(void) {
-    const size_t count = g_vertex_source_this_frame.size();
-    for (size_t i = 0; i < count; ++i) {
-        g_vertex_source_this_frame[i] = 0;
-    }
-}
-
-#endif
-
 enum BindingIndex : int {
     BI_ARRAY_BUFFER = 0,
     BI_ATOMIC_COUNTER,
@@ -395,11 +342,6 @@ void glBindBuffer(GLenum target, GLuint buffer) {
     LOG()
     LOG_D("glBindBuffer, target = %s, buffer = %d", glEnumToString(target), buffer)
     set_bound_buffer_by_target(target, buffer);
-#if defined(MG_PLATFORM_OHOS)
-    if (target == GL_ARRAY_BUFFER) {
-        mark_vertex_source(buffer);
-    }
-#endif
     // save ibo binding to vao
     if (target == GL_ELEMENT_ARRAY_BUFFER) {
         update_vao_ibo_binding(find_bound_array(), buffer);
@@ -497,11 +439,6 @@ void glBindVertexBuffer(GLuint bindingindex, GLuint buffer, GLintptr offset, GLs
     LOG()
     LOG_D("glBindVertexBuffer, bindingindex = %d, buffer = %d, offset = %p, stride = %i", bindingindex, buffer, offset,
           stride)
-#if defined(MG_PLATFORM_OHOS)
-    // MC 26.2's separate-attribute vertex array path binds terrain through here rather than through
-    // glBindBuffer(GL_ARRAY_BUFFER), so both entry points have to mark.
-    mark_vertex_source(buffer);
-#endif
     // Todo: should record fake buffer binding here, when glGetVertexArrayIntegeri_v is called, should return fake
     // buffer id
     if (!has_buffer(buffer) || buffer == 0) {

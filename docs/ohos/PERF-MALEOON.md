@@ -127,6 +127,41 @@ separate-attribute vertex array path uses the latter.
 
 Vanilla keeps the fast path unchanged, because its uploads all happen before the bind.
 
+### That gate was implemented, shipped once, and reverted: it marked from our own bind
+
+The analysis above is still correct. The implementation was not, and the way it failed is worth
+more than the code was.
+
+`glNamedBufferSubData` does not receive a binding, it establishes one, by calling
+`temporarilyBindBuffer`, which calls **this layer's own** `glBindBuffer(GL_ARRAY_BUFFER, ...)`.
+The marking hook was placed in exactly that function, so every upload marked its own target before
+the gate read the mark:
+
+```text
+temporarilyBindBuffer(buffer)                       -> glBindBuffer -> mark_vertex_source(buffer)
+mg_buffer_used_as_vertex_source_this_frame(buffer)  -> GL_TRUE, set two lines earlier
+```
+
+The mark is supposed to mean "the application made this buffer reachable as a vertex source", but
+`glBindBuffer` is both the public entry point and the internal mechanism and cannot tell the two
+apart. The early-out in `temporarilyBindBuffer` does not save it either: that only skips the bind
+when the buffer is already the current `GL_ARRAY_BUFFER` binding, which it is not, because the
+previous upload restored the prior binding.
+
+So the direct write was off from the first upload onward, every large upload fell back to a
+synchronous `glBufferSubData` into `COHERENT | PERSISTENT` storage at about 4604 us a call, and MC
+26.1.2 and 26.2 both became unplayable, with and without Sodium. The corruption did disappear,
+because the unsynchronized write stopped happening at all.
+
+Two requirements for the next attempt:
+
+- **Separate the internal bind from the public one.** An internal helper must update the shadow
+  binding state without marking, and `temporarilyBindBuffer` and every other internal rebind must
+  use it. Until that separation exists, any hook in `glBindBuffer` fires on our own traffic.
+- **Do not accept `direct_hits` falling to zero as evidence the gate works.** It reads identically
+  to "the gate never lets anything through", which is what actually happened. The device check has
+  to assert a frame rate and `direct_hits > 0` on vanilla, not only the Sodium numbers.
+
 ## The colour clear is not a frame boundary, but the fence stays there anyway
 
 The fence sat on `glClear(GL_COLOR_BUFFER_BIT)`, with a comment asserting the application clears

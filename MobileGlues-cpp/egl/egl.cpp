@@ -14,12 +14,6 @@
 #include "../glx/lookup.h"
 #include "loader.h"
 
-#if defined(MG_PLATFORM_OHOS)
-// Defined in gl/buffer.cpp. Declared here rather than including gl/buffer.h so this translation
-// unit does not have to pull in the desktop GL headers that come with it.
-extern "C" void mg_buffer_clear_vertex_source_marks(void);
-#endif
-
 #define DEBUG 0
 
 extern "C"
@@ -237,19 +231,6 @@ extern "C"
         } else {
             result = egl_eglSwapBuffers(dpy, surface);
         }
-#if defined(MG_PLATFORM_OHOS)
-        // Frame boundary for the vertex-source marks that gate the unsynchronized write in
-        // glNamedBufferSubData. This is the only per-present hook in the layer: glfwSwapBuffers
-        // calls it exactly once per rendered frame, whereas glClear with a colour bit was measured
-        // at 1.5 to 4.3 times per present on a Maleoon 920. Clearing on the clear would drop a mark
-        // mid-frame, and a buffer bound before that clear but drawn after it would then wrongly
-        // qualify for an unsynchronized write.
-        //
-        // The frame fence deliberately stays in gl.cpp glClear. It is measured at 20 to 55 ms per
-        // second there, which is not worth relocating, and firing it more often than once per
-        // present keeps the GPU closer to the CPU, which narrows the window the gate has to cover.
-        mg_buffer_clear_vertex_source_marks();
-#endif
         return result;
     }
 
