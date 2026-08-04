@@ -9,6 +9,9 @@
 #include <cassert>
 #include "../texture.h"
 #include "../../diagnostics/counters.h"
+#if defined(MG_PLATFORM_OHOS)
+#include "../buffer.h"
+#endif
 
 #define DEBUG 0
 
@@ -141,7 +144,17 @@ void temporarilyBindBuffer(GLuint bufferID, GLenum target = GL_ARRAY_BUFFER) {
     }
     bufferBindingStack[target].push_back(prev);
     LOG_D("[DSA] [TempBind] target=0x%X, prev=%u -> bind=%u", target, prev, bufferID);
+#if defined(MG_PLATFORM_OHOS)
+    // This bind exists so the non-DSA call below has a target; the application did not ask for
+    // it. Without this bracket it would set the vertex-source mark that gates the unsynchronized
+    // write in glNamedBufferSubData, which reads that mark a few lines later - so every upload
+    // would disqualify itself and the fast path would never be taken. See gl/buffer.cpp.
+    mg_buffer_begin_internal_bind();
+#endif
     glBindBuffer(target, bufferID);
+#if defined(MG_PLATFORM_OHOS)
+    mg_buffer_end_internal_bind();
+#endif
     CHECK_GL_ERROR;
 }
 void restoreTemporaryBufferBinding(GLenum target = GL_ARRAY_BUFFER) {
@@ -161,7 +174,17 @@ void restoreTemporaryBufferBinding(GLenum target = GL_ARRAY_BUFFER) {
     }
 
     LOG_D("[DSA] [Restore] target=0x%X, bind back to %u", target, toRestore);
+#if defined(MG_PLATFORM_OHOS)
+    // Restoring a binding the application established earlier is bookkeeping too. If that buffer
+    // really is a vertex source this frame it was already marked when the application bound it,
+    // so re-marking here would add nothing; marking a binding the application has not touched
+    // this frame would wrongly disqualify it.
+    mg_buffer_begin_internal_bind();
+#endif
     glBindBuffer(target, toRestore);
+#if defined(MG_PLATFORM_OHOS)
+    mg_buffer_end_internal_bind();
+#endif
     CHECK_GL_ERROR;
 }
 
@@ -247,6 +270,20 @@ void glNamedBufferData(GLuint buffer, GLsizeiptr size, const void* data, GLenum 
 // which a frame-boundary fence cannot prevent, and render corrupted. So only buffers at or
 // above the threshold below take the direct path; everything else keeps the original
 // synchronous glBufferSubData, whose upload volume was never the bottleneck.
+//
+// On HarmonyOS the size threshold is not the whole test. A large buffer can also be drawn
+// many times within a single frame - Sodium's terrain arenas are, across the solid, cutout
+// and translucent passes, with chunk uploads interleaved between them - so being large does
+// not imply being drawn at most once, which is the property the frame fence needs. The
+// threshold is therefore combined with a frame-scoped check that no draw of this frame can
+// be reading the buffer. See the mark table in gl/buffer.cpp.
+//
+// The fence itself stays where it is, in gl.cpp glClear. Note when reading that code that a
+// colour clear is not one per presented frame: measured 1.5 to 4.3 per present on a Maleoon
+// 920, so the fence fires several times per frame. That is left alone deliberately, because
+// firing it more often keeps the GPU closer to the CPU and narrows the window the mark table
+// has to cover. The marks are cleared on the real frame boundary instead, in
+// egl/egl.cpp eglSwapBuffers.
 static const GLsizeiptr DIRECT_MAP_MIN_SIZE = 16 * 1024 * 1024;
 
 void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const void* data) {
@@ -267,7 +304,16 @@ void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const
     GLint64 bufSize = 0;
     GLES.glGetBufferParameteri64v(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &bufSize);
     void* p = nullptr;
+#if defined(MG_PLATFORM_OHOS)
+    // Size alone does not establish that no draw of this frame can read the buffer; see the
+    // comment on the mark table in gl/buffer.cpp. A buffer that has already been made reachable
+    // as a vertex source in this frame takes the synchronous path, where the driver does the
+    // write-after-read synchronization that UNSYNCHRONIZED explicitly opts out of.
+    const GLboolean vertexSourceThisFrame = mg_buffer_used_as_vertex_source_this_frame(buffer);
+    if (data && bufSize >= DIRECT_MAP_MIN_SIZE && vertexSourceThisFrame == GL_FALSE) {
+#else
     if (data && bufSize >= DIRECT_MAP_MIN_SIZE) {
+#endif
         const uint64_t mapStartNs = mg::diagnostics::timestamp();
         p = GLES.glMapBufferRange(GL_ARRAY_BUFFER, offset, size, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
         mg::diagnostics::record_direct_map_attempt(mg::diagnostics::elapsed_ns(mapStartNs));
