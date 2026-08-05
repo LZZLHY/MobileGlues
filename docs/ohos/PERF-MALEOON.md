@@ -213,6 +213,82 @@ separate-attribute vertex array path uses the latter.
 
 Vanilla keeps the fast path unchanged, because its uploads all happen before the bind.
 
+### Sharper statement, 2026-08-05: the test reads the size of the store, not the size of the upload ★
+
+The section above says size was standing in for draw frequency. It is worse than that, and the
+precise shape of it went unnoticed for several rounds of device work, so it is worth writing out.
+
+```c
+GLES.glGetBufferParameteri64v(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &bufSize);
+if (data && bufSize >= DIRECT_MAP_MIN_SIZE) { ... UNSYNCHRONIZED map ... }
+```
+
+`bufSize` is `GL_BUFFER_SIZE` of the whole buffer object. `size` — the length of *this* upload — is
+never compared against anything. So a two-kilobyte write into a 256 MiB arena takes the
+unsynchronized path on exactly the same terms as a 128 MiB one. Read as a policy it says "once a
+buffer is big, every write into it forever is unsynchronized", which is not what the safety argument
+above claims for it.
+
+Measured on device, with `diagnostics` on and Sodium loaded: `named_max_buffer` = **256 MiB** with
+`direct_hits` > 0. The terrain arena is being written through an unsynchronized mapping.
+
+Two premises that had to be corrected to get here, both of which had been keeping Sodium out of
+suspicion for this function:
+
+- **Sodium does reach `glNamedBufferSubData`.** It normally moves bytes with `glCopyBufferSubData`
+  out of a persistently mapped ring, which is why it looked exempt. But `GlBufferArena` falls back
+  to `writeToBuffer` → `glNamedBufferSubData` whenever an upload does not fit the ring's remaining
+  space, and Minecraft's own uploader uses this entry point unconditionally.
+- **`GlBufferArena.free()` merges neighbouring free segments immediately, with no fence and no
+  frame quarantine.** A segment can therefore be freed, reallocated and written in the same frame it
+  was drawn from. The frame fence in `eglSwapBuffers` bounds only the cross-frame case, so it does
+  nothing here.
+
+Put together, this explains the observed corruption without needing anything from the draw path.
+An unsynchronized `memcpy` overwrites bytes a submitted draw is still reading; the section that was
+reading them renders another section's complete vertex block. Because Sodium bakes the section index
+into every vertex (`16.0 * unpack(a_LightAndData.w)`, added to the per-region `u_RegionOffset`), the
+displaced data carries its own position with it — so the result is a whole, correctly textured chunk
+sitting at the wrong section's coordinates, which is exactly the reported symptom rather than
+torn triangles or garbage.
+
+The threshold is now runtime-tunable rather than a compile-time constant, so the hypothesis can be
+tested on the device without a rebuild: `MG_DIRECT_MAP_MIN_MIB`, read once, **negative disables the
+direct write entirely**, absent keeps the historical 16 MiB so default behaviour is unchanged. AMCL
+drives it from the `directMapMinMibOverride` key in the MG config.
+
+### Ruled out on device: the multidraw translation backend ★do not re-open
+
+Before the store-size finding, the leading hypothesis was that the corruption came from MobileGlues'
+`glMultiDrawElementsBaseVertex` translation, since Sodium's terrain goes entirely through it
+(`GLDrawBatch.draw` → `GlRenderPass.multiDrawIndexed` → `GlCommandEncoder.executeDraws`, up to 1793
+sub-draws per region pass, `GL_TRIANGLES` / `GL_UNSIGNED_INT`). The reasoning was sound: for opaque
+passes `storesIndices == false`, so `firstIndex` is 0 for every sub-draw and the only things
+distinguishing them are `count` and `baseVertex` — so a wrong `baseVertex` produces displaced whole
+chunks, the exact symptom.
+
+It was tested by forcing `multidrawMode = 2` (`PreferBaseVertex`), the literal spec expansion that
+emits one `glDrawElementsBaseVertex(mode, counts[i], type, indices[i], basevertex[i])` per sub-draw
+and uses no intermediate buffer at all. Device log confirmed the path:
+`multidrawMode = Unroll` → `PreferBaseVertex` → `-> BaseVertex (OK)`. **Terrain was still wrong.**
+Since that backend has no shared state left to corrupt, the multidraw translation is exonerated;
+so is the shared indirect command buffer used by mode 3.
+
+Also settled while looking: there is no `gl_DrawID`, no `baseInstance` and no instancing anywhere in
+Sodium's terrain shaders — a grep of all six shader files found zero such built-ins — so no theory
+resting on draw-index plumbing survives either.
+
+The first attempt at this experiment produced no signal at all, for a reason worth remembering:
+`multidrawMode` was written straight into the device `config.json`, and AMCL's own
+`entry/src/main/cpp/platform/mg_config.cpp` **rewrites that file from a template on every start**, so
+the key was erased before MobileGlues read it. A whole device round was spent measuring the default
+configuration while believing otherwise. Overrides now go through dedicated `*Override` keys that the
+template preserves, and `.tmp-devlogs/set-mg-config.ps1` reads the file back after launch. A second
+instance of the same class of error was found in the same code on 2026-08-05: `readIntKey` parsed a
+single digit and rejected a leading `-`, so `"directMapMinMibOverride": -1` would have silently read
+back as the fallback 16 and the "disabled" experiment would have run the unchanged threshold.
+**Whenever a device experiment is configured, prove from the device which configuration ran.**
+
 ### The gate is a dead end at this granularity, measured twice on device ★read before touching it
 
 Two versions of it were built, shipped and measured. They are the two ends of one knob, and
