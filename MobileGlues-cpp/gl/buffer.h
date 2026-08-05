@@ -34,6 +34,16 @@ extern "C"
 
     GLuint find_bound_buffer(GLenum key);
 
+#if defined(MG_PLATFORM_OHOS)
+
+    // Size of a buffer's store as this layer recorded it, 0 when unknown. Recorded by
+    // glBufferData and glBufferStorage. Declared here so an upload can answer "how big is this
+    // buffer" without a driver round trip; both were previously file-local to buffer.cpp.
+    void set_buffer_data_size(GLuint buffer, size_t size);
+    size_t get_buffer_data_size(GLuint buffer);
+
+#endif
+
     GLuint gen_array();
 
     GLboolean has_array(GLuint key);

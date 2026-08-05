@@ -98,8 +98,15 @@ void glDrawBuffer(GLenum buffer) {
         GLenum buffers[] = {buffer};
         glDrawBuffers(1, buffers);
     } else {
+#if defined(MG_PLATFORM_OHOS)
+        // Use the value ensure_max_attachments() already cached at first bind. Querying the driver
+        // here on every call is a pipeline round trip for a constant, and this is a draw-state call.
+        ensure_max_attachments();
+        const GLint maxAttachments = MAX_COLOR_ATTACHMENTS;
+#else
         GLint maxAttachments;
         GLES.glGetIntegerv(GL_MAX_COLOR_ATTACHMENTS, &maxAttachments);
+#endif
 
         if (buffer == GL_NONE) {
             framebuffers[current_draw_fbo].color_attachments_all_none = true;

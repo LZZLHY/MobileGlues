@@ -9,6 +9,10 @@
 #include <cassert>
 #include "../texture.h"
 #include "../../diagnostics/counters.h"
+#if defined(MG_PLATFORM_OHOS)
+// For get_buffer_data_size, used to answer GL_BUFFER_SIZE without a driver round trip.
+#include "../buffer.h"
+#endif
 
 #define DEBUG 0
 
@@ -262,10 +266,31 @@ void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const
     const uint64_t uploadBytes = mg::diagnostics::non_negative_bytes(size);
 
     temporarilyBindBuffer(buffer);
+    GLint64 bufSize = 0;
+#if defined(MG_PLATFORM_OHOS)
+    // Answer the size from MobileGlues' own record instead of asking the driver.
+    //
+    // The comment this replaces asserted that GL_BUFFER_SIZE is immutable storage metadata and so
+    // does not synchronize. That is an assumption about this driver, not a measurement, and it sits
+    // on the hottest path in the layer: the comment on temporarilyBindBuffer above records that MC
+    // 26.2's terrain uploader reaches this function thousands of times per frame. On a tiled GPU a
+    // glGet* can force a pipeline flush, and a flush thousands of times per frame is not something
+    // to leave resting on an assumption.
+    //
+    // The size is known without asking: gl/buffer.cpp records it in glBufferData and glBufferStorage
+    // and it cannot change afterwards for an immutable store. The driver is consulted only when no
+    // record exists, which is the case for a buffer whose storage this layer never saw.
+    const size_t recordedSize = get_buffer_data_size(buffer);
+    if (recordedSize > 0) {
+        bufSize = static_cast<GLint64>(recordedSize);
+    } else {
+        GLES.glGetBufferParameteri64v(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &bufSize);
+    }
+#else
     // GL_BUFFER_SIZE is immutable storage metadata rather than pipeline state, so querying it
     // does not synchronize. Use it to decide whether this buffer qualifies for the direct write.
-    GLint64 bufSize = 0;
     GLES.glGetBufferParameteri64v(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &bufSize);
+#endif
     void* p = nullptr;
     if (data && bufSize >= DIRECT_MAP_MIN_SIZE) {
         const uint64_t mapStartNs = mg::diagnostics::timestamp();
@@ -505,7 +530,15 @@ void temporarilyBindFramebuffer(GLuint framebufferID, GLenum target = GL_DRAW_FR
     glGetIntegerv(bindingQuery, &prev);
     if (prev == framebufferID) {
         framebufferBindingStack[target].push_back(-1);
+#if defined(MG_PLATFORM_OHOS)
+        // Return, as the sentinel above intends. Without it this pushes twice - the sentinel and
+        // then prev - while the matching restore pops once, so the stack grows by one entry on
+        // every already-bound call and is never reclaimed for the life of the process. The buffer
+        // variant of this helper has the same shape and does return.
+        return;
+#else
         // return;
+#endif
     }
     framebufferBindingStack[target].push_back(static_cast<GLuint>(prev));
     LOG_D("[DSA] [TempBind] target=0x%X, prev=%u -> bind=%u", target, prev, framebufferID);
@@ -517,13 +550,26 @@ void restoreTemporaryFramebufferBinding(GLenum target = GL_DRAW_FRAMEBUFFER) {
     auto it = framebufferBindingStack.find(target);
     if (it == framebufferBindingStack.end() || it->second.empty()) {
         LOG_D("[DSA] [Restore] no saved binding for target 0x%X", target);
+#if defined(MG_PLATFORM_OHOS)
+        // Return, as intended. Falling through dereferences end() or calls back() on an empty
+        // vector, which is undefined behaviour, and then binds whatever it read.
+        return;
+#else
         // return;
+#endif
     }
     GLuint toRestore = it->second.back();
     it->second.pop_back();
     if (toRestore == static_cast<GLuint>(-1)) {
         LOG_D("[DSA] [Restore] target=0x%X, no binding to restore", target);
+#if defined(MG_PLATFORM_OHOS)
+        // Sentinel: the temporary bind was skipped because the object was already bound, so there
+        // is nothing to put back. Falling through re-binds (GLuint)-1 as a framebuffer name.
+        if (it->second.empty()) framebufferBindingStack.erase(it);
+        return;
+#else
         // return;
+#endif
     }
     LOG_D("[DSA] [Restore] target=0x%X, bind back to %u", target, toRestore);
     CHECK_GL_ERROR;
@@ -954,7 +1000,14 @@ void temporarilyBindTexture(GLuint textureID, GLenum possibleTarget = 0) {
     glGetIntegerv(bindingQuery, &prev);
     if (prev == static_cast<GLint>(textureID)) {
         textureBindingStack[target].push_back(-1);
+#if defined(MG_PLATFORM_OHOS)
+        // Same unbounded growth as the framebuffer variant: without this return the already-bound
+        // case pushes two entries and the restore pops one. Minecraft drives the texture DSA entry
+        // points constantly, so this stack grows for the whole session.
+        return;
+#else
         // return;
+#endif
     }
     textureBindingStack[target].push_back(static_cast<GLuint>(prev));
     LOG_D("[DSA] [TempBind] target=0x%X, prev=%u -> bind=%u", target, prev, textureID);
@@ -968,14 +1021,26 @@ void restoreTemporaryTextureBinding(GLuint textureID, GLenum possibleTarget = 0)
     auto stackIt = textureBindingStack.find(target);
     if (stackIt == textureBindingStack.end() || stackIt->second.empty()) {
         LOG_D("[DSA] [Restore] no saved binding for target 0x%X", target);
+#if defined(MG_PLATFORM_OHOS)
+        // Return, as intended: otherwise end() is dereferenced or back() is called on an empty
+        // vector, and the result is bound as a texture name.
+        return;
+#else
         // return;
+#endif
     }
 
     GLuint toRestore = stackIt->second.back();
     stackIt->second.pop_back();
     if (toRestore == static_cast<GLuint>(-1)) {
         LOG_D("[DSA] [Restore] target=0x%X, no binding to restore", target);
+#if defined(MG_PLATFORM_OHOS)
+        // Sentinel: nothing to put back. Falling through binds (GLuint)-1.
+        if (stackIt->second.empty()) textureBindingStack.erase(stackIt);
+        return;
+#else
         // return;
+#endif
     }
     LOG_D("[DSA] [Restore] target=0x%X, bind back to %u", target, toRestore);
     CHECK_GL_ERROR;

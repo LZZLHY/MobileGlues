@@ -774,6 +774,15 @@ GLboolean glUnmapBuffer(GLenum target) {
 
 void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfield flags) {
     LOG()
+#if defined(MG_PLATFORM_OHOS)
+    // Record the immutable size so an upload never has to ask the driver for GL_BUFFER_SIZE.
+    // glBufferData already does this; an immutable store had no equivalent, which left
+    // glNamedBufferSubData querying the driver on every call. See DSAWrapper.cpp.
+    {
+        const GLenum bindingQuery = get_binding_query(target);
+        if (bindingQuery && size > 0) set_buffer_data_size(find_bound_buffer(bindingQuery), static_cast<size_t>(size));
+    }
+#endif
     if (GLES.glBufferStorageEXT) {
         if (global_settings.buffer_coherent_as_flush &&
             ((flags & GL_MAP_PERSISTENT_BIT) != 0 || (flags & GL_DYNAMIC_STORAGE_BIT) != 0))

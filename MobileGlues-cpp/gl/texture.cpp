@@ -702,8 +702,14 @@ void glTexStorage2D(GLenum target, GLsizei levels, GLenum internalFormat, GLsize
     tex->swizzle_param[2] = GL_BLUE;
     tex->swizzle_param[3] = GL_ALPHA;
 
+#if !defined(MG_PLATFORM_OHOS)
     GLenum ERR = GLES.glGetError();
     if (ERR != GL_NO_ERROR) LOG_E("glTexStorage2D ERROR: %d", ERR)
+#else
+    // Hand-written glGetError, unlike the CHECK_GL_ERROR macro it resembles, so it survives into
+    // release builds where LOG_E expands to nothing - a driver round trip whose result is discarded.
+    // Minecraft 1.21.2+ allocates textures through GlTexture, so this runs on texture churn.
+#endif
 }
 
 void glTexStorage3D(GLenum target, GLsizei levels, GLenum internalFormat, GLsizei width, GLsizei height,

@@ -13,6 +13,11 @@
 #include "../gles/loader.h"
 #include "../glx/lookup.h"
 #include "loader.h"
+#if defined(MG_PLATFORM_OHOS)
+// For the frame fence below: the counter helpers and the sync enums/types.
+#include "../diagnostics/counters.h"
+#include "../gl/glcorearb.h"
+#endif
 
 #define DEBUG 0
 
@@ -231,6 +236,33 @@ extern "C"
         } else {
             result = egl_eglSwapBuffers(dpy, surface);
         }
+#if defined(MG_PLATFORM_OHOS)
+        // Frame fence, moved here from gl.cpp glClear.
+        //
+        // glNamedBufferSubData writes large buffers through an UNSYNCHRONIZED mapping, which races
+        // draws still in flight; bounding the GPU to one frame behind removes the cross-frame part
+        // of that race. What the previous placement got wrong was the boundary: a colour clear is
+        // not one per presented frame - measured 1.5 to 4.3 per present on a Maleoon 920 - so the
+        // blocking wait ran several times per frame and cost 269 to 416 ms per second on MC 26.x,
+        // rising to 590 to 720 ms/s while moving with single waits hitting the one second timeout.
+        //
+        // eglSwapBuffers is the real boundary: glfwSwapBuffers calls it exactly once per rendered
+        // frame. Same protection, between 1.5 and 4.3 times fewer waits.
+        //
+        // Placed after the present, so the wait overlaps whatever the compositor is doing rather
+        // than sitting in front of it. The fence is created immediately after the wait, so it
+        // still covers everything this frame submitted.
+        if (GLES.glFenceSync && GLES.glClientWaitSync && GLES.glDeleteSync) {
+            static GLsync frameFence = nullptr;
+            if (frameFence) {
+                const uint64_t waitStart = mg::diagnostics::timestamp();
+                const GLenum waitResult = GLES.glClientWaitSync(frameFence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ULL);
+                mg::diagnostics::record_frame_wait(waitResult, mg::diagnostics::elapsed_ns(waitStart));
+                GLES.glDeleteSync(frameFence);
+            }
+            frameFence = GLES.glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        }
+#endif
         return result;
     }
 

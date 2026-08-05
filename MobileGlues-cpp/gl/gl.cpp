@@ -131,6 +131,22 @@ void glClear(GLbitfield mask) {
     // This belongs at the frame boundary rather than on the upload path. Fencing per upload
     // forces a flush that breaks tiled rendering into fragments and costs most of the frame rate.
     if ((mask & GL_COLOR_BUFFER_BIT) != 0) {
+#if defined(MG_PLATFORM_OHOS)
+        // The fence has moved to egl/egl.cpp eglSwapBuffers. It is kept out of here because a
+        // colour clear is not a frame boundary: measured 1.5 to 4.3 of them per present on a
+        // Maleoon 920, so this blocking glClientWaitSync with GL_SYNC_FLUSH_COMMANDS_BIT ran
+        // several times per frame and behaved closer to a mid-frame glFinish than to a
+        // one-frame-behind throttle. Measured cost here on MC 26.x: 269 to 416 ms per second at
+        // rest, and in the original movement scenarios 590 to 720 ms per second with single waits
+        // reaching the one second timeout - which is what is felt as stutter when turning.
+        //
+        // The earlier decision to leave it here was taken from a 20 to 55 ms/s measurement on
+        // vanilla 1.21.8, a workload where the path it protects never triggers. That figure does
+        // not describe 26.x.
+        //
+        // Only the counter window boundary stays on the colour clear, because it is the most
+        // frequent signal available and the aggregation is per second, not per frame.
+#else
         if (GLES.glFenceSync && GLES.glClientWaitSync) {
             static GLsync _frameFence = nullptr;
             if (_frameFence) {
@@ -141,6 +157,7 @@ void glClear(GLbitfield mask) {
             }
             _frameFence = GLES.glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         }
+#endif
         // The colour clear is the most reliable frame boundary available here: the application
         // performs exactly one per rendered frame, and unlike a swap it is visible to this layer.
         mg::diagnostics::on_frame_boundary("direct-map+frame-fence");
