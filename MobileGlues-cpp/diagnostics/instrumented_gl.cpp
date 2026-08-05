@@ -26,6 +26,10 @@
 #include "../gl/mg.h"
 #include "../gles/loader.h"
 #include "counters.h"
+#if defined(MG_PLATFORM_OHOS)
+// For the copy-destination probe below: the shadow binding lookup and the per-buffer flag.
+#include "../gl/buffer.h"
+#endif
 
 // Per-file verbosity switch, as in every other translation unit here: the logging macros test it.
 #define DEBUG 0
@@ -54,6 +58,14 @@ extern "C" GLAPI GLAPIENTRY void glCopyBufferSubDataARB(GLenum readTarget, GLenu
 extern "C" GLAPI GLAPIENTRY void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOffset,
                                                      GLintptr writeOffset, GLsizeiptr size) {
     LOG_D("Use native function: %s @ %s(...)", RENDERERNAME, __FUNCTION__);
+#if defined(MG_PLATFORM_OHOS)
+    // Probe only, no behaviour change: remember that this destination receives GPU-side copies.
+    // See gl/buffer.h. The destination is read from the shadow binding rather than the driver, so
+    // this costs an array lookup and no round trip. Unconditional rather than gated on diagnostics
+    // because the flag has to be accurate from the first copy, and a diagnostics session that starts
+    // later would otherwise see an empty table.
+    mark_buffer_copy_destination(find_bound_buffer(GL_COPY_WRITE_BUFFER_BINDING));
+#endif
     const uint64_t startNs = mg::diagnostics::timestamp();
     GLES.glCopyBufferSubData(readTarget, writeTarget, readOffset, writeOffset, size);
     mg::diagnostics::record_copy(mg::diagnostics::non_negative_bytes(size), mg::diagnostics::elapsed_ns(startNs));

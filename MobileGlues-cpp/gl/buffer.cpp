@@ -93,11 +93,20 @@ void modify_buffer(GLuint key, GLuint value) {
     g_gen_buffer_exists[key] = 1;
 }
 
+#if defined(MG_PLATFORM_OHOS)
+void mg_clear_buffer_copy_destination(GLuint key);
+#endif
+
 void remove_buffer(GLuint key) {
     if (key < g_gen_buffer_exists.size() && g_gen_buffer_exists[key]) {
         g_gen_buffer_exists[key] = 0;
         g_gen_buffers[key] = 0;
         if (key < g_buffer_datasize.size()) g_buffer_datasize[key] = 0;
+#if defined(MG_PLATFORM_OHOS)
+        // Fake ids are recycled from the free list below, so any per-buffer record has to be cleared
+        // here or the next owner of this id inherits it.
+        mg_clear_buffer_copy_destination(key);
+#endif
         g_free_buffer_ids.push_back(key);
     }
 }
@@ -130,6 +139,33 @@ size_t get_buffer_data_size(GLuint buffer) {
     if (buffer < g_buffer_datasize.size()) return g_buffer_datasize[buffer];
     return 0;
 }
+
+#if defined(MG_PLATFORM_OHOS)
+// See gl/buffer.h for why this exists. Measurement only: nothing branches on it yet.
+//
+// Kept in its own vector rather than added to an existing per-buffer table so that removing the
+// probe later is a clean deletion. Cleared in remove_buffer, because fake ids are recycled from a
+// free list - a stale flag on a recycled id is exactly the class of bug that made an earlier
+// per-buffer table unreliable.
+static std::vector<char> g_buffer_is_copy_destination;
+
+void mark_buffer_copy_destination(GLuint buffer) {
+    if (buffer == 0) return;
+    if (g_buffer_is_copy_destination.size() <= (size_t)buffer) {
+        g_buffer_is_copy_destination.resize((size_t)buffer + 1, 0);
+    }
+    g_buffer_is_copy_destination[buffer] = 1;
+}
+
+GLboolean is_buffer_copy_destination(GLuint buffer) {
+    if (buffer < g_buffer_is_copy_destination.size()) return g_buffer_is_copy_destination[buffer] != 0;
+    return GL_FALSE;
+}
+
+void mg_clear_buffer_copy_destination(GLuint key) {
+    if (key < g_buffer_is_copy_destination.size()) g_buffer_is_copy_destination[key] = 0;
+}
+#endif
 
 static inline int binding_target_to_index(GLenum target) {
     switch (target) {

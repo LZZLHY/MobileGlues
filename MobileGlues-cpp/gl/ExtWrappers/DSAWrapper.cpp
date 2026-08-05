@@ -293,9 +293,45 @@ void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const
 #endif
     void* p = nullptr;
     if (data && bufSize >= DIRECT_MAP_MIN_SIZE) {
+#if defined(MG_PLATFORM_OHOS)
+        // ---- Probes. Measurement only; the chosen access bits are unchanged except for the
+        // ---- sampled synchronized map below, which is gated on diagnostics being enabled.
+        //
+        // Three rounds of work on the 26.2+Sodium terrain race each reasoned from a mechanism and
+        // each was wrong. This path is reached about 41 times a second, so measuring the three
+        // remaining unknowns is far cheaper than arguing about them. See diagnostics/counters.h for
+        // what each number decides.
+        bool sampleSynchronizedMap = false;
+        if (mg::diagnostics::enabled()) {
+            // 1. Is the previous frame's fence signalled *right now*? If it usually is, a gate that
+            //    needs no buffer, range or binding tracking becomes possible.
+            mg::diagnostics::record_direct_fence_poll(mg_frame_fence_poll());
+
+            // 2. Is this destination also a GPU-copy destination? Candidate discriminator between
+            //    Sodium's arena and Minecraft's own terrain heap. Must read ~0 on vanilla 26.2 for
+            //    the idea to be usable.
+            if (is_buffer_copy_destination(buffer)) mg::diagnostics::record_direct_dest_copy_target();
+
+            // 3. Price the only affordable fallback: the same mapped write with UNSYNCHRONIZED
+            //    dropped, so the driver performs the write-after-read wait itself. Sampled at one in
+            //    eight to bound the cost of measuring. This is the one probe that changes behaviour,
+            //    and only toward being more correct, never less.
+            static unsigned directWriteSampleCounter = 0;
+            sampleSynchronizedMap = ((++directWriteSampleCounter & 7u) == 0u);
+        }
+
+        const GLbitfield directAccess =
+            sampleSynchronizedMap ? (GL_MAP_WRITE_BIT) : (GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+        const uint64_t mapStartNs = mg::diagnostics::timestamp();
+        p = GLES.glMapBufferRange(GL_ARRAY_BUFFER, offset, size, directAccess);
+        const uint64_t mapNs = mg::diagnostics::elapsed_ns(mapStartNs);
+        mg::diagnostics::record_direct_map_attempt(mapNs);
+        mg::diagnostics::record_direct_map_cost(!sampleSynchronizedMap, mapNs);
+#else
         const uint64_t mapStartNs = mg::diagnostics::timestamp();
         p = GLES.glMapBufferRange(GL_ARRAY_BUFFER, offset, size, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
         mg::diagnostics::record_direct_map_attempt(mg::diagnostics::elapsed_ns(mapStartNs));
+#endif
     }
     if (p) {
         const uint64_t memcpyStartNs = mg::diagnostics::timestamp();
@@ -333,6 +369,11 @@ void glCopyNamedBufferSubData(GLuint readBuffer, GLuint writeBuffer, GLintptr re
         LOG_W("[DSA] Invalid parameters for glCopyNamedBufferSubData");
         // return;
     }
+#if defined(MG_PLATFORM_OHOS)
+    // Probe only, no behaviour change. The DSA entry point names the destination explicitly, so
+    // unlike the bound-target form there is nothing to resolve. See gl/buffer.h.
+    mark_buffer_copy_destination(writeBuffer);
+#endif
     temporarilyBindBuffer(readBuffer, GL_COPY_READ_BUFFER);
     temporarilyBindBuffer(writeBuffer, GL_COPY_WRITE_BUFFER);
     glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, readOffset, writeOffset, size);

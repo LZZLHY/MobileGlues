@@ -89,6 +89,32 @@ namespace mg::diagnostics {
               v(c.flush_calls), v(c.flush_driver_calls), v(c.flush_skipped_calls), v(c.flush_bytes), us(c.flush_ns),
               us(c.flush_max_ns), v(c.copy_calls), v(c.copy_bytes), us(c.copy_ns), us(c.copy_max_ns))
 
+#if defined(MG_PLATFORM_OHOS)
+        // A separate record so the two above stay byte-identical to every earlier measurement, and
+        // because the line above is already close to the length at which log transports truncate.
+        //
+        // How to read this:
+        //   poll_already vs poll_timeout  -> is the previous frame's fence signalled when a direct
+        //                                    write happens? already >> timeout means a cheap
+        //                                    provably-correct gate exists; the reverse kills it.
+        //   dest_copy_target              -> compare against direct_hits. Near-equal under Sodium
+        //                                    and ZERO on vanilla 26.2 is what makes "is a copy
+        //                                    destination" a usable discriminator. Non-zero on
+        //                                    vanilla means it is not.
+        //   sync_map vs unsync_map        -> per-call cost of the same mapped write with and
+        //                                    without GL_MAP_UNSYNCHRONIZED_BIT. This is the price
+        //                                    of the only affordable fallback; glBufferSubData into
+        //                                    the same store costs 3,946-4,604 us for comparison.
+        LOG_I("[MG-DIAG-PROBE] policy=%s direct_poll_already=%llu direct_poll_timeout=%llu "
+              "direct_poll_other=%llu direct_dest_copy_target=%llu direct_sync_map_calls=%llu "
+              "direct_sync_map_us=%llu direct_sync_map_max_us=%llu direct_unsync_map_calls=%llu "
+              "direct_unsync_map_us=%llu direct_unsync_map_max_us=%llu",
+              policy ? policy : "(none)", v(c.direct_poll_already), v(c.direct_poll_timeout), v(c.direct_poll_other),
+              v(c.direct_dest_copy_target), v(c.direct_sync_map_calls), us(c.direct_sync_map_ns),
+              us(c.direct_sync_map_max_ns), v(c.direct_unsync_map_calls), us(c.direct_unsync_map_ns),
+              us(c.direct_unsync_map_max_ns))
+#endif
+
         c = Counters{};
         g_window_start_ns = now;
     }

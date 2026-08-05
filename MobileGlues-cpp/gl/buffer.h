@@ -42,6 +42,27 @@ extern "C"
     void set_buffer_data_size(GLuint buffer, size_t size);
     size_t get_buffer_data_size(GLuint buffer);
 
+    // "This buffer has been the destination of a buffer-to-buffer copy at least once."
+    //
+    // A probe, not a policy: nothing in the layer changes behaviour on it yet. It exists to test a
+    // candidate discriminator for the MC 26.2 + Sodium terrain race using only calls this layer
+    // already sees, rather than assumptions about the application's internal ordering.
+    //
+    // The idea being tested: Sodium moves terrain through its own persistently mapped ring plus
+    // glCopyBufferSubData, and reaches glNamedBufferSubData only when an upload does not fit the
+    // ring's remaining space - so its arena is a copy destination. Minecraft's own terrain heap is
+    // written directly and, as far as is known, never copied into. If that holds on the device, this
+    // flag separates the buffer that races from the one that does not.
+    //
+    // It must be confirmed on vanilla 26.2 before anything depends on it: see the
+    // direct_dest_copy_target counter.
+    void mark_buffer_copy_destination(GLuint buffer);
+    GLboolean is_buffer_copy_destination(GLuint buffer);
+
+    // Zero-timeout poll of the per-present frame fence; defined in egl/egl.cpp. Returns a
+    // glClientWaitSync result, or 0 when there is no fence to poll. Cannot block.
+    GLenum mg_frame_fence_poll(void);
+
 #endif
 
     GLuint gen_array();

@@ -21,6 +21,34 @@
 
 #define DEBUG 0
 
+#if defined(MG_PLATFORM_OHOS)
+// The per-present frame fence, hoisted out of eglSwapBuffers so an upload can ask about it.
+//
+// It used to be a function-local static. It is at file scope now because gl/ExtWrappers/DSAWrapper.cpp
+// needs to know whether the previous frame's work has retired *at the moment of an upload*, which is
+// a different question from the one eglSwapBuffers answers.
+//
+// Worth stating precisely, because getting it wrong wasted a round: eglSwapBuffers waits on the
+// fence created at the PREVIOUS present, so its ALREADY_SIGNALED result only proves the GPU finished
+// the previous frame by the time the CPU finished submitting this one. It does NOT prove that
+// nothing is in flight, and in particular says nothing about the current frame's draws - which are
+// exactly the readers a mid-frame unsynchronized write races. Polling the fence at the write site is
+// the only way to learn anything about the current instant.
+static GLsync g_mg_frame_fence = nullptr;
+
+// Zero-timeout poll of that fence. Returns a glClientWaitSync result, or 0 when there is no fence
+// yet (first frame, or the entry points are unavailable).
+//
+// Zero timeout means this cannot block: it either reports the fence signalled or reports a timeout
+// immediately. GLES.glClientWaitSync is called directly rather than through this layer's own
+// wrapper, so these polls do not pollute the sync_wait_* counters, which measure the application's
+// own waits.
+extern "C" GLenum mg_frame_fence_poll(void) {
+    if (!g_mg_frame_fence || !GLES.glClientWaitSync) return 0;
+    return GLES.glClientWaitSync(g_mg_frame_fence, 0, 0);
+}
+#endif
+
 extern "C"
 {
 #define EGL_API __attribute__((visibility("default")))
@@ -253,14 +281,14 @@ extern "C"
         // than sitting in front of it. The fence is created immediately after the wait, so it
         // still covers everything this frame submitted.
         if (GLES.glFenceSync && GLES.glClientWaitSync && GLES.glDeleteSync) {
-            static GLsync frameFence = nullptr;
-            if (frameFence) {
+            if (g_mg_frame_fence) {
                 const uint64_t waitStart = mg::diagnostics::timestamp();
-                const GLenum waitResult = GLES.glClientWaitSync(frameFence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ULL);
+                const GLenum waitResult =
+                    GLES.glClientWaitSync(g_mg_frame_fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ULL);
                 mg::diagnostics::record_frame_wait(waitResult, mg::diagnostics::elapsed_ns(waitStart));
-                GLES.glDeleteSync(frameFence);
+                GLES.glDeleteSync(g_mg_frame_fence);
             }
-            frameFence = GLES.glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+            g_mg_frame_fence = GLES.glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         }
 #endif
         return result;

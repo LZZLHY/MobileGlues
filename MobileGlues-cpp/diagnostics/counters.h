@@ -95,6 +95,63 @@ namespace mg::diagnostics {
         uint64_t direct_memcpy_ns = 0;
         uint64_t direct_unmap_ns = 0;
 
+#if defined(MG_PLATFORM_OHOS)
+        // ----- Probes for the 26.2+Sodium terrain race -------------------------------------
+        //
+        // These exist to turn four guesses into numbers. Three rounds of work on this problem each
+        // started from a mechanism instead of a measurement and each was wrong, while the path in
+        // question is reached only about 41 times per second - so measuring it is far cheaper than
+        // reasoning about it.
+        //
+        // Everything here is platform-guarded so the generic translation units stay byte-identical.
+
+        // Was the previous frame's fence already signalled at the moment of a direct write?
+        //
+        // This decides whether a cheap provably-correct fix exists. If the fence is already
+        // signalled, nothing submitted before the last present is still reading, and the
+        // unsynchronized write is safe with no buffer, range or binding tracking at all. If it is
+        // usually unsignalled, that whole family of fixes is dead and we stop considering it.
+        //
+        // Note what the fence does NOT prove: eglSwapBuffers waits on the fence created at the
+        // *previous* present, so a signalled fence says the GPU finished the previous frame, not
+        // the current one. That is why this is polled at the write rather than assumed.
+        uint64_t direct_poll_already = 0;
+        uint64_t direct_poll_timeout = 0;
+        uint64_t direct_poll_other = 0;
+
+        // Is the destination of a direct write also a glCopyBufferSubData destination?
+        //
+        // Sodium pushes terrain through its own persistently mapped ring plus a GPU copy, reaching
+        // glNamedBufferSubData only when an upload does not fit the ring's remaining space.
+        // Minecraft's own uploader writes its terrain heap directly and (as far as we know) never
+        // copies into it. If that holds, "is a copy destination" separates Sodium's arena from
+        // vanilla's heap using only calls this layer already sees - no guesses about the
+        // application's internal upload/draw ordering.
+        //
+        // This counter exists to check that claim on vanilla 26.2 BEFORE relying on it. Expect
+        // roughly all direct writes flagged under Sodium and none on vanilla; a non-zero count on
+        // vanilla kills the idea and saves a shipped regression.
+        uint64_t direct_dest_copy_target = 0;
+
+        // Sampled cost of the same mapped write WITHOUT GL_MAP_UNSYNCHRONIZED_BIT.
+        //
+        // This is the only fallback that could make any gate affordable. Rejecting all 41 direct
+        // writes per second into glBufferSubData costs roughly 177 ms/s on this driver, which is
+        // worse than the staging-ring build that was already rejected. Keeping the mapping and
+        // letting the driver do the write-after-read wait itself might cost anything between the
+        // 158 us an unsynchronized map costs and the 4.6 ms glBufferSubData costs. Nobody has
+        // measured it, and the answer decides the design.
+        //
+        // Sampled rather than always-on, and only while diagnostics are enabled, so the cost of
+        // measuring stays bounded and release builds are untouched.
+        uint64_t direct_sync_map_calls = 0;
+        uint64_t direct_sync_map_ns = 0;
+        uint64_t direct_sync_map_max_ns = 0;
+        uint64_t direct_unsync_map_calls = 0;
+        uint64_t direct_unsync_map_ns = 0;
+        uint64_t direct_unsync_map_max_ns = 0;
+#endif
+
         // Uploads that took the ordinary synchronous path.
         uint64_t fallback_calls = 0;
         uint64_t fallback_bytes = 0;
@@ -228,6 +285,47 @@ namespace mg::diagnostics {
         c.direct_memcpy_ns += memcpy_ns;
         c.direct_unmap_ns += unmap_ns;
     }
+
+#if defined(MG_PLATFORM_OHOS)
+
+    // result is a glClientWaitSync return value, or 0 when there was no fence to poll.
+    inline void record_direct_fence_poll(GLenum result) {
+        if (!enabled()) return;
+        Counters& c = g_counters;
+        switch (result) {
+        case GL_ALREADY_SIGNALED:
+        case GL_CONDITION_SATISFIED:
+            c.direct_poll_already++;
+            break;
+        case GL_TIMEOUT_EXPIRED:
+            c.direct_poll_timeout++;
+            break;
+        default:
+            c.direct_poll_other++;
+            break;
+        }
+    }
+
+    inline void record_direct_dest_copy_target() {
+        if (!enabled()) return;
+        g_counters.direct_dest_copy_target++;
+    }
+
+    inline void record_direct_map_cost(bool unsynchronized, uint64_t elapsed) {
+        if (!enabled()) return;
+        Counters& c = g_counters;
+        if (unsynchronized) {
+            c.direct_unsync_map_calls++;
+            c.direct_unsync_map_ns += elapsed;
+            detail::update_max(c.direct_unsync_map_max_ns, elapsed);
+        } else {
+            c.direct_sync_map_calls++;
+            c.direct_sync_map_ns += elapsed;
+            detail::update_max(c.direct_sync_map_max_ns, elapsed);
+        }
+    }
+
+#endif // MG_PLATFORM_OHOS
 
     inline void record_fallback(uint64_t bytes, uint64_t elapsed) {
         if (!enabled()) return;
