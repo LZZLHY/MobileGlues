@@ -9,11 +9,6 @@
 #include "ankerl/unordered_dense.h"
 #include "texture.h"
 #include "../diagnostics/counters.h"
-#if defined(MG_PLATFORM_OHOS)
-#include <atomic>
-#include <cstring>
-#include "envvars.h"
-#endif
 
 #define DEBUG 0
 
@@ -266,26 +261,6 @@ GLuint find_real_array(GLuint key) {
     if (key < g_gen_arrays.size() && g_gen_array_exists[key]) return g_gen_arrays[key];
     return 0;
 }
-
-#if defined(MG_PLATFORM_OHOS)
-
-// Whether the mapping currently active on a target was rewritten by glMapBufferRange to be truly
-// coherent. Keyed by target because glFlushMappedBufferRange names a target, not a buffer.
-// thread_local because a mapping belongs to the thread that made it and the GL thread is the only
-// one that flushes it; a missing record reads as "not coherent", which keeps the flush.
-static thread_local std::array<char, BINDING_COUNT> g_mapping_coherent = {0};
-
-void set_mapping_is_coherent(GLenum target, bool coherent) {
-    const int idx = binding_target_to_index(target);
-    if (idx >= 0) g_mapping_coherent[idx] = coherent ? 1 : 0;
-}
-
-bool mapping_is_coherent(GLenum target) {
-    const int idx = binding_target_to_index(target);
-    return idx >= 0 && g_mapping_coherent[idx] != 0;
-}
-
-#endif
 
 static GLenum get_binding_query(GLenum target) {
     switch (target) {
@@ -777,49 +752,10 @@ extern "C"
 
 void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
     LOG()
-#if defined(MG_PLATFORM_OHOS)
-    // Make the mapping actually coherent before treating it as coherent.
-    //
-    // buffer_coherent_as_flush strips GL_MAP_FLUSH_EXPLICIT_BIT here and glFlushMappedBufferRange
-    // then skips the driver call, on the stated grounds that a coherent mapping publishes writes
-    // without cache maintenance. But GL_MAP_COHERENT_BIT was never added to the mapping's access
-    // bits. Per GL_EXT_buffer_storage a mapping is coherent only when coherence is requested on the
-    // mapping; allocating the store with GL_MAP_COHERENT_BIT does not make a later mapping coherent.
-    // So the layer removed the application's flush and put nothing in its place, and a persistent
-    // mapping is never unmapped, so there was no later point at which the writes were published.
-    //
-    // This matters for Sodium, which does not CPU-write its terrain arena at all: it writes a
-    // persistently mapped staging ring, calls glFlushMappedBufferRange, and then moves the bytes
-    // with glCopyBufferSubData. With the flush swallowed, the copy can read ring contents the CPU
-    // writes had not reached - a chunk assembled from whatever was there before, which is what
-    // scrambled and misplaced terrain looks like, and why it is intermittent.
-    //
-    // Only a persistent mapping is rewritten, because that is the class the storage promotion
-    // covers and therefore the only one whose store is guaranteed to carry GL_MAP_COHERENT_BIT.
-    // Asking for a coherent mapping of a store without that bit is an error, so if the driver
-    // refuses, fall back to the application's original access and let the flush through: the
-    // recorded outcome, not the setting, decides whether glFlushMappedBufferRange may be skipped.
-    const GLbitfield requestedAccess = access;
-    bool rewrittenToCoherent = false;
-    if (global_settings.buffer_coherent_as_flush && (access & GL_MAP_PERSISTENT_BIT) != 0) {
-        access &= ~GL_MAP_FLUSH_EXPLICIT_BIT;
-        access |= GL_MAP_COHERENT_BIT;
-        rewrittenToCoherent = true;
-    }
-#else
     if (global_settings.buffer_coherent_as_flush) access &= ~GL_MAP_FLUSH_EXPLICIT_BIT;
-#endif
     //    access |= GL_MAP_UNSYNCHRONIZED_BIT;
     const uint64_t startNs = mg::diagnostics::timestamp();
     void* result = GLES.glMapBufferRange(target, offset, length, access);
-#if defined(MG_PLATFORM_OHOS)
-    if (rewrittenToCoherent && !result) {
-        // The store cannot be mapped coherently. Honour what the application asked for instead.
-        result = GLES.glMapBufferRange(target, offset, length, requestedAccess);
-        rewrittenToCoherent = false;
-    }
-    set_mapping_is_coherent(target, result != nullptr && rewrittenToCoherent);
-#endif
     // Mapping can block: without GL_MAP_UNSYNCHRONIZED_BIT the driver waits for readers of the
     // range, so this is one of the places a stall hides behind a call that looks cheap.
     mg::diagnostics::record_map(mg::diagnostics::non_negative_bytes(length), mg::diagnostics::elapsed_ns(startNs));
@@ -858,271 +794,15 @@ void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfiel
 
 void glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length) {
     LOG()
-#if defined(MG_PLATFORM_OHOS)
-    // Skip the flush only for a mapping this layer actually rewrote to be coherent, as recorded by
-    // glMapBufferRange above. The setting alone is not sufficient grounds: it says the layer intends
-    // coherent-as-flush, not that the current mapping got it. Dropping the application's flush
-    // without coherence loses the writes, and for a persistent mapping there is no unmap to publish
-    // them later.
-    const bool callDriver = !mapping_is_coherent(target);
-#else
     // A coherent mapping publishes writes without cache maintenance, so the driver call is
     // skipped. Counting the skips separately makes that visible instead of looking like a flush
     // that silently did nothing.
     const bool callDriver = !global_settings.buffer_coherent_as_flush;
-#endif
     const uint64_t startNs = mg::diagnostics::timestamp();
     if (callDriver) GLES.glFlushMappedBufferRange(target, offset, length);
     mg::diagnostics::record_flush(mg::diagnostics::non_negative_bytes(length), callDriver,
                                   mg::diagnostics::elapsed_ns(startNs));
 }
-
-#if defined(MG_PLATFORM_OHOS)
-
-// ---------------------------------------------------------------------------------------------
-// Ordered upload through a staging ring owned by this layer.
-//
-// The problem this solves, stated as measured rather than as theory. On a Maleoon 920 the two
-// routes glNamedBufferSubData had were the two ends of one trade:
-//
-//   * glMapBufferRange(MAP_WRITE | UNSYNCHRONIZED) + memcpy - fast, and wrong. UNSYNCHRONIZED
-//     tells the driver to do no write-after-read synchronization, so the memcpy races draws still
-//     in flight. Sodium's arena allocator frees a segment and reuses it in the same frame it was
-//     drawn from, so a whole section's vertices get overwritten and that section renders another
-//     section's geometry - at the other section's coordinates, because Sodium bakes the section
-//     index into every vertex. That is the displaced-chunk corruption.
-//   * glBufferSubData - correct, and slow in a specific way: it *blocks the calling thread* until
-//     the readers retire. Measured with the direct write disabled: 76 to 159 calls per second
-//     moving 1.2 to 2.0 MB, costing 116 to 256 ms of CPU per second, with single calls of 45, 50
-//     and 67 ms. The cost tracks the destination store, not the byte count. Downstream, the
-//     application's own glClientWaitSync went to 172 to 496 ms/s with single waits near 100 ms,
-//     because a pipeline that is drained on every upload leaves the GPU starved and bursty.
-//
-// A buffer-to-buffer copy is the third option and it is not a compromise between those two. It
-// carries the *same* ordering guarantee as glBufferSubData - GLES 3.2 requires commands to be
-// processed in order, and a copy is an ordinary command, not a shader memory access, so no
-// barrier is involved - while only *enqueueing* work. The ordering is resolved by the GPU as a
-// dependency between commands rather than by parking the calling thread.
-//
-// The evidence that it is fast here is in the same logs that condemn glBufferSubData: Sodium
-// uploads its own terrain this way, from a persistently mapped ring, and those copies measured
-// 675 MB/s to 1.8 GB/s in the very windows where glBufferSubData managed 11 MB/s. Those copies
-// also prove this driver implements the GL_EXT_buffer_storage relaxation that permits a copy whose
-// operand is mapped with GL_MAP_PERSISTENT_BIT, which base GLES 3.2 would reject with
-// GL_INVALID_OPERATION - if it did not, Sodium's terrain would not appear at all.
-//
-// ⚠️ PERF-MALEOON.md has a rejected row reading "staging ring plus glCopyBufferSubData". Read this
-// before assuming that row covers this code. That attempt (`458b4c5`) differed in four ways, each
-// sufficient on its own to explain its single-digit frame rate:
-//   1. It had no ring. One buffer, whose store was respecified with glBufferData on *every*
-//      upload - a fresh driver allocation, an internal copy into untouched pages and a deferred
-//      free, hundreds of times per second for a median payload of 8 KB. The hiperf profile for
-//      this platform puts the time in the driver's allocation and ioctl paths.
-//   2. It never mapped anything, so the caller's bytes entered the staging store as glBufferData's
-//      initial-data argument, i.e. through a driver-internal copy rather than a plain memcpy.
-//   3. Its copy destination was bound to GL_ARRAY_BUFFER, the live vertex-source binding, which is
-//      the binding a driver must treat most pessimistically. GL_COPY_WRITE_BUFFER exists precisely
-//      so a transfer destination need not be a pipeline binding.
-//   4. It sat on top of `afa51bf`, which withheld the coherent promotion, so the destination was
-//      device-local and unmappable. That change alone had already measured "correct, low".
-// This implementation does none of those: one immutable store allocated once, persistently mapped
-// once, filled by memcpy, copied out of GL_COPY_READ_BUFFER into GL_COPY_WRITE_BUFFER, with the
-// promotion left alone.
-//
-// Segment lifetime. The copy is issued before this function returns, but the GPU may read the ring
-// long afterwards, so a byte range must not be rewritten until the copy that reads it has retired.
-// The ring is therefore divided into segments used strictly in rotation, and a segment is fenced
-// when it fills. Entering the next segment costs one *zero-timeout* glClientWaitSync, which does
-// not block: it either reports the fence signalled, or the caller is told to use its synchronous
-// path for this upload. Nothing here ever waits, and nothing here ever reuses an unsignalled
-// segment - so a mis-sized ring costs throughput and shows up as ring_bypass_busy, never
-// correctness.
-//
-// Deliberately not batched. Accumulating the copies and issuing them once per frame would reduce
-// render-pass breaks on a tiled GPU, but it would also require every draw, map, read, respecify and
-// delete in the layer to flush the queue first - about thirty call sites, nine of them currently
-// macro-generated - and getting one wrong is a silent correctness bug. Issuing the copy immediately
-// keeps the whole win, since the win is that the *calling thread* no longer waits. Batching is a
-// later refinement, to be justified by a measurement of the per-break cost, which has never been
-// taken on this driver.
-// ---------------------------------------------------------------------------------------------
-
-namespace {
-
-    // Tunable on the device, because the right size is a property of the workload and the only
-    // honest way to pick it is to look at ring_bypass_busy. MG_UPLOAD_RING_KIB is the size of one
-    // segment; MG_UPLOAD_RING_SEGMENTS is how many. Defaults hold 4 MiB in total, which is ample:
-    // the measured traffic is 40 to 140 KB per frame with a largest single upload of 199 KB.
-    constexpr int RING_MAX_SEGMENTS = 16;
-
-    GLuint g_ring_buffer = 0;
-    unsigned char* g_ring_base = nullptr;
-    GLsizeiptr g_ring_segment_bytes = 0;
-    int g_ring_segments = 0;
-
-    int g_ring_current = 0;
-    GLsizeiptr g_ring_cursor = 0;
-    GLsync g_ring_fence[RING_MAX_SEGMENTS] = {};
-
-    // Tri-state so a driver that cannot provide the ring is asked exactly once.
-    enum class RingState {
-        Untried,
-        Ready,
-        Unavailable
-    };
-    RingState g_ring_state = RingState::Untried;
-
-    bool ring_initialise() {
-        // Immutable storage is required for a persistent mapping, so without this entry point there
-        // is no ring. glBufferStorage's own wrapper already guards on it the same way.
-        if (!GLES.glBufferStorageEXT || !GLES.glMapBufferRange || !GLES.glCopyBufferSubData || !GLES.glFenceSync ||
-            !GLES.glClientWaitSync || !GLES.glDeleteSync) {
-            LOG_I("[MG-RING] unavailable: required entry points missing")
-            return false;
-        }
-
-        int segmentKib = 512;
-        GetEnvVarInt("MG_UPLOAD_RING_KIB", &segmentKib, 512);
-        if (segmentKib < 64) segmentKib = 64;
-        if (segmentKib > 16384) segmentKib = 16384;
-
-        int segments = 8;
-        GetEnvVarInt("MG_UPLOAD_RING_SEGMENTS", &segments, 8);
-        if (segments < 2) segments = 2; // one segment cannot rotate, so it could never retire
-        if (segments > RING_MAX_SEGMENTS) segments = RING_MAX_SEGMENTS;
-
-        const GLsizeiptr segmentBytes = static_cast<GLsizeiptr>(segmentKib) * 1024;
-        const GLsizeiptr totalBytes = segmentBytes * segments;
-
-        GLuint ring = 0;
-        GLES.glGenBuffers(1, &ring);
-        if (!ring) {
-            LOG_I("[MG-RING] unavailable: glGenBuffers failed")
-            return false;
-        }
-
-        // Built on GL_COPY_READ_BUFFER throughout, so GL_ARRAY_BUFFER is never disturbed. The
-        // driver entry points are called directly rather than this layer's wrappers: the wrappers
-        // would apply the coherent-promotion policy and record a size against a fake id, and this
-        // buffer has no fake id and wants its flags stated explicitly rather than inherited.
-        const GLuint previousCopyRead = find_bound_buffer(GL_COPY_READ_BUFFER_BINDING);
-        GLES.glBindBuffer(GL_COPY_READ_BUFFER, ring);
-
-        const GLbitfield storageFlags =
-            GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT | GL_DYNAMIC_STORAGE_BIT;
-        GLES.glBufferStorageEXT(GL_COPY_READ_BUFFER, totalBytes, nullptr, storageFlags);
-
-        void* mapped = GLES.glMapBufferRange(GL_COPY_READ_BUFFER, 0, totalBytes,
-                                             GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
-
-        // Restore through the wrapper so the shadow binding and the driver agree again.
-        glBindBuffer(GL_COPY_READ_BUFFER, previousCopyRead);
-
-        if (!mapped) {
-            LOG_I("[MG-RING] unavailable: could not persistently map %lld bytes", (long long)totalBytes)
-            GLES.glDeleteBuffers(1, &ring);
-            return false;
-        }
-
-        g_ring_buffer = ring;
-        g_ring_base = static_cast<unsigned char*>(mapped);
-        g_ring_segment_bytes = segmentBytes;
-        g_ring_segments = segments;
-        g_ring_current = 0;
-        g_ring_cursor = 0;
-        for (int i = 0; i < RING_MAX_SEGMENTS; ++i)
-            g_ring_fence[i] = nullptr;
-
-        LOG_I("[MG-RING] ready: %d segments x %d KiB = %lld bytes, buffer %u", segments, segmentKib,
-              (long long)totalBytes, ring)
-        return true;
-    }
-
-    // Moves to the next segment, fencing the one being left. Returns false when the next segment's
-    // copy has not retired yet, in which case the caller must not use the ring for this upload.
-    bool ring_advance_segment() {
-        g_ring_fence[g_ring_current] = GLES.glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-
-        const int next = (g_ring_current + 1) % g_ring_segments;
-        if (g_ring_fence[next]) {
-            // Zero timeout: a poll, not a wait. This is the one place the design could have
-            // reintroduced a stall, and it deliberately does not.
-            const GLenum result = GLES.glClientWaitSync(g_ring_fence[next], 0, 0);
-            if (result != GL_ALREADY_SIGNALED && result != GL_CONDITION_SATISFIED) return false;
-            GLES.glDeleteSync(g_ring_fence[next]);
-            g_ring_fence[next] = nullptr;
-        }
-
-        g_ring_current = next;
-        g_ring_cursor = 0;
-        mg::diagnostics::record_ring_segment_advance();
-        return true;
-    }
-
-} // namespace
-
-GLboolean mg_upload_ring_try(GLuint realDestination, GLintptr destinationOffset, GLsizeiptr size, const void* data) {
-    if (realDestination == 0 || size <= 0 || destinationOffset < 0 || !data) return GL_FALSE;
-
-    if (g_ring_state == RingState::Untried) {
-        g_ring_state = ring_initialise() ? RingState::Ready : RingState::Unavailable;
-    }
-    if (g_ring_state != RingState::Ready) {
-        mg::diagnostics::record_ring_bypass(mg::diagnostics::RingBypass::Unavailable);
-        return GL_FALSE;
-    }
-
-    // An upload that cannot fit a segment can never be staged, however the ring rotates.
-    if (size > g_ring_segment_bytes) {
-        mg::diagnostics::record_ring_bypass(mg::diagnostics::RingBypass::TooBig);
-        return GL_FALSE;
-    }
-
-    const uint64_t startNs = mg::diagnostics::timestamp();
-
-    if (g_ring_cursor + size > g_ring_segment_bytes) {
-        if (!ring_advance_segment()) {
-            mg::diagnostics::record_ring_bypass(mg::diagnostics::RingBypass::Busy);
-            return GL_FALSE;
-        }
-    }
-
-    const GLsizeiptr ringOffset = static_cast<GLsizeiptr>(g_ring_current) * g_ring_segment_bytes + g_ring_cursor;
-
-    const uint64_t memcpyStartNs = mg::diagnostics::timestamp();
-    memcpy(g_ring_base + ringOffset, data, static_cast<size_t>(size));
-    const uint64_t memcpyNs = mg::diagnostics::elapsed_ns(memcpyStartNs);
-
-    // GL_MAP_COHERENT_BIT removes the need for a GL cache-maintenance command; it does not order
-    // the CPU's own stores against the driver's subsequent reads. On AArch64 write-combining memory
-    // the copy above can still be sitting in a store buffer when the command below is submitted.
-    // This layer has already been caught assuming coherence implies publication - see the comment
-    // on glMapBufferRange above - so the release is explicit here.
-    std::atomic_thread_fence(std::memory_order_release);
-
-    const GLuint previousCopyRead = find_bound_buffer(GL_COPY_READ_BUFFER_BINDING);
-    const GLuint previousCopyWrite = find_bound_buffer(GL_COPY_WRITE_BUFFER_BINDING);
-
-    const uint64_t copyStartNs = mg::diagnostics::timestamp();
-    GLES.glBindBuffer(GL_COPY_READ_BUFFER, g_ring_buffer);
-    GLES.glBindBuffer(GL_COPY_WRITE_BUFFER, realDestination);
-    // GLES.* rather than the wrapper, so this copy is not counted into the application's copy_*
-    // totals. Merging the two is exactly what left the previous attempt unmeasurable.
-    GLES.glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, ringOffset, destinationOffset, size);
-    const uint64_t copyNs = mg::diagnostics::elapsed_ns(copyStartNs);
-
-    // Restore through the wrappers, which translate the fake ids the shadow holds.
-    glBindBuffer(GL_COPY_READ_BUFFER, previousCopyRead);
-    glBindBuffer(GL_COPY_WRITE_BUFFER, previousCopyWrite);
-
-    g_ring_cursor += size;
-
-    mg::diagnostics::record_ring_upload(mg::diagnostics::non_negative_bytes(size), memcpyNs, copyNs,
-                                        mg::diagnostics::elapsed_ns(startNs));
-    return GL_TRUE;
-}
-
-#endif // MG_PLATFORM_OHOS
 
 void glGenVertexArrays(GLsizei n, GLuint* arrays) {
     LOG()

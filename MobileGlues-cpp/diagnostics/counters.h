@@ -95,27 +95,6 @@ namespace mg::diagnostics {
         uint64_t direct_memcpy_ns = 0;
         uint64_t direct_unmap_ns = 0;
 
-#if defined(MG_PLATFORM_OHOS)
-        // Uploads served by a memcpy into this layer's own persistently mapped staging ring
-        // followed by glCopyBufferSubData into the destination. Kept apart from copy_* on purpose:
-        // copy_* is the application's own copies, and an earlier attempt at this route merged the
-        // two, which left no way to tell whose cost was whose.
-        //
-        // Platform-guarded because the route is. Keeping the fields out of the generic struct is
-        // also what keeps the isolation gate meaningful rather than merely green.
-        uint64_t ring_calls = 0;
-        uint64_t ring_bytes = 0;
-        uint64_t ring_memcpy_ns = 0;
-        uint64_t ring_copy_ns = 0;
-        uint64_t ring_max_ns = 0;
-        uint64_t ring_segment_advances = 0;
-        // Uploads the ring refused, by reason. All three fall through to the synchronous path, so
-        // a high count here means the ring is mis-sized rather than that anything is wrong.
-        uint64_t ring_bypass_busy = 0;    // every segment still had an unsignalled fence
-        uint64_t ring_bypass_toobig = 0;  // upload larger than one segment
-        uint64_t ring_bypass_unavail = 0; // ring could not be created on this driver
-#endif
-
         // Uploads that took the ordinary synchronous path.
         uint64_t fallback_calls = 0;
         uint64_t fallback_bytes = 0;
@@ -249,49 +228,6 @@ namespace mg::diagnostics {
         c.direct_memcpy_ns += memcpy_ns;
         c.direct_unmap_ns += unmap_ns;
     }
-
-#if defined(MG_PLATFORM_OHOS)
-
-    inline void record_ring_upload(uint64_t bytes, uint64_t memcpy_ns, uint64_t copy_ns, uint64_t elapsed) {
-        if (!enabled()) return;
-        Counters& c = g_counters;
-        c.ring_calls++;
-        c.ring_bytes += bytes;
-        c.ring_memcpy_ns += memcpy_ns;
-        c.ring_copy_ns += copy_ns;
-        detail::update_max(c.ring_max_ns, elapsed);
-    }
-
-    inline void record_ring_segment_advance() {
-        if (!enabled()) return;
-        g_counters.ring_segment_advances++;
-    }
-
-    // Reason codes match the counter names; kept as an enum so a call site cannot pick the wrong
-    // field by writing to the counter directly.
-    enum class RingBypass {
-        Busy,
-        TooBig,
-        Unavailable
-    };
-
-    inline void record_ring_bypass(RingBypass reason) {
-        if (!enabled()) return;
-        Counters& c = g_counters;
-        switch (reason) {
-        case RingBypass::Busy:
-            c.ring_bypass_busy++;
-            break;
-        case RingBypass::TooBig:
-            c.ring_bypass_toobig++;
-            break;
-        case RingBypass::Unavailable:
-            c.ring_bypass_unavail++;
-            break;
-        }
-    }
-
-#endif // MG_PLATFORM_OHOS
 
     inline void record_fallback(uint64_t bytes, uint64_t elapsed) {
         if (!enabled()) return;

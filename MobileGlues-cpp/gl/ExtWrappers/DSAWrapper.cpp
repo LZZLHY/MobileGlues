@@ -10,11 +10,8 @@
 #include "../texture.h"
 #include "../../diagnostics/counters.h"
 #if defined(MG_PLATFORM_OHOS)
-// For get_buffer_data_size, used to answer GL_BUFFER_SIZE without a driver round trip, and for the
-// runtime-tunable direct-write threshold below.
-#include <limits>
+// For get_buffer_data_size, used to answer GL_BUFFER_SIZE without a driver round trip.
 #include "../buffer.h"
-#include "../envvars.h"
 #endif
 
 #define DEBUG 0
@@ -256,73 +253,6 @@ void glNamedBufferData(GLuint buffer, GLsizeiptr size, const void* data, GLenum 
 // synchronous glBufferSubData, whose upload volume was never the bottleneck.
 static const GLsizeiptr DIRECT_MAP_MIN_SIZE = 16 * 1024 * 1024;
 
-#if defined(MG_PLATFORM_OHOS)
-// Runtime-tunable threshold, so the direct write can be raised or switched off on the device.
-//
-// Two things about the test this feeds are worth stating plainly, because both were missed for
-// several rounds. First, it compares the size of the WHOLE STORE, not the size of this upload, so a
-// two-kilobyte write into a 256 MiB arena takes the unsynchronized path just as a 128 MiB one does.
-// Second, Sodium does reach this function: it normally moves bytes with glCopyBufferSubData from a
-// persistently mapped ring, but when an upload does not fit the ring's remaining space it falls back
-// to a direct write, and Minecraft's own uploader uses this entry point too. Measured on device:
-// named_max_buffer = 256 MiB with direct_hits > 0, i.e. the terrain arena is being written through an
-// unsynchronized mapping.
-//
-// That is enough to explain the terrain corruption without any of the draw-path theories. Sodium's
-// arena allocator frees a segment and immediately reuses it, so an unsynchronized memcpy can overwrite
-// bytes a submitted draw is still reading. The section that was reading them then renders another
-// section's complete vertex block - including the section index Sodium bakes into every vertex - so a
-// whole, correctly textured chunk appears at the other section's position. The frame fence in
-// eglSwapBuffers bounds only the cross-frame case.
-//
-// MG_DIRECT_MAP_MIN_MIB: threshold in MiB. Negative disables the direct write entirely and sends every
-// upload down the ordinary synchronous glBufferSubData. Absent or unparsable keeps the historical
-// 16 MiB. AMCL writes this from the directMapMinMibOverride key in the MG config, so it can be changed
-// on the device without a rebuild.
-static GLsizeiptr direct_map_min_size() {
-    static const GLsizeiptr cached = [] {
-        int mib = 16;
-        GetEnvVarInt("MG_DIRECT_MAP_MIN_MIB", &mib, 16);
-        if (mib < 0) {
-            LOG_I("[DSA] direct-mapped upload DISABLED (MG_DIRECT_MAP_MIN_MIB=%d)", mib)
-            return std::numeric_limits<GLsizeiptr>::max();
-        }
-        LOG_I("[DSA] direct-mapped upload threshold = %d MiB", mib)
-        return static_cast<GLsizeiptr>(mib) * 1024 * 1024;
-    }();
-    return cached;
-}
-
-// Minimum store size for the ordered staging-ring route (gl/buffer.cpp mg_upload_ring_try).
-//
-// This is the route that is meant to win: it is ordered, so it cannot produce the displaced-chunk
-// corruption the direct write does, and it does not block the calling thread, which is the single
-// respect in which glBufferSubData is unusable here. It is tried *before* the direct write, so with
-// both thresholds at their defaults the unsynchronized path no longer runs for large stores.
-//
-// The threshold is on the store rather than the upload for a reason worth stating, given that using
-// store size as a proxy is precisely what made the direct write unsafe: here it is not a safety
-// test at all. Both routes below it are correct. It only decides where staging is *worth* it -
-// small buffers were never the bottleneck and are cheap synchronously, so routing them through a
-// ring would add a copy and a command for nothing.
-//
-// MG_UPLOAD_RING_MIB: threshold in MiB; negative disables the ring entirely and restores the
-// previous two-route behaviour. AMCL drives it from uploadRingMinMibOverride in the MG config.
-static GLsizeiptr upload_ring_min_size() {
-    static const GLsizeiptr cached = [] {
-        int mib = 16;
-        GetEnvVarInt("MG_UPLOAD_RING_MIB", &mib, 16);
-        if (mib < 0) {
-            LOG_I("[DSA] ordered staging-ring upload DISABLED (MG_UPLOAD_RING_MIB=%d)", mib)
-            return std::numeric_limits<GLsizeiptr>::max();
-        }
-        LOG_I("[DSA] ordered staging-ring upload threshold = %d MiB", mib)
-        return static_cast<GLsizeiptr>(mib) * 1024 * 1024;
-    }();
-    return cached;
-}
-#endif
-
 void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const void* data) {
     LOG()
     LOG_D("[DSA] glNamedBufferSubData, buffer: %u, offset: %lld, size: %lld, data: %p", buffer, offset, size, data);
@@ -334,32 +264,6 @@ void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const
 
     const uint64_t namedStartNs = mg::diagnostics::timestamp();
     const uint64_t uploadBytes = mg::diagnostics::non_negative_bytes(size);
-
-#if defined(MG_PLATFORM_OHOS)
-    // Ordered staging-ring route, attempted first and deliberately *before* any binding is
-    // established. It needs only GL_COPY_READ_BUFFER and GL_COPY_WRITE_BUFFER, and it specifically
-    // does not want the destination bound to GL_ARRAY_BUFFER: issuing a transfer into the live
-    // vertex-source binding is one of the mistakes the previous staged attempt made.
-    //
-    // Only the layer's own size record is consulted here. The driver query below needs a binding,
-    // and a buffer this layer never saw the storage of is not a terrain arena, so there is nothing
-    // to gain by binding early just to ask.
-    {
-        const size_t recordedSize = get_buffer_data_size(buffer);
-        if (data && size > 0 && offset >= 0 && recordedSize > 0 &&
-            static_cast<GLsizeiptr>(recordedSize) >= upload_ring_min_size()) {
-            // The real name exists for any buffer whose storage this layer recorded, because
-            // recording happens inside glBufferStorage, after a bind created it.
-            const GLuint realDestination = find_real_buffer(buffer);
-            if (realDestination != 0 && mg_upload_ring_try(realDestination, offset, size, data) == GL_TRUE) {
-                mg::diagnostics::record_named_upload(uploadBytes, static_cast<uint64_t>(recordedSize),
-                                                     mg::diagnostics::elapsed_ns(namedStartNs));
-                LOG_D("[DSA] Buffer %u sub-data staged, size %lld at offset %lld", buffer, size, offset);
-                return;
-            }
-        }
-    }
-#endif
 
     temporarilyBindBuffer(buffer);
     GLint64 bufSize = 0;
@@ -388,11 +292,7 @@ void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const
     GLES.glGetBufferParameteri64v(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &bufSize);
 #endif
     void* p = nullptr;
-#if defined(MG_PLATFORM_OHOS)
-    if (data && bufSize >= direct_map_min_size()) {
-#else
     if (data && bufSize >= DIRECT_MAP_MIN_SIZE) {
-#endif
         const uint64_t mapStartNs = mg::diagnostics::timestamp();
         p = GLES.glMapBufferRange(GL_ARRAY_BUFFER, offset, size, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
         mg::diagnostics::record_direct_map_attempt(mg::diagnostics::elapsed_ns(mapStartNs));
