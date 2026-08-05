@@ -10,8 +10,11 @@
 #include "../texture.h"
 #include "../../diagnostics/counters.h"
 #if defined(MG_PLATFORM_OHOS)
-// For get_buffer_data_size, used to answer GL_BUFFER_SIZE without a driver round trip.
+// For get_buffer_data_size, used to answer GL_BUFFER_SIZE without a driver round trip, and for the
+// runtime-tunable direct-write threshold below.
+#include <limits>
 #include "../buffer.h"
+#include "../envvars.h"
 #endif
 
 #define DEBUG 0
@@ -253,6 +256,44 @@ void glNamedBufferData(GLuint buffer, GLsizeiptr size, const void* data, GLenum 
 // synchronous glBufferSubData, whose upload volume was never the bottleneck.
 static const GLsizeiptr DIRECT_MAP_MIN_SIZE = 16 * 1024 * 1024;
 
+#if defined(MG_PLATFORM_OHOS)
+// Runtime-tunable threshold, so the direct write can be raised or switched off on the device.
+//
+// Two things about the test this feeds are worth stating plainly, because both were missed for
+// several rounds. First, it compares the size of the WHOLE STORE, not the size of this upload, so a
+// two-kilobyte write into a 256 MiB arena takes the unsynchronized path just as a 128 MiB one does.
+// Second, Sodium does reach this function: it normally moves bytes with glCopyBufferSubData from a
+// persistently mapped ring, but when an upload does not fit the ring's remaining space it falls back
+// to a direct write, and Minecraft's own uploader uses this entry point too. Measured on device:
+// named_max_buffer = 256 MiB with direct_hits > 0, i.e. the terrain arena is being written through an
+// unsynchronized mapping.
+//
+// That is enough to explain the terrain corruption without any of the draw-path theories. Sodium's
+// arena allocator frees a segment and immediately reuses it, so an unsynchronized memcpy can overwrite
+// bytes a submitted draw is still reading. The section that was reading them then renders another
+// section's complete vertex block - including the section index Sodium bakes into every vertex - so a
+// whole, correctly textured chunk appears at the other section's position. The frame fence in
+// eglSwapBuffers bounds only the cross-frame case.
+//
+// MG_DIRECT_MAP_MIN_MIB: threshold in MiB. Negative disables the direct write entirely and sends every
+// upload down the ordinary synchronous glBufferSubData. Absent or unparsable keeps the historical
+// 16 MiB. AMCL writes this from the directMapMinMibOverride key in the MG config, so it can be changed
+// on the device without a rebuild.
+static GLsizeiptr direct_map_min_size() {
+    static const GLsizeiptr cached = [] {
+        int mib = 16;
+        GetEnvVarInt("MG_DIRECT_MAP_MIN_MIB", &mib, 16);
+        if (mib < 0) {
+            LOG_I("[DSA] direct-mapped upload DISABLED (MG_DIRECT_MAP_MIN_MIB=%d)", mib)
+            return std::numeric_limits<GLsizeiptr>::max();
+        }
+        LOG_I("[DSA] direct-mapped upload threshold = %d MiB", mib)
+        return static_cast<GLsizeiptr>(mib) * 1024 * 1024;
+    }();
+    return cached;
+}
+#endif
+
 void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const void* data) {
     LOG()
     LOG_D("[DSA] glNamedBufferSubData, buffer: %u, offset: %lld, size: %lld, data: %p", buffer, offset, size, data);
@@ -292,7 +333,11 @@ void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const
     GLES.glGetBufferParameteri64v(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &bufSize);
 #endif
     void* p = nullptr;
+#if defined(MG_PLATFORM_OHOS)
+    if (data && bufSize >= direct_map_min_size()) {
+#else
     if (data && bufSize >= DIRECT_MAP_MIN_SIZE) {
+#endif
         const uint64_t mapStartNs = mg::diagnostics::timestamp();
         p = GLES.glMapBufferRange(GL_ARRAY_BUFFER, offset, size, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
         mg::diagnostics::record_direct_map_attempt(mg::diagnostics::elapsed_ns(mapStartNs));
