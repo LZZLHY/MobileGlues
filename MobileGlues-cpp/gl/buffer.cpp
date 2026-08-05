@@ -262,6 +262,26 @@ GLuint find_real_array(GLuint key) {
     return 0;
 }
 
+#if defined(MG_PLATFORM_OHOS)
+
+// Whether the mapping currently active on a target was rewritten by glMapBufferRange to be truly
+// coherent. Keyed by target because glFlushMappedBufferRange names a target, not a buffer.
+// thread_local because a mapping belongs to the thread that made it and the GL thread is the only
+// one that flushes it; a missing record reads as "not coherent", which keeps the flush.
+static thread_local std::array<char, BINDING_COUNT> g_mapping_coherent = {0};
+
+void set_mapping_is_coherent(GLenum target, bool coherent) {
+    const int idx = binding_target_to_index(target);
+    if (idx >= 0) g_mapping_coherent[idx] = coherent ? 1 : 0;
+}
+
+bool mapping_is_coherent(GLenum target) {
+    const int idx = binding_target_to_index(target);
+    return idx >= 0 && g_mapping_coherent[idx] != 0;
+}
+
+#endif
+
 static GLenum get_binding_query(GLenum target) {
     switch (target) {
     case GL_ARRAY_BUFFER:
@@ -752,10 +772,49 @@ extern "C"
 
 void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
     LOG()
+#if defined(MG_PLATFORM_OHOS)
+    // Make the mapping actually coherent before treating it as coherent.
+    //
+    // buffer_coherent_as_flush strips GL_MAP_FLUSH_EXPLICIT_BIT here and glFlushMappedBufferRange
+    // then skips the driver call, on the stated grounds that a coherent mapping publishes writes
+    // without cache maintenance. But GL_MAP_COHERENT_BIT was never added to the mapping's access
+    // bits. Per GL_EXT_buffer_storage a mapping is coherent only when coherence is requested on the
+    // mapping; allocating the store with GL_MAP_COHERENT_BIT does not make a later mapping coherent.
+    // So the layer removed the application's flush and put nothing in its place, and a persistent
+    // mapping is never unmapped, so there was no later point at which the writes were published.
+    //
+    // This matters for Sodium, which does not CPU-write its terrain arena at all: it writes a
+    // persistently mapped staging ring, calls glFlushMappedBufferRange, and then moves the bytes
+    // with glCopyBufferSubData. With the flush swallowed, the copy can read ring contents the CPU
+    // writes had not reached - a chunk assembled from whatever was there before, which is what
+    // scrambled and misplaced terrain looks like, and why it is intermittent.
+    //
+    // Only a persistent mapping is rewritten, because that is the class the storage promotion
+    // covers and therefore the only one whose store is guaranteed to carry GL_MAP_COHERENT_BIT.
+    // Asking for a coherent mapping of a store without that bit is an error, so if the driver
+    // refuses, fall back to the application's original access and let the flush through: the
+    // recorded outcome, not the setting, decides whether glFlushMappedBufferRange may be skipped.
+    const GLbitfield requestedAccess = access;
+    bool rewrittenToCoherent = false;
+    if (global_settings.buffer_coherent_as_flush && (access & GL_MAP_PERSISTENT_BIT) != 0) {
+        access &= ~GL_MAP_FLUSH_EXPLICIT_BIT;
+        access |= GL_MAP_COHERENT_BIT;
+        rewrittenToCoherent = true;
+    }
+#else
     if (global_settings.buffer_coherent_as_flush) access &= ~GL_MAP_FLUSH_EXPLICIT_BIT;
+#endif
     //    access |= GL_MAP_UNSYNCHRONIZED_BIT;
     const uint64_t startNs = mg::diagnostics::timestamp();
     void* result = GLES.glMapBufferRange(target, offset, length, access);
+#if defined(MG_PLATFORM_OHOS)
+    if (rewrittenToCoherent && !result) {
+        // The store cannot be mapped coherently. Honour what the application asked for instead.
+        result = GLES.glMapBufferRange(target, offset, length, requestedAccess);
+        rewrittenToCoherent = false;
+    }
+    set_mapping_is_coherent(target, result != nullptr && rewrittenToCoherent);
+#endif
     // Mapping can block: without GL_MAP_UNSYNCHRONIZED_BIT the driver waits for readers of the
     // range, so this is one of the places a stall hides behind a call that looks cheap.
     mg::diagnostics::record_map(mg::diagnostics::non_negative_bytes(length), mg::diagnostics::elapsed_ns(startNs));
@@ -794,10 +853,19 @@ void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfiel
 
 void glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length) {
     LOG()
+#if defined(MG_PLATFORM_OHOS)
+    // Skip the flush only for a mapping this layer actually rewrote to be coherent, as recorded by
+    // glMapBufferRange above. The setting alone is not sufficient grounds: it says the layer intends
+    // coherent-as-flush, not that the current mapping got it. Dropping the application's flush
+    // without coherence loses the writes, and for a persistent mapping there is no unmap to publish
+    // them later.
+    const bool callDriver = !mapping_is_coherent(target);
+#else
     // A coherent mapping publishes writes without cache maintenance, so the driver call is
     // skipped. Counting the skips separately makes that visible instead of looking like a flush
     // that silently did nothing.
     const bool callDriver = !global_settings.buffer_coherent_as_flush;
+#endif
     const uint64_t startNs = mg::diagnostics::timestamp();
     if (callDriver) GLES.glFlushMappedBufferRange(target, offset, length);
     mg::diagnostics::record_flush(mg::diagnostics::non_negative_bytes(length), callDriver,
