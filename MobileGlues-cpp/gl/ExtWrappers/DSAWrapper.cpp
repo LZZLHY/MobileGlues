@@ -292,6 +292,35 @@ static GLsizeiptr direct_map_min_size() {
     }();
     return cached;
 }
+
+// Minimum store size for the ordered staging-ring route (gl/buffer.cpp mg_upload_ring_try).
+//
+// This is the route that is meant to win: it is ordered, so it cannot produce the displaced-chunk
+// corruption the direct write does, and it does not block the calling thread, which is the single
+// respect in which glBufferSubData is unusable here. It is tried *before* the direct write, so with
+// both thresholds at their defaults the unsynchronized path no longer runs for large stores.
+//
+// The threshold is on the store rather than the upload for a reason worth stating, given that using
+// store size as a proxy is precisely what made the direct write unsafe: here it is not a safety
+// test at all. Both routes below it are correct. It only decides where staging is *worth* it -
+// small buffers were never the bottleneck and are cheap synchronously, so routing them through a
+// ring would add a copy and a command for nothing.
+//
+// MG_UPLOAD_RING_MIB: threshold in MiB; negative disables the ring entirely and restores the
+// previous two-route behaviour. AMCL drives it from uploadRingMinMibOverride in the MG config.
+static GLsizeiptr upload_ring_min_size() {
+    static const GLsizeiptr cached = [] {
+        int mib = 16;
+        GetEnvVarInt("MG_UPLOAD_RING_MIB", &mib, 16);
+        if (mib < 0) {
+            LOG_I("[DSA] ordered staging-ring upload DISABLED (MG_UPLOAD_RING_MIB=%d)", mib)
+            return std::numeric_limits<GLsizeiptr>::max();
+        }
+        LOG_I("[DSA] ordered staging-ring upload threshold = %d MiB", mib)
+        return static_cast<GLsizeiptr>(mib) * 1024 * 1024;
+    }();
+    return cached;
+}
 #endif
 
 void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const void* data) {
@@ -305,6 +334,32 @@ void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const
 
     const uint64_t namedStartNs = mg::diagnostics::timestamp();
     const uint64_t uploadBytes = mg::diagnostics::non_negative_bytes(size);
+
+#if defined(MG_PLATFORM_OHOS)
+    // Ordered staging-ring route, attempted first and deliberately *before* any binding is
+    // established. It needs only GL_COPY_READ_BUFFER and GL_COPY_WRITE_BUFFER, and it specifically
+    // does not want the destination bound to GL_ARRAY_BUFFER: issuing a transfer into the live
+    // vertex-source binding is one of the mistakes the previous staged attempt made.
+    //
+    // Only the layer's own size record is consulted here. The driver query below needs a binding,
+    // and a buffer this layer never saw the storage of is not a terrain arena, so there is nothing
+    // to gain by binding early just to ask.
+    {
+        const size_t recordedSize = get_buffer_data_size(buffer);
+        if (data && size > 0 && offset >= 0 && recordedSize > 0 &&
+            static_cast<GLsizeiptr>(recordedSize) >= upload_ring_min_size()) {
+            // The real name exists for any buffer whose storage this layer recorded, because
+            // recording happens inside glBufferStorage, after a bind created it.
+            const GLuint realDestination = find_real_buffer(buffer);
+            if (realDestination != 0 && mg_upload_ring_try(realDestination, offset, size, data) == GL_TRUE) {
+                mg::diagnostics::record_named_upload(uploadBytes, static_cast<uint64_t>(recordedSize),
+                                                     mg::diagnostics::elapsed_ns(namedStartNs));
+                LOG_D("[DSA] Buffer %u sub-data staged, size %lld at offset %lld", buffer, size, offset);
+                return;
+            }
+        }
+    }
+#endif
 
     temporarilyBindBuffer(buffer);
     GLint64 bufSize = 0;

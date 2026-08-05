@@ -42,6 +42,23 @@ extern "C"
     void set_buffer_data_size(GLuint buffer, size_t size);
     size_t get_buffer_data_size(GLuint buffer);
 
+    // Ordered upload through this layer's own staging ring.
+    //
+    // Copies size bytes from data into a persistently mapped, host-coherent ring owned by this
+    // layer, then issues glCopyBufferSubData into realDestination at destinationOffset. Returns
+    // GL_TRUE when the upload was performed this way, GL_FALSE when the caller must fall back to
+    // its ordinary synchronous path. realDestination is a *driver* buffer name, not a fake id.
+    //
+    // Why it exists: glBufferSubData into the promoted host-coherent terrain arena is correct but
+    // blocks the calling thread until in-flight readers of the destination retire - measured on a
+    // Maleoon 920 at 1.5 to 2.7 ms per call with single calls reaching 67 ms, for uploads averaging
+    // 8 KB. A buffer-to-buffer copy carries the same ordering guarantee, because it is an ordinary
+    // command in the stream, but it only *enqueues* work, so the calling thread does not wait.
+    //
+    // Nothing here is unsynchronized, so this route does not need the frame fence and cannot
+    // produce the displaced-chunk corruption the direct mapped write does.
+    GLboolean mg_upload_ring_try(GLuint realDestination, GLintptr destinationOffset, GLsizeiptr size, const void* data);
+
 #endif
 
     GLuint gen_array();

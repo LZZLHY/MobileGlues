@@ -89,6 +89,23 @@ namespace mg::diagnostics {
               v(c.flush_calls), v(c.flush_driver_calls), v(c.flush_skipped_calls), v(c.flush_bytes), us(c.flush_ns),
               us(c.flush_max_ns), v(c.copy_calls), v(c.copy_bytes), us(c.copy_ns), us(c.copy_max_ns))
 
+#if defined(MG_PLATFORM_OHOS)
+        // A third record rather than more fields on the second one. The ring is a platform-only
+        // upload route, so keeping it separate leaves the two records above byte-identical to every
+        // earlier measurement, and the line above is already close to the length at which log
+        // transports truncate.
+        //
+        // ring_bypass_busy is the field to watch: it counts uploads the ring refused because no
+        // segment had retired, which all fell back to the synchronous path. Non-zero means the ring
+        // is too small for the workload, not that anything is incorrect.
+        LOG_I("[MG-DIAG-RING] policy=%s ring_calls=%llu ring_bytes=%llu ring_memcpy_us=%llu ring_copy_us=%llu "
+              "ring_max_us=%llu ring_advances=%llu ring_bypass_busy=%llu ring_bypass_toobig=%llu "
+              "ring_bypass_unavail=%llu",
+              policy ? policy : "(none)", v(c.ring_calls), v(c.ring_bytes), us(c.ring_memcpy_ns), us(c.ring_copy_ns),
+              us(c.ring_max_ns), v(c.ring_segment_advances), v(c.ring_bypass_busy), v(c.ring_bypass_toobig),
+              v(c.ring_bypass_unavail))
+#endif
+
         c = Counters{};
         g_window_start_ns = now;
     }
