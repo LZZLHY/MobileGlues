@@ -36,6 +36,10 @@
 // the only way to learn anything about the current instant.
 static GLsync g_mg_frame_fence = nullptr;
 
+// Declared rather than included: gl/buffer.h pulls in the whole buffer-shadow surface, and this
+// translation unit needs exactly one entry point from it. Defined in gl/buffer.cpp.
+extern "C" void mg_deferred_upload_flush_all(void);
+
 // Zero-timeout poll of that fence. Returns a glClientWaitSync result, or 0 when there is no fence
 // yet (first frame, or the entry points are unavailable).
 //
@@ -280,6 +284,15 @@ extern "C"
         // Placed after the present, so the wait overlaps whatever the compositor is doing rather
         // than sitting in front of it. The fence is created immediately after the wait, so it
         // still covers everything this frame submitted.
+        // Replay the terrain uploads that glNamedBufferSubData queued during this frame.
+        //
+        // Placed after the present, which is the point of the whole exercise: by now the frame's
+        // terrain draws have had the rest of the frame plus the flip to retire, so the fence the
+        // queue took when it opened is almost always already signalled and the replay costs a
+        // memcpy per record. Minecraft does not read these bytes until the next frame's draws, so
+        // writing them here rather than mid-frame is invisible to it. See gl/buffer.cpp.
+        mg_deferred_upload_flush_all();
+
         if (GLES.glFenceSync && GLES.glClientWaitSync && GLES.glDeleteSync) {
             if (g_mg_frame_fence) {
                 const uint64_t waitStart = mg::diagnostics::timestamp();

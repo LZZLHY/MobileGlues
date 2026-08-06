@@ -150,6 +150,29 @@ namespace mg::diagnostics {
         uint64_t direct_unsync_map_calls = 0;
         uint64_t direct_unsync_map_ns = 0;
         uint64_t direct_unsync_map_max_ns = 0;
+
+        // ----- Deferred terrain upload ------------------------------------------------------
+        //
+        // deferred_forced_flush is the field that matters most: it counts replays triggered by
+        // something other than the frame boundary, i.e. the safety net firing. The design rests on
+        // nothing reading these heaps between the upload and the present, which was verified from
+        // Minecraft 26.2 bytecode; a non-zero count here means that verification does not hold on
+        // some path and the assumption needs revisiting rather than trusting.
+        //
+        // deferred_fence_timeout is the other one to watch. The replay polls the queue's fence and
+        // only blocks if the poll fails. Timeouts mean the blocking wait is being paid, which is
+        // the one way this design could cost frame time.
+        uint64_t deferred_enqueued = 0;
+        uint64_t deferred_enqueued_bytes = 0;
+        uint64_t deferred_replayed = 0;
+        uint64_t deferred_replayed_bytes = 0;
+        uint64_t deferred_replay_fallback = 0;
+        uint64_t deferred_overflow = 0;
+        uint64_t deferred_forced_flush = 0;
+        uint64_t deferred_fence_already = 0;
+        uint64_t deferred_fence_satisfied = 0;
+        uint64_t deferred_fence_timeout = 0;
+        uint64_t deferred_fence_other = 0;
 #endif
 
         // Uploads that took the ordinary synchronous path.
@@ -323,6 +346,45 @@ namespace mg::diagnostics {
             c.direct_sync_map_ns += elapsed;
             detail::update_max(c.direct_sync_map_max_ns, elapsed);
         }
+    }
+
+    // The deferred-upload counters are written from the GL paths, so unlike every other recorder
+    // here they must stay correct with diagnostics off - the flush logic reads none of them, but a
+    // half-updated set would make a later session's numbers meaningless. They are plain increments,
+    // so the enabled() check is kept for consistency of cost, not of state.
+    inline void record_deferred_enqueue(uint64_t bytes) {
+        if (!enabled()) return;
+        g_counters.deferred_enqueued++;
+        g_counters.deferred_enqueued_bytes += bytes;
+    }
+
+    inline void record_deferred_replay(uint64_t bytes) {
+        if (!enabled()) return;
+        g_counters.deferred_replayed++;
+        g_counters.deferred_replayed_bytes += bytes;
+    }
+
+    inline void record_deferred_replay_fallback(uint64_t bytes) {
+        if (!enabled()) return;
+        g_counters.deferred_replay_fallback++;
+        g_counters.deferred_replayed_bytes += bytes;
+    }
+
+    inline void record_deferred_overflow() {
+        if (!enabled()) return;
+        g_counters.deferred_overflow++;
+    }
+
+    inline void record_deferred_forced_flush() {
+        if (!enabled()) return;
+        g_counters.deferred_forced_flush++;
+    }
+
+    inline void record_deferred_fence_wait(GLenum result) {
+        if (!enabled()) return;
+        Counters& c = g_counters;
+        detail::count_wait_result(result, c.deferred_fence_already, c.deferred_fence_satisfied,
+                                  c.deferred_fence_timeout, c.deferred_fence_other, c.deferred_fence_other);
     }
 
 #endif // MG_PLATFORM_OHOS

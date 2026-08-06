@@ -63,6 +63,26 @@ extern "C"
     // glClientWaitSync result, or 0 when there is no fence to poll. Cannot block.
     GLenum mg_frame_fence_poll(void);
 
+    // ---- Deferred terrain upload ------------------------------------------------------------
+    //
+    // Queues the bytes of a large glNamedBufferSubData instead of writing them immediately, and
+    // replays them at the frame boundary. See gl/buffer.cpp for the full reasoning; the short
+    // version is that this changes *when* the write happens, which is the only axis left.
+    //
+    // Returns GL_TRUE when the upload was queued and the caller must do nothing else.
+    GLboolean mg_deferred_upload_enqueue(GLuint realBuffer, GLintptr offset, GLsizeiptr size, const void* data);
+
+    // Replays everything queued, waiting first for the fence taken when the queue was opened.
+    // Called once per present from egl/egl.cpp. Safe to call with an empty queue.
+    void mg_deferred_upload_flush_all(void);
+
+    // Replays only the records targeting one buffer. The safety net: any operation that could
+    // observe a queued buffer's contents, or destroy it, has to call this first.
+    void mg_deferred_upload_flush_buffer(GLuint realBuffer);
+
+    // GL_TRUE while anything is queued. Lets hot paths skip the per-buffer check entirely.
+    GLboolean mg_deferred_upload_pending(void);
+
 #endif
 
     GLuint gen_array();

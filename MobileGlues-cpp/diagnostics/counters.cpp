@@ -113,6 +113,19 @@ namespace mg::diagnostics {
               v(c.direct_dest_copy_target), v(c.direct_sync_map_calls), us(c.direct_sync_map_ns),
               us(c.direct_sync_map_max_ns), v(c.direct_unsync_map_calls), us(c.direct_unsync_map_ns),
               us(c.direct_unsync_map_max_ns))
+
+        // The two acceptance criteria for the deferred upload are deferred_forced_flush (the safety
+        // net firing means the "nothing reads these heaps before the present" premise is wrong
+        // somewhere) and deferred_fence_timeout (the poll failing means the blocking wait is being
+        // paid, which is the only way this design costs frame time). Both should read 0.
+        LOG_I("[MG-DIAG-DEFER] policy=%s deferred_enqueued=%llu deferred_enqueued_bytes=%llu "
+              "deferred_replayed=%llu deferred_replayed_bytes=%llu deferred_replay_fallback=%llu "
+              "deferred_overflow=%llu deferred_forced_flush=%llu deferred_fence_already=%llu "
+              "deferred_fence_satisfied=%llu deferred_fence_timeout=%llu deferred_fence_other=%llu",
+              policy ? policy : "(none)", v(c.deferred_enqueued), v(c.deferred_enqueued_bytes), v(c.deferred_replayed),
+              v(c.deferred_replayed_bytes), v(c.deferred_replay_fallback), v(c.deferred_overflow),
+              v(c.deferred_forced_flush), v(c.deferred_fence_already), v(c.deferred_fence_satisfied),
+              v(c.deferred_fence_timeout), v(c.deferred_fence_other))
 #endif
 
         c = Counters{};

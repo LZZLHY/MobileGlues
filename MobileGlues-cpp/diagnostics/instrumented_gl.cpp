@@ -42,6 +42,11 @@ extern "C" GLAPI GLAPIENTRY void glBufferSubDataARB(GLenum target, GLintptr offs
 #endif
 extern "C" GLAPI GLAPIENTRY void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void* data) {
     LOG_D("Use native function: %s @ %s(...)", RENDERERNAME, __FUNCTION__);
+#if defined(MG_PLATFORM_OHOS)
+    // Ordering: an ordinary ordered write must not overtake a queued one, or the application's own
+    // sequence of updates to the same buffer would be applied out of order.
+    if (mg_deferred_upload_pending()) mg_deferred_upload_flush_all();
+#endif
     const uint64_t startNs = mg::diagnostics::timestamp();
     GLES.glBufferSubData(target, offset, size, data);
     mg::diagnostics::record_sub_data(mg::diagnostics::non_negative_bytes(size), mg::diagnostics::elapsed_ns(startNs));
@@ -65,6 +70,10 @@ extern "C" GLAPI GLAPIENTRY void glCopyBufferSubData(GLenum readTarget, GLenum w
     // because the flag has to be accurate from the first copy, and a diagnostics session that starts
     // later would otherwise see an empty table.
     mark_buffer_copy_destination(find_bound_buffer(GL_COPY_WRITE_BUFFER_BINDING));
+
+    // A copy can read a queued buffer as its source, or write one as its destination. Either way
+    // the queue has to land first.
+    if (mg_deferred_upload_pending()) mg_deferred_upload_flush_all();
 #endif
     const uint64_t startNs = mg::diagnostics::timestamp();
     GLES.glCopyBufferSubData(readTarget, writeTarget, readOffset, writeOffset, size);

@@ -301,32 +301,67 @@ void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const
         // each was wrong. This path is reached about 41 times a second, so measuring the three
         // remaining unknowns is far cheaper than arguing about them. See diagnostics/counters.h for
         // what each number decides.
-        bool sampleSynchronizedMap = false;
         if (mg::diagnostics::enabled()) {
-            // 1. Is the previous frame's fence signalled *right now*? If it usually is, a gate that
-            //    needs no buffer, range or binding tracking becomes possible.
+            // 1. Is the previous frame's fence signalled *right now*? Measured 89.2% already
+            //    signalled, 10.8% timeout - so the GPU is essentially never more than a frame
+            //    behind, but "essentially never" is not a correctness argument and this poll alone
+            //    cannot authorise an unsynchronized write: the fence covers the PREVIOUS frame,
+            //    while the race is against draws issued earlier in THIS frame.
             mg::diagnostics::record_direct_fence_poll(mg_frame_fence_poll());
 
             // 2. Is this destination also a GPU-copy destination? Candidate discriminator between
-            //    Sodium's arena and Minecraft's own terrain heap. Must read ~0 on vanilla 26.2 for
-            //    the idea to be usable.
+            //    Sodium's arena and Minecraft's own terrain heap. Measured 0 of 12,776 on a session
+            //    without Sodium, which is the result the idea needs there; the Sodium side is still
+            //    unmeasured because MG/latest.log holds only the most recent session.
             if (is_buffer_copy_destination(buffer)) mg::diagnostics::record_direct_dest_copy_target();
-
-            // 3. Price the only affordable fallback: the same mapped write with UNSYNCHRONIZED
-            //    dropped, so the driver performs the write-after-read wait itself. Sampled at one in
-            //    eight to bound the cost of measuring. This is the one probe that changes behaviour,
-            //    and only toward being more correct, never less.
-            static unsigned directWriteSampleCounter = 0;
-            sampleSynchronizedMap = ((++directWriteSampleCounter & 7u) == 0u);
         }
 
-        const GLbitfield directAccess =
-            sampleSynchronizedMap ? (GL_MAP_WRITE_BIT) : (GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+        // The sampled "drop GL_MAP_UNSYNCHRONIZED_BIT" probe that used to live here has been
+        // REMOVED, because it answered its question and was expensive enough to distort the very
+        // frame rate it was measuring:
+        //
+        //     unsynchronized mapped write   11,179 calls    0.8 us per call
+        //     same write, UNSYNCHRONIZED    1,597 calls  24,934 us per call, worst 104,448 us
+        //
+        // A factor of about 31,000, and six times worse than the 3,946-4,604 us glBufferSubData
+        // costs into the same store. So the mapped write is fast only because it is unsynchronized,
+        // and letting the driver perform the write-after-read wait itself is the worst option
+        // measured on this driver - worse than not mapping at all. That closes the only fallback
+        // cheap enough to make a gate affordable.
+        //
+        // It also cost 1,597 x 24.9 ms = 39.8 s of CPU over the session, about 150 ms/s, which is
+        // most of why that build measured named_total_us 162 ms/s against 28.7 ms/s for the same
+        // MobileGlues commit without the probe. Recorded because it is a clean example of a
+        // measurement changing what it measures.
+
+        // Defer the write to the frame boundary instead of performing it here.
+        //
+        // This is the fix. The write itself is unchanged - same mapping, same access bits, same
+        // memcpy - but it happens after a fence that proves this frame's terrain draws have
+        // retired, so it no longer races them. Minecraft uploads only after it draws (LevelRenderer
+        // offset 603 draws, offset 682 uploads) and does not read the bytes until the next frame,
+        // so moving the write later within the frame is invisible to it. See gl/buffer.cpp for the
+        // full argument and for why every other axis is closed.
+        //
+        // The queue needs the real driver name, not the fake id, because it is replayed long after
+        // this binding is gone. Falling through on GL_FALSE - overflow, or a buffer whose real name
+        // does not exist yet - lands on exactly today's behaviour.
+        {
+            const GLuint realDestination = find_real_buffer(buffer);
+            if (realDestination != 0 && mg_deferred_upload_enqueue(realDestination, offset, size, data) == GL_TRUE) {
+                restoreTemporaryBufferBinding();
+                mg::diagnostics::record_named_upload(uploadBytes, bufSize > 0 ? static_cast<uint64_t>(bufSize) : 0,
+                                                     mg::diagnostics::elapsed_ns(namedStartNs));
+                LOG_D("[DSA] Buffer %u sub-data queued, size %lld at offset %lld", buffer, size, offset);
+                return;
+            }
+        }
+
         const uint64_t mapStartNs = mg::diagnostics::timestamp();
-        p = GLES.glMapBufferRange(GL_ARRAY_BUFFER, offset, size, directAccess);
+        p = GLES.glMapBufferRange(GL_ARRAY_BUFFER, offset, size, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
         const uint64_t mapNs = mg::diagnostics::elapsed_ns(mapStartNs);
         mg::diagnostics::record_direct_map_attempt(mapNs);
-        mg::diagnostics::record_direct_map_cost(!sampleSynchronizedMap, mapNs);
+        mg::diagnostics::record_direct_map_cost(true, mapNs);
 #else
         const uint64_t mapStartNs = mg::diagnostics::timestamp();
         p = GLES.glMapBufferRange(GL_ARRAY_BUFFER, offset, size, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
