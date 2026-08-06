@@ -294,6 +294,164 @@ Two candidates, both specific to Sodium and both consistent with those symptoms:
    `glNamedBufferSubData`. This was fixed once in `920f65a` and reverted along with the staging-ring
    work; the fix is independent of that work and should be re-applied on its own.
 
+## 2026-08-06 later: deferral cannot be made sound for Sodium, and two defects I introduced ★★
+
+Investigation only, no code changed. This section supersedes the optimistic parts of the section
+above. Device state at `3de6ef7`: vanilla 26.2, 26.1.2 and 1.21.11 **all clean and must stay clean**;
+26.2 + Sodium **worse than before**, with the artifact changing shape to *regions rendering as void
+while the geometry that belonged there floats elsewhere*, and the frame rate dropping from ~80 to the
+low teens whenever the camera or the player moves.
+
+### C1 — the frame collapse is mine: a fence that cannot be signalled, polled as if it could
+
+`glFenceSync` inserts a fence command; it does **not** submit it. The spec is explicit that a sync
+object "can be in the signaled state only once the corresponding fence command has completed", and a
+command that was never submitted cannot have completed. `GL_SYNC_FLUSH_COMMANDS_BIT` exists precisely
+to force the submission.
+
+`deferred_wait_for_fence()` polls first with `flags = 0`, on the stated grounds that the poll is
+"measured at 89 % already-signalled". **That measurement came from the other drain site.** The two are
+not comparable:
+
+| drain site | fence age at the wait | poll outcome |
+| --- | --- | --- |
+| `egl/egl.cpp eglSwapBuffers`, after the present | a whole frame; the present submitted it | succeeds, ~89 %, 114 µs/s total |
+| `gl/multidraw.cpp`, mid-frame | microseconds, no present, no `glFlush`, no MC `submit()` in between | **always times out** |
+
+So every multi-draw drain falls through to `glClientWaitSync(GL_SYNC_FLUSH_COMMANDS_BIT, 100 ms)`.
+The cost of that bit on this device was already measured and written down — in
+`gl/submit_epoch.h` on the `wip/maleoon-buffer-diagnostics` backup:
+
+> `GL_SYNC_FLUSH_COMMANDS_BIT` promises exactly one thing: that the commands recorded before the
+> fence have been submitted … On a tiled GPU honouring it is not free, because the driver ends the
+> render pass currently being built in order to submit — **measured at 3.77 ms per call on Maleoon
+> 920**.
+
+And the drain always fires with a render pass open: `DefaultChunkRenderer.render` creates the pass at
+offset 246 and closes it at 500/515, with `nglMultiDrawElementsBaseVertex` at
+`GlCommandEncoder.executeDraws` offset 167 in between, with no `primcount == 1` shortcut. So 3.77 ms
+of tile teardown at 2800x1840, **plus** a real block for everything recorded before the fence — which
+now includes the frame's 32-copy defragmentation budget and all of `MappedStagingBuffer.flush()`'s
+consolidated copies. Once per frame that enqueues anything, which is exactly "whenever moving":
+standing still there are no chunk builds and no re-sorts, so no enqueues and no drain, so 80 fps.
+
+That is 3.77 ms plus a pipeline drain against the ~65 ms/frame the symptom needs; a single 100 ms
+timeout covers it outright. Two rejected rows in this file already said the same thing from different
+directions — "`glFlush` after every `glFenceSync`: brief improvement, then back to second-scale submit
+waits", and the zero-timeout `glGetSynciv` bypass whose "cost moved to the blocking waits behind it,
+15.3 ms mean, 190 ms worst".
+
+### C2 — a correctness hole I introduced in the same function
+
+```c
+GLenum result = GLES.glClientWaitSync(g_deferred_fence, 0, 0);
+if (result != GL_ALREADY_SIGNALED && result != GL_CONDITION_SATISFIED) {
+    result = GLES.glClientWaitSync(g_deferred_fence, GL_SYNC_FLUSH_COMMANDS_BIT, 100000000ULL);
+}
+mg::diagnostics::record_deferred_fence_wait(result);   // recorded, then discarded
+```
+
+The second result is never acted on. On `GL_TIMEOUT_EXPIRED` — reachable within a 100 ms budget under
+exactly the load C1 creates — the replay proceeds and performs the `GL_MAP_UNSYNCHRONIZED_BIT` write
+against draws that are demonstrably still in flight. Independent of everything else, this alone can
+produce corruption.
+
+### C3 — why deferral cannot work for Sodium at all: an ownership change with no GL call
+
+This is the finding that closes the approach, and it is a property of Sodium, not a bug in it.
+
+```
+SingleOwnerBufferArena.transferSegments
+   28  old = arenaBuffer
+   40  parent.getBufferOfSizeAtLeast(bytes)     <- may return a POOLED GpuBuffer
+   51  executeCopyCommands(cmds, old, new)
+   60  parent.releaseBufferForReuse(old)        <- pools it WITHOUT close()
+   66  arenaBuffer = new
+```
+
+`ArenaAggregator.releaseBufferForReuse` stores the buffer in a free pool and does **not** call
+`close()`; `getBufferOfSizeAtLeast` searches that pool for one sized within
+`MAX_BUFFER_REUSE_SIZE_FACTOR = 1.4f` and hands **the same driver buffer object to a different
+arena**. There is no `glDeleteBuffers`, no `glBufferData`, no bind — **zero GL calls**. MobileGlues has
+nothing to wrap, nothing to shadow and nothing to count.
+
+A queued record holds `(realBuffer, dstOffset)`. If that transition happens between the enqueue and
+the drain, the replay writes into whichever arena now owns the object. Sodium bakes the section
+position into every vertex, so the foreign block renders at *its own* world coordinates — geometry
+floating where nothing should be — while the slot that should have received the bytes stays empty —
+a void region. A `RenderRegion` is 8x4x8 sections, which is why the artifact is no longer
+chunk-sized. **The symptom matches the mechanism exactly.**
+
+And the window is not exotic: `BufferArena.upload` calls `tryUploads` at offset 122 and
+`handleResizeUploads` at offset 141 **in the same call**, so enqueue-then-relocate is the normal path.
+
+By contrast, *offset* changes are always observable, because every `BufferSegment.setOffset` in
+`defragmentRightwards` (88, 233) and `buildTransferList` (126) is paired with a `copyToBuffer`, which
+MG's range guard can and does intercept. It is only buffer-object **identity** that is invisible.
+
+### The escape hatch I had in mind does not exist
+
+"Defer only until the end of Sodium's upload phase" was checked: `StagingBuffer.flip()` is at the
+*start* of the phase (`RenderRegionManager.update` offset 4), `finalizeRenderLists` (502) issues no GL
+at all, and the first distinctive GL call after the phase is the terrain multi-draw itself. So "end of
+upload phase" and "first terrain draw" are the same point — the point that is already failing for the
+C1 reasons above.
+
+### Sodium's frame order, corrected again
+
+An earlier pass had `cleanupAndFlip` missing. `SodiumWorldRenderer.setupTerrain`:
+
+```
+349 processGFNIMovement        translucency re-sort trigger (scales with camera movement)
+429 cleanupAndFlip             -> RenderRegionManager.update -> StagingBuffer.flip() then
+                                  ArenaAggregator.update()  <- DEFRAGMENTATION RUNS HERE
+439 updateChunks               uploads
+461 processChunkBuilds         uploads
+502 finalizeRenderLists        this frame's draw lists, built after the uploads
+```
+
+Defragmentation runs **before** the uploads, not after. Its budget floor is
+`DEFRAG_COPIES_PER_FRAME = 32/1024MiB` and `DEFRAG_BYTES_PER_FRAME = 32MiB/1024MiB` scaled by
+`max(totalDeviceAllocated, 1 GiB)`, i.e. **at least 32 copy commands and 32 MiB of live geometry
+relocated per frame**.
+
+Also corrected: `BufferArena.tryUpload` offset 60 **always** calls `StagingBuffer.enqueueCopy`. The
+`writeToBuffer` fallback that reaches `glNamedBufferSubData` lives one level down, in
+`MappedStagingBuffer.enqueueCopy` offsets 6-33, taken when `size > remaining`. `remaining` is only
+replenished by `flip()` once per frame, so within a frame the ring drains monotonically and once
+exhausted **every** further upload becomes an MG record. Ring pressure scales with chunk-build rate,
+which scales with movement — a second, independent reason the symptoms track movement.
+
+### Where this leaves the design
+
+Deferral is sound for Minecraft's own heaps and is what fixed vanilla 26.2, 26.1.2 and 1.21.11: there
+the ordering (`LevelRenderer.render` draws at 603, uploads at 682) guarantees the bytes are not read
+until the next frame, and the only drain needed is the one at the present, where the fence is already
+submitted and the poll is genuinely free.
+
+It cannot be made sound for Sodium's arena from inside this layer, because of C3. The honest options
+for that one configuration are to exclude it from the deferral and accept the original race — which
+by the user's own comparison is *less* bad than the current state, and is what upstream ships
+(`#432` `Not planned`, PSA `#313`) — or to stop trying to fix it in the translation layer.
+
+`is_buffer_copy_destination()` is the discriminator to use if excluding: sticky per buffer, set from
+both copy entry points, and measured **0 of 12,776** direct writes on a session without Sodium, while
+structurally guaranteed to be set for a Sodium arena because every non-overflow upload is a ring→arena
+copy. The one thing to re-verify on device before trusting it is `direct_dest_copy_target == 0`
+together with `deferred_enqueued > 0` on vanilla 26.2 in the same session.
+
+### Bookkeeping defect found in passing, not to be bundled
+
+`gl/buffer.cpp glBufferData` calls `set_buffer_data_size(find_bound_buffer(target), size)`, but
+`find_bound_buffer` expects a `*_BINDING` enum. `GL_ARRAY_BUFFER` (0x8892) is not
+`GL_ARRAY_BUFFER_BINDING` (0x8894), so it falls to `default: target = 0` and the size is recorded
+against buffer id 0. Consequence: for any store created through `glBufferData`, `get_buffer_data_size`
+returns 0 and `glNamedBufferSubData` pays the driver `glGetBufferParameteri64v` on every call — the
+exact round trip the OHOS block was added to remove. Minecraft's terrain heaps come through
+`glBufferStorage`, whose OHOS block uses `get_binding_query` correctly, so they are unaffected; the
+impact is limited to mutable stores. Touches all three working versions, so it wants its own commit
+and its own device round.
+
 ## The size threshold was the wrong test
 
 The direct-write path gated on buffer size, at 16 MiB. The safety argument behind that number was
