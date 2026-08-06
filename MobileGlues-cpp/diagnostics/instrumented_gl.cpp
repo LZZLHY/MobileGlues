@@ -83,7 +83,7 @@ extern "C" GLAPI GLAPIENTRY void glCopyBufferSubData(GLenum readTarget, GLenum w
     // ring-overflow writes are queued against, so a per-buffer or unconditional test fired on
     // essentially every copy - and the fence being waited on had been taken microseconds earlier in
     // the same tryUploads batch, so the poll failed and a full pipeline drain was paid. About 40-50
-    // CPU/GPU serializations per second, which is the shape docs/ohos/PERF-MALEOON.md already
+    // CPU/GPU serializations per second, which is the shape docs/ohos/RENDER-ADAPTATION.md already
     // measured at 261-454 ms/s and rejected. Vanilla never showed it because vanilla barely copies.
     //
     // Every pending upload owns a separately allocated arena segment, so the range test below

@@ -7,9 +7,13 @@ for HarmonyOS NEXT.
 
 | Document | Purpose |
 | --- | --- |
+| [`RENDER-ADAPTATION.md`](RENDER-ADAPTATION.md) | **Start here.** The Minecraft 26.x / Sodium / MobileGlues three-way system: position, established facts, closed axes, open questions |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Commit, branch, review and upstream-sync rules for this line |
-| [`DESIGN.md`](DESIGN.md) | Platform abstraction and the phased plan for the OHOS backend |
-| [`PERF-MALEOON.md`](PERF-MALEOON.md) | Measurement method, counters, and the accepted/rejected experiment log |
+| [`archive/`](archive/) | Superseded documents. Useful for the measurements they contain; **not authoritative for conclusions** |
+
+`RENDER-ADAPTATION.md` replaced `DESIGN.md` and `PERF-MALEOON.md` on 2026-08-06. Those two mixed
+sound measurements with conclusions that later proved wrong, and several of the wrong ones were
+load-bearing for months — so they were archived wholesale rather than edited. Do not cite them.
 
 ## Platform facts
 
@@ -27,7 +31,12 @@ The important difference from most MobileGlues deployments: on Android, launcher
 FCL and PojavLauncher usually run MobileGlues on top of ANGLE, i.e. GLES emulated over
 Vulkan. On HarmonyOS NEXT it runs directly on the vendor GLES driver. Buffer renaming,
 coherent memory and synchronization have very different costs in those two setups, so
-defaults that are free on ANGLE can dominate the frame here. See `PERF-MALEOON.md`.
+defaults that are free on ANGLE can dominate the frame here. See
+[`RENDER-ADAPTATION.md`](RENDER-ADAPTATION.md).
+
+That difference is also why "upstream does not support this" carries no weight here: upstream is
+mostly running on ANGLE, where the expensive operations are cheap. The configurations upstream
+declines to support are exactly the ones this platform line exists to make work.
 
 ## How it is consumed
 

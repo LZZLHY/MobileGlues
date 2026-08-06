@@ -48,7 +48,8 @@ Tested-on: <OS version>, <GPU>, <driver path or version>
 1. No binary artifacts. No `.a`, `.so`, `.o`, `.hap`, no prebuilt third-party libraries.
    Build inputs only.
 2. No platform `#ifdef` sprawl in shared logic. Platform differences belong behind a
-   narrow interface; see [`DESIGN.md`](DESIGN.md).
+   narrow interface, and the isolation gate must report zero differences against the generic
+   baseline; see [`RENDER-ADAPTATION.md`](RENDER-ADAPTATION.md).
 3. Do not change Android or Apple behaviour to fix OpenHarmony. Platform-specific policy
    is selected at runtime or configure time, and other platforms keep their existing path.
 4. Keep upstream formatting. `MobileGlues-cpp/.clang-format` is authoritative; only the
@@ -68,8 +69,14 @@ they are the ones most likely to trade correctness for frame rate.
   the maximum, for each affected path.
 * A change that improves frame pacing while corrupting geometry is a regression, not a
   trade-off. Terrain correctness is not negotiable.
-* Record rejected approaches with their numbers in [`PERF-MALEOON.md`](PERF-MALEOON.md).
-  Knowing what failed and by how much is the most reusable part of this work.
+* Record closed axes with their numbers in [`RENDER-ADAPTATION.md`](RENDER-ADAPTATION.md).
+  Knowing which dimension is closed, and by how much, is the most reusable part of this work —
+  more so than a list of patches, because the same dimension gets re-proposed otherwise.
+* Never carry a measurement across a change of call site or configuration. Two of the most
+  expensive errors on this line were exactly that; see §5.3 of `RENDER-ADAPTATION.md`.
+* Any change must be grounded in reading Sodium, MobileGlues, the deobfuscated
+  Minecraft/NeoForge client **and** the official NeoForge and Sodium documentation. A claim about
+  what the application or the mod does must be able to point at the code it came from.
 
 ## Device verification gate
 

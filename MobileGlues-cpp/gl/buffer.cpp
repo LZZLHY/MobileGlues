@@ -198,7 +198,7 @@ void mg_clear_buffer_copy_destination(GLuint key) {
 // submitted - and the replay waits on it. So at replay time every draw that could read these
 // ranges has provably completed, and the write may then be unsynchronized without racing anything.
 //
-// How this differs from each rejected row in docs/ohos/PERF-MALEOON.md, since the rule is to say:
+// How this differs from each closed axis in docs/ohos/RENDER-ADAPTATION.md, since the rule is to say:
 //   * "Unsynchronized CPU copy from the staging mapping into the arena": same timing as today,
 //     different source. This keeps today's source and changes only the timing.
 //   * "Same, with one synchronizing fence per staging batch": that *added* waits, 261-454 ms/s
