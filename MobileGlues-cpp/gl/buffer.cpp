@@ -292,9 +292,18 @@ GLboolean mg_deferred_upload_enqueue(GLuint realBuffer, GLintptr offset, GLsizei
     if (!GLES.glFenceSync || !GLES.glClientWaitSync || !GLES.glDeleteSync || !GLES.glMapBufferRange) return GL_FALSE;
 
     const size_t need = static_cast<size_t>(size);
-    if (g_deferred_used + need > DEFERRED_BYTES_CAP) {
+    if (need > DEFERRED_BYTES_CAP) {
+        // A single upload larger than the whole queue can never be staged.
         mg::diagnostics::record_deferred_overflow();
         return GL_FALSE;
+    }
+    if (g_deferred_used + need > DEFERRED_BYTES_CAP) {
+        // Drain and carry on rather than handing the caller back to the unsynchronized immediate
+        // write. Overflow used to fall through to that path, which reinstated the exact race this
+        // queue exists to remove - so overflow was silently a correctness hole, not just a slow
+        // path. Replaying early costs one fence wait; it never costs correctness.
+        mg::diagnostics::record_deferred_overflow();
+        mg_deferred_upload_flush_all();
     }
 
     if (g_deferred_bytes.size() < g_deferred_used + need) {
@@ -357,6 +366,69 @@ void mg_deferred_upload_flush_buffer(GLuint realBuffer) {
     // another only through the application's own aliasing, but replaying out of order would break
     // the sequence the application issued. So flush everything, which is also what keeps this
     // simple enough to be obviously correct.
+    mg::diagnostics::record_deferred_forced_flush();
+    mg_deferred_upload_flush_all();
+}
+
+GLuint mg_real_buffer_for_target(GLenum target) {
+    const GLenum bindingQuery = get_binding_query(target);
+    if (!bindingQuery) return 0;
+    return find_real_buffer(find_bound_buffer(bindingQuery));
+}
+
+void mg_deferred_upload_flush_if_range(GLuint realBuffer, GLintptr offset, GLsizeiptr size) {
+    if (g_deferred_records.empty() || realBuffer == 0) return;
+
+    // A negative or absent size means "the whole buffer" - a respecification, or a query whose
+    // extent this layer does not know. Treat it as overlapping everything on that buffer.
+    const bool wholeBuffer = (size <= 0);
+    const GLintptr end = wholeBuffer ? 0 : offset + size;
+
+    for (const DeferredUpload& rec : g_deferred_records) {
+        if (rec.realBuffer != realBuffer) continue;
+        if (wholeBuffer) {
+            mg::diagnostics::record_deferred_forced_flush();
+            mg_deferred_upload_flush_all();
+            return;
+        }
+        const GLintptr recEnd = rec.dstOffset + rec.size;
+        if (rec.dstOffset < end && offset < recEnd) {
+            mg::diagnostics::record_deferred_forced_flush();
+            mg_deferred_upload_flush_all();
+            return;
+        }
+    }
+}
+
+void mg_deferred_upload_flush_for_draw(void) {
+    if (g_deferred_records.empty()) return;
+
+    // Why the multi-draw entry points, and why that is both necessary and sufficient.
+    //
+    // The queue is only safe if the bytes land before any draw that reads them. For Minecraft's own
+    // renderer that is free: LevelRenderer.render draws at bytecode offset 603 and uploads at 682,
+    // so at draw time the queue is empty and this never fires.
+    //
+    // Sodium is the reverse, and this was missed for a round. Its terrain work runs from
+    // Minecraft.renderFrame offset 440 - LevelExtractorMixin.cullTerrain -> setupTerrain ->
+    // updateChunks (439) and processChunkBuilds (461) - and finalizeRenderLists at 502 builds THIS
+    // frame's draw lists afterwards. The draws then arrive at renderFrame offset 526. So Sodium
+    // uploads before it draws, in the same frame, and replaying only at the present would hand its
+    // draws the previous tenant of a freed-and-reused arena segment. That is the residual
+    // intermittent corruption: intermittent because Sodium's own glCopyBufferSubData traffic was
+    // accidentally draining the queue most of the time, and only batches consisting purely of
+    // ring-overflow writeToBuffer calls - where MappedStagingBuffer.flush() early-returns on an
+    // empty pendingCopies - slipped through.
+    //
+    // Sufficient: Sodium's terrain draws go through glMultiDrawElementsBaseVertex. Necessary: a
+    // hook on *every* draw would fire on Minecraft's first GUI draw right after offset 682, where
+    // the queue's fence was taken microseconds earlier and would therefore block mid-frame - which
+    // is the stall this whole design exists to avoid. So the hook has to be narrow, and multi-draw
+    // is the narrowest place that still covers the case that needs covering.
+    //
+    // Cheap for Sodium too: the fence was taken during updateChunks, early in the frame, so it
+    // covers the *previous* frame's draws, which have had a whole frame plus a present to retire.
+    // The poll should therefore succeed and the replay costs one memcpy per record.
     mg::diagnostics::record_deferred_forced_flush();
     mg_deferred_upload_flush_all();
 }
@@ -947,8 +1019,11 @@ void glBufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage
           glEnumToString(usage))
 #if defined(MG_PLATFORM_OHOS)
     // Respecifying a store destroys it, so a queued write aimed at the old allocation must land
-    // first - or it would be applied to a fresh allocation at a stale offset.
-    if (mg_deferred_upload_pending()) mg_deferred_upload_flush_all();
+    // first - or it would be applied to a fresh allocation at a stale offset. Whole-buffer scope,
+    // which is what passing size <= 0 to the range form means.
+    if (mg_deferred_upload_pending()) {
+        mg_deferred_upload_flush_if_range(find_real_buffer(find_bound_buffer(get_binding_query(target))), 0, 0);
+    }
 #endif
     GLES.glBufferData(target, size, data, usage);
     set_buffer_data_size(find_bound_buffer(target), size);
@@ -1005,9 +1080,13 @@ extern "C"
 void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
     LOG()
 #if defined(MG_PLATFORM_OHOS)
-    // The application is about to look at buffer contents itself. Anything still queued has to be
-    // in place first, or it would read bytes that this layer has accepted but not yet written.
-    if (mg_deferred_upload_pending()) mg_deferred_upload_flush_all();
+    // The application is about to look at buffer contents itself. Anything queued that overlaps the
+    // range it asked for has to be in place first, or it would read bytes this layer has accepted
+    // but not yet written.
+    if (mg_deferred_upload_pending()) {
+        mg_deferred_upload_flush_if_range(find_real_buffer(find_bound_buffer(get_binding_query(target))), offset,
+                                          length);
+    }
 #endif
     if (global_settings.buffer_coherent_as_flush) access &= ~GL_MAP_FLUSH_EXPLICIT_BIT;
     //    access |= GL_MAP_UNSYNCHRONIZED_BIT;

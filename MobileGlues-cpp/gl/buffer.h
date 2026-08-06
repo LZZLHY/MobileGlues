@@ -80,6 +80,28 @@ extern "C"
     // observe a queued buffer's contents, or destroy it, has to call this first.
     void mg_deferred_upload_flush_buffer(GLuint realBuffer);
 
+    // Replays only if a queued record actually overlaps [offset, offset+size) of realBuffer.
+    //
+    // This is the discriminating form, and it is what the copy and sub-data paths must use. Sodium
+    // writes its arena through both routes - a mapped ring plus glCopyBufferSubData for most
+    // uploads, and glNamedBufferSubData when the ring is full - so a per-buffer test fires on
+    // essentially every copy, which reinstates a fence wait per upload. Every pending upload owns a
+    // separately allocated segment, so a range test almost never fires.
+    void mg_deferred_upload_flush_if_range(GLuint realBuffer, GLintptr offset, GLsizeiptr size);
+
+    // Driver buffer name currently bound to a target, or 0. Resolves target -> binding query ->
+    // shadow -> real name in one call, from the shadow state only, with no driver round trip.
+    //
+    // Exists because get_binding_query is declared static in this header and so is not linkable
+    // from another translation unit, while the safety-net sites in diagnostics/instrumented_gl.cpp
+    // need exactly this lookup.
+    GLuint mg_real_buffer_for_target(GLenum target);
+
+    // Replays before a draw that could read a queued buffer. Called from the multi-draw entry
+    // points, which is where Sodium's terrain draws arrive; see gl/buffer.cpp for why that is both
+    // necessary and sufficient.
+    void mg_deferred_upload_flush_for_draw(void);
+
     // GL_TRUE while anything is queued. Lets hot paths skip the per-buffer check entirely.
     GLboolean mg_deferred_upload_pending(void);
 

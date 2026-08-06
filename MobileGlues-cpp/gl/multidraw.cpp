@@ -10,6 +10,12 @@
 #include <cstdint>
 #include <limits>
 #include <vector>
+#if defined(MG_PLATFORM_OHOS)
+// For the deferred-upload drain below. Declared rather than including gl/buffer.h, which would pull
+// in the whole buffer-shadow surface for one entry point. Defined in gl/buffer.cpp.
+extern "C" void mg_deferred_upload_flush_for_draw(void);
+extern "C" GLboolean mg_deferred_upload_pending(void);
+#endif
 
 #define DEBUG 0
 
@@ -41,6 +47,12 @@ void glMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type, const v
             break;
         }
     }
+#if defined(MG_PLATFORM_OHOS)
+    // Land any deferred terrain upload before drawing from it. See gl/buffer.cpp
+    // mg_deferred_upload_flush_for_draw for why the multi-draw entry points are the right and only
+    // place for this.
+    if (mg_deferred_upload_pending()) mg_deferred_upload_flush_for_draw();
+#endif
     func_ptr(mode, count, type, indices, primcount);
 }
 
@@ -72,6 +84,15 @@ void glMultiDrawElementsBaseVertex(GLenum mode, GLsizei* counts, GLenum type, co
             break;
         }
     }
+
+#if defined(MG_PLATFORM_OHOS)
+    // This is the one that matters: Sodium's terrain draws arrive here, and Sodium uploads *before*
+    // it draws within a frame (Minecraft.renderFrame offset 440 uploads, offset 526 draws), unlike
+    // Minecraft's own renderer which draws at LevelRenderer offset 603 and uploads at 682. Without
+    // this drain the deferred bytes would not land until the present and Sodium's draws would read
+    // the previous tenant of a reused arena segment.
+    if (mg_deferred_upload_pending()) mg_deferred_upload_flush_for_draw();
+#endif
 
     func_ptr(mode, counts, type, indices, primcount, basevertex);
 }

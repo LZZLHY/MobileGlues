@@ -44,8 +44,12 @@ extern "C" GLAPI GLAPIENTRY void glBufferSubData(GLenum target, GLintptr offset,
     LOG_D("Use native function: %s @ %s(...)", RENDERERNAME, __FUNCTION__);
 #if defined(MG_PLATFORM_OHOS)
     // Ordering: an ordinary ordered write must not overtake a queued one, or the application's own
-    // sequence of updates to the same buffer would be applied out of order.
-    if (mg_deferred_upload_pending()) mg_deferred_upload_flush_all();
+    // sequence of updates to the same range would be applied out of order. Range-scoped, because a
+    // per-buffer test on the terrain heaps fires constantly for no reason - see
+    // mg_deferred_upload_flush_if_range.
+    if (mg_deferred_upload_pending()) {
+        mg_deferred_upload_flush_if_range(mg_real_buffer_for_target(target), offset, size);
+    }
 #endif
     const uint64_t startNs = mg::diagnostics::timestamp();
     GLES.glBufferSubData(target, offset, size, data);
@@ -71,9 +75,23 @@ extern "C" GLAPI GLAPIENTRY void glCopyBufferSubData(GLenum readTarget, GLenum w
     // later would otherwise see an empty table.
     mark_buffer_copy_destination(find_bound_buffer(GL_COPY_WRITE_BUFFER_BINDING));
 
-    // A copy can read a queued buffer as its source, or write one as its destination. Either way
-    // the queue has to land first.
-    if (mg_deferred_upload_pending()) mg_deferred_upload_flush_all();
+    // A copy can read a queued range as its source, or write one as its destination. Either way the
+    // queue has to land first - but only if the ranges actually meet.
+    //
+    // This used to be an unconditional flush_all, and that was the sprint-flight frame collapse.
+    // Sodium issues 186-210 copies per second from its mapped ring into the same arena that its
+    // ring-overflow writes are queued against, so a per-buffer or unconditional test fired on
+    // essentially every copy - and the fence being waited on had been taken microseconds earlier in
+    // the same tryUploads batch, so the poll failed and a full pipeline drain was paid. About 40-50
+    // CPU/GPU serializations per second, which is the shape docs/ohos/PERF-MALEOON.md already
+    // measured at 261-454 ms/s and rejected. Vanilla never showed it because vanilla barely copies.
+    //
+    // Every pending upload owns a separately allocated arena segment, so the range test below
+    // should essentially never fire; deferred_forced_flush says whether that holds.
+    if (mg_deferred_upload_pending()) {
+        mg_deferred_upload_flush_if_range(mg_real_buffer_for_target(readTarget), readOffset, size);
+        mg_deferred_upload_flush_if_range(mg_real_buffer_for_target(writeTarget), writeOffset, size);
+    }
 #endif
     const uint64_t startNs = mg::diagnostics::timestamp();
     GLES.glCopyBufferSubData(readTarget, writeTarget, readOffset, writeOffset, size);

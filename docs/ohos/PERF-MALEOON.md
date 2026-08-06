@@ -188,6 +188,112 @@ produce the same end state.** Both of these drop `GL_MAP_COHERENT_BIT`, and that
 enough to merge them, but one leaves the buffer mappable and the other does not, and on this
 driver that difference is the whole cost.
 
+## 2026-08-06: the fix, and the two premises that had to be corrected to find it ★★ read this first
+
+This section supersedes several statements below. Where they conflict, this one is right and the
+older text is marked.
+
+### What was actually wrong
+
+MC 26.x declares three 128 MiB terrain vertex heaps and one 32 MiB translucent index heap with
+`GL_DYNAMIC_STORAGE_BIT` **only**, never maps them, and writes them with `glNamedBufferSubData`.
+This layer answered that call with `glMapBufferRange(MAP_WRITE | UNSYNCHRONIZED)` + `memcpy`.
+
+That is a spec violation, not a tuning choice. `glBufferSubData` is defined to behave as if the data
+were consumed at call time — it is an ordered command, and achieving that is the implementation's
+problem. `GL_MAP_UNSYNCHRONIZED_BIT` is the opposite contract. Worse, the application never requested
+`GL_MAP_WRITE_BIT` on these stores, so under `EXT_buffer_storage` mapping them should have failed with
+`GL_INVALID_OPERATION`; it only succeeded because the coherent promotion had rewritten the flags.
+
+Where MC *does* take on synchronization duty it says so: its own mappable buffers are created with
+`mappingFlags = 50|64` (`WRITE|FLUSH_EXPLICIT|UNSYNCHRONIZED|PERSISTENT`) and backed by
+`MappableRingBuffer`'s three-slot fences and `GlTransientMemory`'s recycle-behind-`submit()`. Where it
+does not say so, this layer assumed it anyway.
+
+### Two corrections that unlocked the fix
+
+**1. The order is draw-then-upload, not upload-then-draw.** `LevelRenderer.render` bytecode: offset
+392 `prepareChunkRenders`, offset **603 `FrameGraphBuilder.execute` — every terrain draw**, offset 644
+`compileSections`, offset **682 `uploadTerrainBuffersToGpu`**. So *every* terrain upload happens after
+*every* terrain draw of its frame.
+
+Consequences: the claim further down that "the vanilla terrain uber buffer is fully uploaded before
+anything is drawn from it" is **false and always was**, which is why vanilla 26.2 and 26.1.2 flickered
+too. And no per-buffer or per-frame predicate can separate a safe upload from an unsafe one — they are
+all unsafe, always. That is why the vertex-source gate could never work, now with a structural reason
+rather than only an A/B.
+
+**2. 26.1.2 has the same architecture.** `mc-2612.jar` contains the same `UberGpuBuffer` /
+`TlsfAllocator` classes, the same host-staging selector, the same 128 MiB / 32 MiB sizes. The claim
+that "older versions use the previous renderer and never hit this path" is true **only for 1.21.8**
+(measured `named_max_buffer` 17.7–40 KB). The real 26.1.2-vs-26.2 difference is synchronization:
+`GlCommandEncoder.submit()` / `fences[]` / `MAX_SUBMITS_IN_FLIGHT = 2` exist only in 26.2.
+
+### Every route was closed by measurement, so the axis had to change
+
+Per call into a ≥16 MiB store, all measured on a Maleoon 920:
+
+| route | cost per call |
+| --- | --- |
+| mapped write, `UNSYNCHRONIZED` | **0.8 µs** — the only fast one, and the incorrect one |
+| the same write with `UNSYNCHRONIZED` dropped | **24,934 µs**, worst 104 ms |
+| `glBufferSubData` | 3,946–4,604 µs |
+| `glBufferSubData`, promotion withheld (device-local) | 55,000 µs, peak 188 ms |
+| staging buffer + `glCopyBufferSubData` | single-digit frame rates |
+
+At 48.2 such writes per second the cheapest correct route costs ≈188 ms/s, which does not fit a 45 fps
+budget. **Three rounds changed the route or the scope. None changed the time.**
+
+### The fix: defer the write to the frame boundary
+
+Correction 1 is what makes deferral free: the bytes written at offset 682 are not read until offset
+603 of the *next* frame, so moving the write later within this frame cannot make any draw see stale
+data.
+
+`glNamedBufferSubData` now `memcpy`s into a host queue and returns. The queue takes a fence when it
+opens — at the first deferred write of a frame, by which point all of that frame's terrain draws are
+submitted. `egl/egl.cpp eglSwapBuffers` replays the queue after the present, waiting on that fence
+first. The write is still the 0.8 µs unsynchronized mapped write; it simply no longer races anything.
+
+Cost: one extra cached host `memcpy` per upload (≤371 KB per call, ~1.7 MB/s), one fence per frame,
+and one wait per present where a wait is already being paid (114 µs/s, 89 % of polls already
+signalled). Single-digit ms/s against 188 ms/s.
+
+How it differs from each rejected row below, since the rule is to say: the unsynchronized-copy row
+keeps today's timing and changes the source, this keeps the source and changes the timing; the
+fence-per-batch row *added* waits (261–454 ms/s), this adds none; the staging-ring row changes storage
+class and issues a GPU copy, this issues byte-identical GL calls to today; the gate rows route some
+uploads to synchronous `glBufferSubData`, this never does except on overflow.
+
+**Device result (versionCode 1000491):** vanilla 26.2, 26.1.2 and 1.21.11 all clean — no flicker, no
+stutter, frame rate preserved. 26.2 + Sodium improved but not fixed; see the next section.
+
+### Still open, 26.2 + Sodium only, and the two leading causes
+
+Reported symptoms: residual terrain corruption, smaller in extent, **view-angle dependent** (same
+spot, a small rotation makes it appear or disappear); and **sprint-flight only** frame collapse to
+single digits, while standing still is ~80 fps and ordinary flight is fine.
+
+Two candidates, both specific to Sodium and both consistent with those symptoms:
+
+1. **The safety net is flushing on every `glCopyBufferSubData`.** Sodium issues 186–210 copies per
+   second (its ring → arena upload path); vanilla issues almost none. The net currently calls
+   `mg_deferred_upload_flush_all()`, which can block on the queue fence. That is the
+   fence-per-upload pattern this file already measured at 261–454 ms/s and rejected — reintroduced,
+   and visible only in the configuration that copies. Sprint flight is when copy traffic peaks.
+   Fix: make the net range-overlap based instead of flush-all.
+2. **Sodium's persistently mapped ring may never publish its writes.** `glMapBufferRange` strips
+   `GL_MAP_FLUSH_EXPLICIT_BIT` and `glFlushMappedBufferRange` then skips the driver call — but
+   `GL_MAP_COHERENT_BIT` is never added to the *mapping*. Per `EXT_buffer_storage` a mapping is
+   coherent only when coherence is requested on the mapping; allocating the store with
+   `GL_MAP_COHERENT_BIT` does not make a later mapping coherent. So the application's flush was
+   removed with nothing put in its place, and a persistent mapping is never unmapped, so there is no
+   later point at which the writes are published. The copy can then read ring contents the CPU writes
+   had not reached — a chunk assembled from whatever was there before, intermittently. This is
+   Sodium-only because only Sodium uses a mapped staging ring; MC's own path is a host `malloc` plus
+   `glNamedBufferSubData`. This was fixed once in `920f65a` and reverted along with the staging-ring
+   work; the fix is independent of that work and should be re-applied on its own.
+
 ## The size threshold was the wrong test
 
 The direct-write path gated on buffer size, at 16 MiB. The safety argument behind that number was
