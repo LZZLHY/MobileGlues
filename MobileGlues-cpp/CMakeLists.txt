@@ -94,6 +94,8 @@ else()
     set(MG_PLATFORM_SOURCE platform/platform_generic.cpp)
 endif()
 
+
+
 add_library(${CMAKE_PROJECT_NAME} SHARED
     init.cpp
     main.cpp
@@ -167,7 +169,21 @@ elseif(OHOS)
         libhilog_ndk.z.so
         ${CMAKE_DL_LIBS}
     )
-    else()
+
+    # MG_PLATFORM_OHOS gates a large amount of code: every OpenHarmony-specific upload, mapping,
+    # synchronization and diagnostics path in this library sits inside `#if defined(MG_PLATFORM_OHOS)`.
+    #
+    # Set here so that this standalone tree compiles the SAME configuration the shipping build does.
+    # The shipping build defines it on its own target, in
+    # MyApplication/entry/src/main/cpp/CMakeLists.txt, where MobileGlues is compiled into libglfw.so.
+    # While this file did not set it, a build of this tree silently skipped all of that code, so it
+    # could report success on sources the real target would refuse to compile - and did, repeatedly,
+    # across a whole investigation. A compile check that does not compile the code under change is
+    # worse than no check, because it gets trusted.
+    #
+    # Keep the two in agreement: a definition added on the shipping target belongs here too.
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE MG_PLATFORM_OHOS=1)
+else()
     # Linux — EGL/GLES are loaded dynamically via dlopen
     target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC
         ${CMAKE_DL_LIBS}
