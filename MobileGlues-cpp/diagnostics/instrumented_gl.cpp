@@ -54,6 +54,12 @@ extern "C" GLAPI GLAPIENTRY void glBufferSubData(GLenum target, GLintptr offset,
     const uint64_t startNs = mg::diagnostics::timestamp();
     GLES.glBufferSubData(target, offset, size, data);
     mg::diagnostics::record_sub_data(mg::diagnostics::non_negative_bytes(size), mg::diagnostics::elapsed_ns(startNs));
+#if defined(MG_PLATFORM_OHOS)
+    // This entry point does not maintain the dedup shadow, so anything it writes makes the shadow
+    // stale. Invalidating rather than recording keeps the shadow's meaning simple: it only ever holds
+    // bytes written through the path that also checks it.
+    mg_subdata_invalidate(mg_fake_buffer_for_target(target));
+#endif
     CHECK_GL_ERROR
 }
 
@@ -95,7 +101,35 @@ extern "C" GLAPI GLAPIENTRY void glCopyBufferSubData(GLenum readTarget, GLenum w
 #endif
     const uint64_t startNs = mg::diagnostics::timestamp();
     GLES.glCopyBufferSubData(readTarget, writeTarget, readOffset, writeOffset, size);
-    mg::diagnostics::record_copy(mg::diagnostics::non_negative_bytes(size), mg::diagnostics::elapsed_ns(startNs));
+    const uint64_t copyNs = mg::diagnostics::elapsed_ns(startNs);
+    mg::diagnostics::record_copy(mg::diagnostics::non_negative_bytes(size), copyNs);
+#if defined(MG_PLATFORM_OHOS)
+    // Name the two buffers and their storage flags, so the slow copies can be attributed and their
+    // effective bandwidth computed. See counters.h copy_slow_calls: the question is whether this
+    // library's own COHERENT promotion is what makes these copies slow, and bytes over time answers it.
+    {
+        const GLuint readFake = mg_fake_buffer_for_target(readTarget);
+        const GLuint writeFake = mg_fake_buffer_for_target(writeTarget);
+        mg::diagnostics::record_copy_detail(
+            mg::diagnostics::non_negative_bytes(size), copyNs, readFake, writeFake,
+            static_cast<uint64_t>(mg_store_effective_flags(readFake)),
+            static_cast<uint64_t>(mg_store_effective_flags(writeFake)));
+    }
+#endif
+#if defined(MG_PLATFORM_OHOS)
+    // A GPU copy rewrites the destination without this layer seeing the bytes.
+    mg_subdata_invalidate(find_bound_buffer(GL_COPY_WRITE_BUFFER_BINDING));
+    // Give up a layer-owned mapping of the destination.
+    //
+    // Strictly this is not required: the storage is coherent, the mapping is coherent, and this layer
+    // only ever writes through it, so a GPU-side write is visible and nothing cached goes stale. It
+    // is done anyway because it costs nothing measurable and removes a whole class of doubt - the
+    // store this cache exists for reports copy_dest = 0, so on the configuration being fixed this
+    // branch never fires, and on any other configuration the conservative answer is the right one.
+    if (mg_pmap_any()) {
+        mg_pmap_drop(find_bound_buffer(GL_COPY_WRITE_BUFFER_BINDING), GL_COPY_WRITE_BUFFER, MG_PMAP_EVICT_COPY);
+    }
+#endif
     CHECK_GL_ERROR
 }
 

@@ -380,9 +380,114 @@ void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const
         mg::diagnostics::record_direct_map_hit(uploadBytes, memcpyNs, mg::diagnostics::elapsed_ns(unmapStartNs));
     } else {
         // Small buffers, and any buffer that cannot be mapped, keep the synchronous path.
+        //
+        // Measured 2026-08-06, and it overturns the assumption in the comment on
+        // DIRECT_MAP_MIN_SIZE above: this branch took 17,133 of 25,339 glNamedBufferSubData calls,
+        // moved 41.8 bytes on average, and cost 6,857 ms with a worst single call of 116,707 us. The
+        // claim that these are harmless because "upload volume was never the bottleneck" is true
+        // about volume and wrong about cost - a 42-byte write into a store the GPU is reading stalls
+        // until the current render pass drains, and the size of the write does not enter into it.
+        //
+        // Not changed here yet, deliberately. Lowering the threshold is not the fix: the same
+        // comment records that small stores are read again later in the same frame, which is why
+        // they were excluded, and that reasoning still stands. The probe below names the
+        // destinations so the next change can be aimed rather than guessed.
+#if defined(MG_PLATFORM_OHOS)
+        // Drop a write whose bytes are already at that offset. Writing identical bytes to the same
+        // place twice is indistinguishable from writing them once, so this removes calls rather than
+        // making them cheaper - which matters here because the cost of one of these calls is a
+        // write-after-read stall, measured up to 116 ms for a 4-byte write, and is unrelated to the
+        // byte count.
+        //
+        // The duplicates come from Sodium: RenderRegionManager.uploadResults creates one
+        // PendingSectionMeshUpload per terrain pass that has a mesh, all carrying the same
+        // relativeBuiltTime, and each one calls UniformBufferManager.writeMeshTimes with the same
+        // region and section index. See gl/buffer.h for what the shadow's correctness depends on.
+        // Satisfy the write from a mapping this layer already holds, if it has one for this buffer.
+        //
+        // This is the fix for the chunk-boundary stutter. Measured on device 2026-08-07 over 287 s of
+        // MC 26.2 + Sodium: the 229,376-byte u_SectionTimeInfo store took 9,301 writes of about 8
+        // bytes through the branch below, costing 11,673 ms, and that was 99.4% of all cost in
+        // windows under 30 fps against 28.8% in windows at 80 and above. One second spent 556 ms on
+        // 152 four-byte writes. The cost is the driver waiting for the terrain draws that are still
+        // sampling the store, so it is per call and has nothing to do with the byte count - which is
+        // why eliding duplicate writes (below) removed 19% of the calls and 0% of the cost.
+        //
+        // Tried before this and rejected on measurement, so that this is not mistaken for the first
+        // idea rather than the last: lowering DIRECT_MAP_MIN_SIZE (small stores are re-read within a
+        // frame, which is why they were excluded); dropping GL_MAP_UNSYNCHRONIZED_BIT and letting the
+        // driver serialize (24,934 us per call, six times worse than not mapping); a staging buffer
+        // plus glCopyBufferSubData (single-digit frame rates); and deferring the write to the frame
+        // boundary (this store is read in the same frame it is written, at DefaultChunkRenderer
+        // offset 318).
+        //
+        // Checked first because it is the cheapest outcome available - a bounds check and a memcpy -
+        // and because for an adopted buffer the dedup shadow below is meaningless anyway: writes
+        // through the mapping never update it.
+        // First choice: write through the mapping the APPLICATION already holds.
+        //
+        // This is the fix. Blaze3D maps every immutable buffer whose usage has MAP_READ or MAP_WRITE
+        // inside GlBuffer$Direct's constructor and throws the view away, so such a buffer is
+        // permanently mapped and this layer can never map it itself - which is why the three previous
+        // attempts, all of which tried to take their own mapping, changed nothing. The pointer already
+        // exists and this layer produced it, so it is recorded at glMapBufferRange and reused here.
+        //
+        // The bytecode predicts which buffers land in which case, and the device agrees exactly: the
+        // 229,376-byte store is requested with 0x142, which contains MAP_WRITE, so Blaze3D holds its
+        // mapping and every access mask this layer tried was refused with GL_INVALID_OPERATION; the
+        // three small uniform stores are requested with 0x100, which contains neither MAP_READ nor
+        // MAP_WRITE, so Blaze3D leaves them alone and this layer's own cache adopted them.
+        //
+        // Checked before mg_pmap_write because the two are mutually exclusive by construction, and
+        // before the dedup shadow because for a buffer served this way the shadow is never consulted
+        // again and eliding a 0.5 us memcpy is pointless.
+        if (mg_appmap_write(GL_ARRAY_BUFFER, buffer, offset, size, data) == GL_TRUE) {
+            restoreTemporaryBufferBinding();
+            mg::diagnostics::record_named_upload(uploadBytes, bufSize > 0 ? static_cast<uint64_t>(bufSize) : 0,
+                                                 mg::diagnostics::elapsed_ns(namedStartNs));
+            LOG_D("[DSA] Buffer %u sub-data written through the application's own mapping, %lld bytes at %lld", buffer,
+                  size, offset);
+            return;
+        }
+
+        if (mg_pmap_write(GL_ARRAY_BUFFER, buffer, offset, size, data) == GL_TRUE) {
+            restoreTemporaryBufferBinding();
+            mg::diagnostics::record_named_upload(uploadBytes, bufSize > 0 ? static_cast<uint64_t>(bufSize) : 0,
+                                                 mg::diagnostics::elapsed_ns(namedStartNs));
+            LOG_D("[DSA] Buffer %u sub-data written through a held mapping, %lld bytes at offset %lld", buffer, size,
+                  offset);
+            return;
+        }
+
+        if (mg_subdata_is_redundant(buffer, offset, size, data) == GL_TRUE) {
+            restoreTemporaryBufferBinding();
+            mg::diagnostics::record_fallback_deduped(uploadBytes);
+            mg::diagnostics::record_named_upload(uploadBytes, bufSize > 0 ? static_cast<uint64_t>(bufSize) : 0,
+                                                 mg::diagnostics::elapsed_ns(namedStartNs));
+            LOG_D("[DSA] Buffer %u sub-data elided, identical %lld bytes already at offset %lld", buffer, size, offset);
+            return;
+        }
+#endif
         const uint64_t fallbackStartNs = mg::diagnostics::timestamp();
         glBufferSubData(GL_ARRAY_BUFFER, offset, size, data);
-        mg::diagnostics::record_fallback(uploadBytes, mg::diagnostics::elapsed_ns(fallbackStartNs));
+        const uint64_t fallbackNs = mg::diagnostics::elapsed_ns(fallbackStartNs);
+        mg::diagnostics::record_fallback(uploadBytes, fallbackNs);
+#if defined(MG_PLATFORM_OHOS)
+        // Record only after the write succeeded, so the shadow never claims bytes that are not there.
+        mg_subdata_record(buffer, offset, size, data);
+        // Count this write against the buffer, and take a mapping once it has proved hot. Placed
+        // after the write rather than before it so that a buffer is only ever adopted on the strength
+        // of writes that actually happened, and so that the adopting glMapBufferRange - the one call
+        // here that may block - happens with the store in a known state. GL_ARRAY_BUFFER is what
+        // temporarilyBindBuffer above bound this buffer to, and nothing in between changes it.
+        mg_pmap_consider(GL_ARRAY_BUFFER, buffer, size, bufSize > 0 ? static_cast<size_t>(bufSize) : 0);
+        mg::diagnostics::record_fallback_dest(
+            buffer, bufSize > 0 ? static_cast<uint64_t>(bufSize) : 0, uploadBytes,
+            static_cast<uint64_t>(offset < 0 ? 0 : offset), is_buffer_copy_destination(buffer) ? 1u : 0u, fallbackNs,
+            static_cast<uint64_t>(mg_store_requested_flags(buffer)),
+            static_cast<uint64_t>(mg_store_effective_flags(buffer)),
+            static_cast<uint64_t>(mg_store_entry(buffer)));
+#endif
         CHECK_GL_ERROR;
     }
     restoreTemporaryBufferBinding();

@@ -178,7 +178,18 @@ void glClear(GLbitfield mask) {
         // Clear again
         GLES.glClear(mask);
     } else {
+#if defined(MG_PLATFORM_OHOS)
+        // The driver's clear, timed on its own. glClear was the slowest entry point in this library in
+        // 25 of 89 windows with a worst single call of 41.8 ms, and everything else in this function is
+        // bookkeeping - the counter window boundary and, on ANGLE only, a depth workaround. Separating
+        // the two says whether that 41.8 ms is the driver resolving tiles, which this library cannot
+        // change, or work added here.
+        const uint64_t clearStartNs = mg::diagnostics::timestamp();
         GLES.glClear(mask);
+        mg::diagnostics::record_clear(mg::diagnostics::elapsed_ns(clearStartNs));
+#else
+        GLES.glClear(mask);
+#endif
     }
 
     CHECK_GL_ERROR_NO_INIT;
