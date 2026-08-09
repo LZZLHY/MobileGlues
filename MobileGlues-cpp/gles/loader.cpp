@@ -187,6 +187,32 @@ void InitGLESCapabilities() {
 
     LOG_I("%sDetected GL_EXT_multi_draw_indirect!", g_gles_caps.GL_EXT_multi_draw_indirect ? "" : "Not ")
 
+    // Report this one at a severity that is always emitted, because it decides far more than its
+    // name suggests.
+    //
+    // GL_ARB_buffer_storage is what Blaze3D turns into DeviceFeatures.persistentMapping (verified in
+    // GlHeuristics.createDeviceInfo, the 7th constructor argument is
+    // extensions.contains("GL_ARB_buffer_storage")). Two Sodium paths branch on that single flag:
+    //
+    //   UniformBufferManager.writeMeshTimes - true: memPutInt into a persistent mapping, no GL call
+    //                                         at all. false: MemoryStack.malloc(4) plus
+    //                                         CommandEncoder.writeToBuffer, i.e. one 4-byte
+    //                                         glNamedBufferSubData per section that finishes its
+    //                                         first build. Measured on device 2026-08-07: 5,990 such
+    //                                         writes costing 6,447 ms, worst single call 164 ms, and
+    //                                         95% of all sub-threshold upload cost.
+    //   MojangStagingBuffer.<init>          - true: a mapped staging ring. false: staging is null and
+    //                                         every arena upload goes straight to writeToBuffer.
+    //
+    // So a device without this extension makes Sodium choose the slow side of both branches, which is
+    // the chunk-boundary stutter. Logging the capability and the entry point separately matters
+    // because they can disagree: gl/buffer.cpp glBufferStorage silently allocates nothing when
+    // glBufferStorageEXT is null, so advertising the extension without the function would be worse
+    // than not advertising it.
+    LOG_I("%sDetected GL_EXT_buffer_storage! (glBufferStorageEXT=%s, GL_ARB_buffer_storage %s)",
+          g_gles_caps.GL_EXT_buffer_storage ? "" : "Not ", GLES.glBufferStorageEXT ? "resolved" : "NULL",
+          g_gles_caps.GL_EXT_buffer_storage ? "reported to the application" : "NOT reported")
+
     if (g_gles_caps.GL_EXT_buffer_storage) {
         AppendExtension("GL_ARB_buffer_storage");
     }
