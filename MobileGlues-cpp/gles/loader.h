@@ -99,6 +99,13 @@ extern "C"
 #define NATIVE_FUNCTION_HEAD(type, name, ...) extern "C" GLAPI GLAPIENTRY type name(__VA_ARGS__) {
 #endif
 
+// REMOVED 2026-08-07: per-call timing on every macro-generated native forward.
+//
+// It answered its question - the several hundred forwards gl/gl_native.cpp generates accounted for only
+// 8-10% of a frame's CPU time, and the entry points as a whole for 14-18% - and after that it was pure
+// cost on the hottest path in the library. See gl/log.h for the same note about the entry-point scope,
+// and docs/ohos/RENDER-ADAPTATION.md 6.11 for the measurement.
+
 #if GLOBAL_DEBUG
 #define NATIVE_FUNCTION_END(type, name, ...)                                                                           \
     LOG_D("Use native function: %s @ %s(...)", RENDERERNAME, __FUNCTION__);                                            \

@@ -15,6 +15,8 @@
 // in the whole buffer-shadow surface for one entry point. Defined in gl/buffer.cpp.
 extern "C" void mg_deferred_upload_flush_for_draw(void);
 extern "C" GLboolean mg_deferred_upload_pending(void);
+// REMOVED: the diagnostics include that draw timing needed. Nothing in this file is instrumented any
+// more - multi-draw was measured and cleared. See the notes at the two multiindirect backends.
 #endif
 
 #define DEBUG 0
@@ -94,30 +96,76 @@ void glMultiDrawElementsBaseVertex(GLenum mode, GLsizei* counts, GLenum type, co
     if (mg_deferred_upload_pending()) mg_deferred_upload_flush_for_draw();
 #endif
 
+    // NOTE: this dispatcher is NOT how the application gets here, and that is a finding in its own
+    // right. glx/lookup.cpp handle_multidraw_func_name rewrites "glMultiDrawElementsBaseVertex" into
+    // "mg_glMultiDrawElementsBaseVertex_<mode>" at getProcAddress time, so LWJGL resolves a pointer
+    // straight to the backend and this function is never called. The device round that timed draws
+    // proved it: the dispatcher's own call counter read 0 while the per-part counters inside the
+    // multiindirect backend were non-zero.
+    //
+    // Which means the deferred-upload drain above has never run either. That drain is the safety net
+    // the whole deferred design rests on, and deferred_forced_flush reading 0 was taken as "the range
+    // test almost never fires" when the truth is that the hook was unreachable. Exposure is currently
+    // small - deferred_enqueued measures about 2 per window - but it is a real hole and it is recorded
+    // in docs/ohos/RENDER-ADAPTATION.md rather than fixed in the same build as a measurement, so that
+    // one does not confound the other.
     func_ptr(mode, counts, type, indices, primcount, basevertex);
 }
 
+// The indirect command buffer, rotated over several GL names rather than one.
+//
+// Why this is a ring and not a single buffer, established on device 2026-08-08:
+//
+// Sodium issues one multi-draw per render region per pass, so a frame contains many, and each one
+// rewrites this staging area and then immediately issues a draw that reads it. With a single buffer,
+// multi-draw N+1's map lands on memory that multi-draw N's glMultiDrawElementsIndirectEXT may still
+// be reading. The map below asks for GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT and *not*
+// GL_MAP_UNSYNCHRONIZED_BIT, so a conforming driver has two ways to answer: rename the storage, or
+// wait for the read to finish. Waiting is a stall on every multi-draw after the first; renaming is
+// free. If a driver does neither - and this one appears not to - the commands read are stale or
+// half-written, which means a wrong baseVertex/firstIndex, which means geometry drawn from the wrong
+// offset in Sodium's arena.
+//
+// That last sentence is 3.2's artifact word for word - "regions render as void while the geometry
+// that belonged there appears elsewhere" - and switching to multidrawMode=2, which removes this
+// buffer from the picture entirely, made the artifact disappear on device. It also moved windows at
+// 60 fps or better from 11.2% to 51.0%, so the hazard was costing frame rate as well as correctness.
+//
+// The ring gives each multi-draw its own storage for the next MG_INDIRECT_RING_SIZE calls, so the
+// GPU has that many multi-draws' worth of slack before a write can catch up with a read. Buffers are
+// tiny - primcount is at most about 1800, so 36 KB each - which is why the ring is cheap enough to
+// be the fix rather than a compromise. Sizes are tracked per slot because each grows independently.
+//
+// This does not remove the glGetIntegerv below, which is a separate per-call cost on a tiled GPU and
+// a separate change; one variable at a time.
+static constexpr int MG_INDIRECT_RING_SIZE = 8;
 static bool g_indirect_cmds_inited = false;
-static GLsizei g_cmdbufsize = 0;
-static GLuint g_indirectbuffer = 0;
+static GLuint g_indirectbuffers[MG_INDIRECT_RING_SIZE] = {0};
+static GLsizei g_cmdbufsizes[MG_INDIRECT_RING_SIZE] = {0};
+static int g_indirect_slot = 0;
 static GLuint prevIndirectBuffer = 0;
 
 void prepare_indirect_buffer(const GLsizei* counts, GLenum type, const void* const* indices, GLsizei primcount,
                              const GLint* basevertex) {
     GLES.glGetIntegerv(GL_DRAW_INDIRECT_BUFFER_BINDING, (GLint*)&prevIndirectBuffer);
     if (!g_indirect_cmds_inited) {
-        GLES.glGenBuffers(1, &g_indirectbuffer);
-        GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, g_indirectbuffer);
-        g_cmdbufsize = 1;
-        GLES.glBufferData(GL_DRAW_INDIRECT_BUFFER, g_cmdbufsize * sizeof(draw_elements_indirect_command_t), NULL,
-                          GL_DYNAMIC_DRAW);
-
+        GLES.glGenBuffers(MG_INDIRECT_RING_SIZE, g_indirectbuffers);
+        for (int i = 0; i < MG_INDIRECT_RING_SIZE; ++i) {
+            GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, g_indirectbuffers[i]);
+            g_cmdbufsizes[i] = 1;
+            GLES.glBufferData(GL_DRAW_INDIRECT_BUFFER, g_cmdbufsizes[i] * sizeof(draw_elements_indirect_command_t),
+                              NULL, GL_DYNAMIC_DRAW);
+        }
         g_indirect_cmds_inited = true;
     }
-    GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, g_indirectbuffer);
 
-    if (g_cmdbufsize < primcount) {
-        size_t sz = g_cmdbufsize;
+    // Advance first, so the slot used by the previous multi-draw is left alone.
+    g_indirect_slot = (g_indirect_slot + 1) % MG_INDIRECT_RING_SIZE;
+    const int slot = g_indirect_slot;
+    GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, g_indirectbuffers[slot]);
+
+    if (g_cmdbufsizes[slot] < primcount) {
+        size_t sz = g_cmdbufsizes[slot];
 
         LOG_D("Before resize: %d", sz)
 
@@ -127,10 +175,10 @@ void prepare_indirect_buffer(const GLsizei* counts, GLenum type, const void* con
 
         GLES.glBufferData(GL_DRAW_INDIRECT_BUFFER, sz * sizeof(draw_elements_indirect_command_t), NULL,
                           GL_DYNAMIC_DRAW);
-        g_cmdbufsize = sz;
+        g_cmdbufsizes[slot] = sz;
     }
 
-    LOG_D("After resize: %d", g_cmdbufsize)
+    LOG_D("After resize: %d (slot %d)", g_cmdbufsizes[slot], slot)
 
     auto* pcmds = (draw_elements_indirect_command_t*)GLES.glMapBufferRange(
         GL_DRAW_INDIRECT_BUFFER, 0, primcount * sizeof(draw_elements_indirect_command_t),
@@ -278,10 +326,15 @@ void mg_glMultiDrawElementsBaseVertex_multiindirect(GLenum mode, GLsizei* counts
                                                     const GLint* basevertex) {
     LOG()
     void prepareForDraw();
+
+    // REMOVED: per-part draw timing (prepareForDraw / indirect-command-buffer build / driver call).
+    // It answered its question and the answer was negative, so the cost of three clock reads per
+    // multi-draw is no longer worth paying. Measured per *frame* rather than per second, so the
+    // number does not simply track the frame count: windows under 30 fps spent 0.33 ms per frame in
+    // multi-draw against 0.30 ms per frame in windows at 80 fps or better. Flat. Multi-draw is not
+    // where the chunk-boundary stutter lives. See docs/ohos/RENDER-ADAPTATION.md.
     prepareForDraw();
-
     prepare_indirect_buffer(counts, type, indices, primcount, basevertex);
-
     // Multi-draw indirect!
     GLES.glMultiDrawElementsIndirectEXT(mode, type, 0, primcount, 0);
 
@@ -361,10 +414,10 @@ void mg_glMultiDrawElements_multiindirect(GLenum mode, const GLsizei* count, GLe
                                           GLsizei primcount) {
     LOG()
     void prepareForDraw();
+
+    // REMOVED: per-part draw timing, same as the base-vertex variant above and for the same reason.
     prepareForDraw();
-
     prepare_indirect_buffer(count, type, indices, primcount, 0);
-
     // Multi-draw indirect!
     GLES.glMultiDrawElementsIndirectEXT(mode, type, 0, primcount, 0);
 

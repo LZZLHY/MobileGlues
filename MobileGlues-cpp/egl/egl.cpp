@@ -261,6 +261,17 @@ extern "C"
         LOG_D("eglSwapBuffers, dpy: %p, surface: %p", dpy, surface);
         LOAD_EGL(eglSwapBuffers)
         EGLBoolean result;
+        // REMOVED: present timing and the frame-gap denominator.
+        //
+        // Present was measured per *frame*: 0.39 ms/frame in windows under 30 fps against 0.29
+        // ms/frame at 80 fps or better. Flat, so the present is not blocking on the compositor and
+        // the stutter is not here.
+        //
+        // The frame gap was the denominator that made the percentages real, and it did its job: with
+        // it, every MG entry point together came to 14-18% of a frame's CPU time in steady state
+        // (about 4.9 ms of a 27 ms frame), which put the steady-state frame rate ceiling in the
+        // application, not in this layer. That conclusion is recorded; the two clock reads per
+        // present are not needed to keep it. See docs/ohos/RENDER-ADAPTATION.md.
         if (global_settings.fsr1_setting != FSR1_Quality_Preset::Disabled) {
             ApplyFSR();
             result = egl_eglSwapBuffers(dpy, surface);

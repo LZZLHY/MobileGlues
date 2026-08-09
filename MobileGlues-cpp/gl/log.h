@@ -43,6 +43,18 @@ typedef int android_LogPriority;
 int __android_log_print(int prio, const char* tag, const char* fmt, ...);
 #endif
 
+// REMOVED 2026-08-07: the per-entry-point scope timer that used to hang off LOG().
+//
+// It answered its question and was then pure cost. What it established, kept because it is the reason
+// not to add it back casually: with the u_SectionTimeInfo upload cost gone, only 14-18% of a frame's
+// CPU time was inside this library at all in the steady state - about 4.9 ms of a 27 ms frame - and the
+// rest is the application's own code. The frame-rate ceiling is not here, and an instrument on every
+// entry point cannot find something that is not in the entry points.
+//
+// If it is ever needed again, the shape that worked was: a small RAII object appended to this macro and
+// to NATIVE_FUNCTION_HEAD in gles/loader.h, a shared thread_local depth counter so nested entry points
+// count once, and an inline flag test so a release build pays a load and a branch rather than two
+// out-of-line calls. See docs/ohos/RENDER-ADAPTATION.md 6.11.
 #if GLOBAL_DEBUG_FORCE_OFF
 #define LOG()                                                                                                          \
     {}
