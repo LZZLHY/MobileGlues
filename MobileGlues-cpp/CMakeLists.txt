@@ -131,25 +131,24 @@ else()
 endif()
 
 if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-    include(CheckIPOSupported)
-    include(CheckCCompilerFlag)
-    include(CheckCXXCompilerFlag)
-
-    check_ipo_supported(RESULT MOBILEGLUES_IPO_SUPPORTED OUTPUT MOBILEGLUES_IPO_ERROR)
-    check_c_compiler_flag("-flto=thin" MOBILEGLUES_HAS_THINLTO_C)
-    check_cxx_compiler_flag("-flto=thin" MOBILEGLUES_HAS_THINLTO_CXX)
-
-    if(MOBILEGLUES_HAS_THINLTO_C AND MOBILEGLUES_HAS_THINLTO_CXX)
-        message(STATUS "MobileGlues: ThinLTO supported")
+    # Android NDK and OHOS BiSheng are Clang toolchains; ThinLTO is their
+    # upstream release contract. Do not try_compile it on OHOS: Huawei's
+    # toolchain file loses its SDK-root variable in CMake scratch projects even
+    # though the real target accepts and links -flto=thin correctly.
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(STATUS "MobileGlues: using Clang ThinLTO")
         target_compile_options(mobileglues_core PRIVATE -flto=thin)
         target_link_options(mobileglues_core INTERFACE -flto=thin)
         set(MOBILEGLUES_LTO_MODE "thin" CACHE INTERNAL "Effective MobileGlues LTO mode" FORCE)
-    elseif(MOBILEGLUES_IPO_SUPPORTED)
-        message(STATUS "MobileGlues: ThinLTO unavailable, using CMake IPO")
+    else()
+        include(CheckIPOSupported)
+        check_ipo_supported(RESULT MOBILEGLUES_IPO_SUPPORTED OUTPUT MOBILEGLUES_IPO_ERROR)
+        if(NOT MOBILEGLUES_IPO_SUPPORTED)
+            message(FATAL_ERROR "MobileGlues requires LTO for non-Debug builds: ${MOBILEGLUES_IPO_ERROR}")
+        endif()
+        message(STATUS "MobileGlues: using CMake IPO")
         set_property(TARGET mobileglues_core PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
         set(MOBILEGLUES_LTO_MODE "ipo" CACHE INTERNAL "Effective MobileGlues LTO mode" FORCE)
-    else()
-        message(FATAL_ERROR "MobileGlues requires LTO for non-Debug builds: ${MOBILEGLUES_IPO_ERROR}")
     endif()
 else()
     set(MOBILEGLUES_LTO_MODE "disabled-debug" CACHE INTERNAL "Effective MobileGlues LTO mode" FORCE)
