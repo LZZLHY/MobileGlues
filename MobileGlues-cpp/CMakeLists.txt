@@ -44,6 +44,22 @@ if(NOT TARGET spirv-cross-c)
     add_subdirectory(3rdparty/SPIRV-Cross)
 endif()
 
+# The official Android 2.0 plugin builds this shader stack as RelWithDebInfo:
+# O2 + debug information + NDEBUG. OHOS names its shipping configuration
+# Release, so preserve the same optimization/diagnostic contract explicitly;
+# symbols are stripped only at the HAP packaging boundary.
+if(NOT MSVC)
+    foreach(MOBILEGLUES_SHADER_TARGET IN ITEMS
+            glslang
+            spirv-cross-core
+            spirv-cross-glsl
+            spirv-cross-c)
+        if(TARGET ${MOBILEGLUES_SHADER_TARGET})
+            target_compile_options(${MOBILEGLUES_SHADER_TARGET} PRIVATE -O2 -g)
+        endif()
+    endforeach()
+endif()
+
 # Single source-of-truth for both the Android/standalone library and embedded
 # consumers.  init.cpp is intentionally a wrapper source rather than part of
 # the core: hosts can initialize after preparing their writable directory.
