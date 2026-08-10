@@ -12,12 +12,44 @@
 #include "../gl/log.h"
 #include "../gl/mg.h"
 #include "../includes.h"
+#include <MG/init.h>
 #include <EGL/egl.h>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
+#include <mutex>
 
 #define DEBUG 0
+
+#if !defined(__APPLE__)
+namespace {
+
+// Resolve the handle for the image that owns this resolver. RTLD_DEFAULT is not
+// sufficient in Android/OHOS-style processes where a system GLES implementation
+// may already be global: it can return the backend function and bypass the
+// MobileGlues frontend completely. A failed lookup is deliberately not cached,
+// so a loader namespace that becomes ready later can retry safely.
+void* own_image_handle() {
+    static std::atomic<void*> cached{nullptr};
+    static std::mutex resolve_mutex;
+
+    if (void* handle = cached.load(std::memory_order_acquire)) return handle;
+
+    std::lock_guard<std::mutex> lock(resolve_mutex);
+    if (void* handle = cached.load(std::memory_order_relaxed)) return handle;
+
+    Dl_info info{};
+    if (!dladdr(reinterpret_cast<const void*>(&glXGetProcAddress), &info) || !info.dli_fname) return nullptr;
+
+    void* handle = dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+    if (!handle) handle = dlopen(info.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+    if (handle) cached.store(handle, std::memory_order_release);
+    return handle;
+}
+
+} // namespace
+#endif
 
 // The application can ask for a multi-draw entry point by name and call the
 // result directly, bypassing the dispatcher in gl/multidraw.cpp. Hand back the
@@ -49,6 +81,14 @@ std::string handle_multidraw_func_name(std::string name) {
 
 void* glXGetProcAddress(const char* name) {
     LOG()
+    if (!name) return nullptr;
+    mg_init_report_v1 init_report{sizeof(mg_init_report_v1), MG_INIT_ABI_VERSION,
+                                  MG_INIT_STATE_COLD, MG_INIT_ERROR_NONE, {0}};
+    if (!mg_initialize_v1(&init_report)) {
+        LOG_W_FORCE("glXGetProcAddress rejected before MobileGlues READY (state=%d error=%d stage=%s)",
+                    init_report.state, init_report.error, init_report.stage)
+        return nullptr;
+    }
     std::string real_func_name = handle_multidraw_func_name(std::string(name));
 #ifdef __APPLE__
     return dlsym((void*)(~(uintptr_t)0), real_func_name.c_str());
@@ -56,7 +96,14 @@ void* glXGetProcAddress(const char* name) {
 
     void* proc = nullptr;
 
-    proc = dlsym(RTLD_DEFAULT, real_func_name.c_str());
+    if (void* handle = own_image_handle()) {
+        proc = dlsym(handle, real_func_name.c_str());
+    }
+    if (!proc) {
+        // Preserve upstream's extension fallback: MobileGlues intentionally
+        // does not wrap every vendor entry point exposed by the GLES backend.
+        proc = dlsym(RTLD_DEFAULT, real_func_name.c_str());
+    }
 
     if (!proc) {
         LOG_W("Failed to get OpenGL function: %s", real_func_name.c_str())
