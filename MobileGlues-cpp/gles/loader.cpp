@@ -125,7 +125,7 @@ void* open_lib(const char** names, const char* override, bool* used_override) {
     return lib;
 }
 
-void load_libs() {
+bool load_libs() {
 #ifndef __APPLE__
     const bool want_angle = global_settings.angle == AngleMode::Enabled;
     std::string gles_angle, egl_angle;
@@ -147,6 +147,11 @@ void load_libs() {
     gles = (void*)(~(uintptr_t)0);
     egl = (void*)(~(uintptr_t)0);
 #endif
+    if (!gles || !egl) {
+        LOG_E("Unable to load required GLES/EGL backend libraries");
+        return false;
+    }
+    return true;
 }
 
 void* proc_address(void* lib, const char* name) {
@@ -296,7 +301,7 @@ void InitGLESCapabilities() {
     }
 }
 
-void init_target_gles() {
+bool init_target_gles() {
     init_gl_state();
 
     memset(&g_gles_func, 0, sizeof(g_gles_func));
@@ -678,6 +683,14 @@ void init_target_gles() {
 
     //    LOG_D("glBruh() @ 0x%x", GLES.glBruh)
 
+    // These are the minimum entry points used immediately by the capability
+    // probe below. Optional ES 3.1/3.2 and extension functions remain nullable
+    // and are filtered by their advertised capabilities as before.
+    if (!GLES.glGetError || !GLES.glGetString || !GLES.glGetStringi || !GLES.glGetIntegerv) {
+        LOG_E("Required GLES 3.0 bootstrap entry point is unavailable");
+        return false;
+    }
+
     LOG_D("Initializing %s @ hardware", RENDERERNAME)
     set_hardware();
 
@@ -696,4 +709,5 @@ void init_target_gles() {
             g_gles_func.glDrawElementsBaseVertex = nullptr;
         }
     }
+    return true;
 }

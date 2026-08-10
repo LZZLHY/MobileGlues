@@ -7,8 +7,10 @@
 
 #include "includes.h"
 
+#if MOBILEGLUES_AUTO_INIT
 struct static_block_t {
-    static_block_t() { proc_init(); }
+    static_block_t() { (void)mg_initialize_v1(nullptr); }
 };
 
 static static_block_t static_block;
+#endif

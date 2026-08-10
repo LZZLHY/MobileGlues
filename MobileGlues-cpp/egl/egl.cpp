@@ -15,6 +15,7 @@
 #include "../glx/lookup.h"
 #include "loader.h"
 #include "trace.h"
+#include <MG/init.h>
 #include <EGL/eglext.h>
 #include <cstdio>
 #include <mutex>
@@ -52,6 +53,16 @@ namespace {
     void setFrontendError(EGLint error) {
         ETRACE("virtual error queued: %s", mg_egl_error_name(error));
         frontend_error = error;
+    }
+
+    bool ensureMobileGluesReady() {
+        mg_init_report_v1 report{sizeof(mg_init_report_v1), MG_INIT_ABI_VERSION,
+                                 MG_INIT_STATE_COLD, MG_INIT_ERROR_NONE, {0}};
+        if (mg_initialize_v1(&report)) return true;
+        LOG_W_FORCE("EGL entry rejected before MobileGlues READY (state=%d error=%d stage=%s)",
+                    report.state, report.error, report.stage)
+        setFrontendError(EGL_NOT_INITIALIZED);
+        return false;
     }
 
     const char* eglAttributeName(EGLint attribute) {
@@ -516,6 +527,7 @@ extern "C"
 
     EGL_API EGLDisplay eglGetDisplay(EGLNativeDisplayType display_id) {
         LOG_D("eglGetDisplay, display_id: %p", display_id);
+        if (!ensureMobileGluesReady()) return EGL_NO_DISPLAY;
         LOAD_EGL(eglGetDisplay)
         const EGLDisplay dpy = egl_eglGetDisplay(display_id);
         ETRACE("eglGetDisplay(%p) -> %p", display_id, dpy);
@@ -889,6 +901,7 @@ extern "C"
         LOG_D("eglGetPlatformDisplay, platform: %d, native_display: %p, attrib_list: "
               "%p",
               platform, native_display, attrib_list);
+        if (!ensureMobileGluesReady()) return EGL_NO_DISPLAY;
         LOAD_EGL_OR(eglGetPlatformDisplay, setFrontendError(EGL_BAD_PARAMETER), EGL_NO_DISPLAY)
         return egl_eglGetPlatformDisplay(platform, native_display, attrib_list);
     }
@@ -993,6 +1006,7 @@ extern "C"
     // backend mangling.
     EGL_API EGLAPI __eglMustCastToProperFunctionPointerType EGLAPIENTRY eglGetProcAddress(const char* procname) {
         if (procname == nullptr) return nullptr;
+        if (!ensureMobileGluesReady()) return nullptr;
 
         struct egl_entry_t {
             const char* name;

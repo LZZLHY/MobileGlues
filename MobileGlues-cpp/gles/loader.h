@@ -43,9 +43,9 @@ extern "C"
     // load_libs() falls back to the system driver when it cannot be opened.
     extern bool g_angle_in_use;
 
-    void init_target_gles();
+    bool init_target_gles();
 
-    void load_libs();
+    bool load_libs();
 
 #if GLOBAL_DEBUG
 #define INIT_GLES_FUNC(name)                                                                                           \

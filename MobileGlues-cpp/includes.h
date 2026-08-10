@@ -17,6 +17,7 @@
 #include <EGL/egl.h>
 #include <GLES3/gl32.h>
 #include <MG/extensions.h>
+#include <MG/init.h>
 
 #include "egl/egl.h"
 #include "egl/loader.h"
@@ -32,8 +33,8 @@ extern "C"
 {
 #endif
 
-    static int g_initialized = 0;
-
+    // Deprecated internal compatibility wrapper. Embedded consumers use the
+    // versioned API in <MG/init.h>; this symbol remains hidden.
     void proc_init();
 
 #ifdef __cplusplus

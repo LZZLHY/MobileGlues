@@ -191,7 +191,7 @@ extern "C"
     mglues_eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx);
     */
 
-    void init_target_egl();
+    bool init_target_egl();
     void destroy_temp_egl_ctx();
 
 #ifdef __cplusplus

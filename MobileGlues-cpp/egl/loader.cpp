@@ -22,7 +22,7 @@ static EGLDisplay eglDisplay = EGL_NO_DISPLAY;
 static EGLSurface eglSurface = EGL_NO_SURFACE;
 static EGLContext eglContext = EGL_NO_CONTEXT;
 
-void init_target_egl() {
+bool init_target_egl() {
     ETRACE("init_target_egl: starting the bootstrap probe")
     LOAD_EGL(eglGetProcAddress);
     LOAD_EGL(eglBindAPI);
@@ -37,6 +37,14 @@ void init_target_egl() {
     LOAD_EGL(eglQueryString);
     LOAD_EGL(eglTerminate);
     LOAD_EGL(eglGetError);
+
+    if (!egl_eglGetProcAddress || !egl_eglBindAPI || !egl_eglInitialize || !egl_eglGetDisplay ||
+        !egl_eglCreatePbufferSurface || !egl_eglDestroySurface || !egl_eglDestroyContext ||
+        !egl_eglMakeCurrent || !egl_eglChooseConfig || !egl_eglCreateContext || !egl_eglQueryString ||
+        !egl_eglTerminate || !egl_eglGetError) {
+        LOG_E("Required EGL bootstrap entry point is unavailable");
+        return false;
+    }
 
     EGLint configAttribs[] = {EGL_RED_SIZE,
                               8,
@@ -122,7 +130,7 @@ void init_target_egl() {
 
     LOG_V("EGL initialized successfully");
     ETRACE("init_target_egl: probe up (dpy=%p, ctx=%p, surface=%p)", eglDisplay, eglContext, eglSurface)
-    return;
+    return true;
 
 cleanup:
     if (eglSurface != EGL_NO_SURFACE) {
@@ -147,6 +155,7 @@ cleanup:
     eglDisplay = EGL_NO_DISPLAY;
     LOG_E("EGL initialization failed");
     ETRACE("init_target_egl: probe FAILED, all three handles released")
+    return false;
 }
 
 void destroy_temp_egl_ctx() {
