@@ -1,93 +1,53 @@
 cmake_minimum_required(VERSION 3.22.1)
-project("mobileglues")
-enable_language(CXX)
+project(mobileglues LANGUAGES C CXX)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+option(MOBILEGLUES_BUILD_STANDALONE "Build the standalone libmobileglues shared library" ON)
+option(MOBILEGLUES_AUTO_INIT "Run MobileGlues initialization from a shared-library constructor" ON)
+option(MOBILEGLUES_ENABLE_PROFILING "Build the Perfetto profiling integration" OFF)
 
-# glslang & SPIRV-Cross
-set(ENABLE_RTTI                ON  CACHE BOOL "Enables RTTI (will be took by glslang)" FORCE)
-set(ENABLE_HLSL                OFF CACHE BOOL "Disable HLSL input for glslang" FORCE)
-set(BUILD_EXTERNAL             OFF CACHE BOOL "Disable build external dependencies for glslang" FORCE)
-set(ENABLE_GLSLANG_BINARIES    OFF CACHE BOOL "Disable glslangValidator/spirv-remap" FORCE)
-set(ENABLE_OPT                 OFF CACHE BOOL "Disable SPIRV-Tools opt usage in glslang" FORCE)
-set(BUILD_EXTERNAL             OFF CACHE BOOL "Don't build external deps in External/" FORCE)
+# Keep dependency options local to this directory tree.  CMP0077 NEW makes the
+# normal variables below authoritative even for the older SPIRV-Cross project;
+# this avoids polluting an embedding parent's cache while still producing the
+# same minimal shader stack as the Android module.
+set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
 
-set(SPIRV_CROSS_ENABLE_C_API   ON  CACHE BOOL "Enable C API" FORCE)
-set(SPIRV_CROSS_ENABLE_GLSL    ON  CACHE BOOL "Enable GLSL backend" FORCE)
-set(SPIRV_CROSS_ENABLE_REFLECT OFF CACHE BOOL "Disable reflect" FORCE)
-set(SPIRV_CROSS_ENABLE_HLSL    OFF CACHE BOOL "Disable HLSL backend" FORCE)
-set(SPIRV_CROSS_ENABLE_MSL     OFF CACHE BOOL "Disable MSL backend" FORCE)
-set(SPIRV_CROSS_ENABLE_CPP     OFF CACHE BOOL "Disable C++ API target" FORCE)
-set(SPIRV_CROSS_CLI            OFF CACHE BOOL "Disable CLI binary" FORCE)
-set(SPIRV_CROSS_STATIC         ON  CACHE BOOL "Prefer static libs" FORCE)
-set(SPIRV_CROSS_ENABLE_UTIL    OFF CACHE BOOL "Disable util" FORCE)
+set(ENABLE_RTTI ON)
+set(ENABLE_HLSL OFF)
+set(BUILD_EXTERNAL OFF)
+set(ENABLE_GLSLANG_BINARIES OFF)
+set(ENABLE_OPT OFF)
+set(ENABLE_GLSLANG_JS OFF)
+set(BUILD_TESTING OFF)
 
-add_subdirectory(3rdparty/glslang)
-add_subdirectory(3rdparty/SPIRV-Cross)
+set(SPIRV_CROSS_ENABLE_C_API ON)
+set(SPIRV_CROSS_ENABLE_GLSL ON)
+set(SPIRV_CROSS_ENABLE_REFLECT OFF)
+set(SPIRV_CROSS_ENABLE_HLSL OFF)
+set(SPIRV_CROSS_ENABLE_MSL OFF)
+set(SPIRV_CROSS_ENABLE_CPP OFF)
+set(SPIRV_CROSS_CLI OFF)
+set(SPIRV_CROSS_STATIC ON)
+set(SPIRV_CROSS_SHARED OFF)
+set(SPIRV_CROSS_ENABLE_UTIL OFF)
+set(SPIRV_CROSS_ENABLE_TESTS OFF)
+set(SPIRV_CROSS_SKIP_INSTALL ON)
 
-if(MACOS)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w -fvisibility=default -funwind-tables -g -D_THREAD_SAFE -fPIC -stdlib=libc++")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -w -g -std=gnu99 -funwind-tables -fvisibility=hidden")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libstdc++")
-else()
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w -fvisibility=hidden -funwind-tables -g -D_THREAD_SAFE -fPIC")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -w -g -std=gnu99 -funwind-tables -fvisibility=hidden")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libstdc++")
-    set(CMAKE_ANDROID_STL_TYPE c++_static)
+if(NOT TARGET glslang::glslang)
+    add_subdirectory(3rdparty/glslang)
+endif()
+if(NOT TARGET spirv-cross-c)
+    add_subdirectory(3rdparty/SPIRV-Cross)
 endif()
 
-if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-    # Check if ThinLTO or LTO is suppported
-    include(CheckIPOSupported)
-    include(CheckCCompilerFlag)
-    include(CheckCXXCompilerFlag)
-
-    check_ipo_supported(RESULT LTOSupported OUTPUT LTOError)
-
-    check_c_compiler_flag("-flto" HAS_LTO_C)
-    check_cxx_compiler_flag("-flto" HAS_LTO_CXX)
-
-    if (LTOSupported OR (HAS_LTO_C AND HAS_LTO_CXX))
-    # Check ThinLTO
-    check_c_compiler_flag("-flto=thin" HAS_THINLTO_C)
-    check_cxx_compiler_flag("-flto=thin" HAS_THINLTO_CXX)
-    if (HAS_THINLTO_C AND HAS_THINLTO_CXX)
-        message(STATUS "ThinLTO supported, using -flto=thin")
-
-        add_compile_options(-flto=thin)
-        add_link_options(-flto=thin)
-    else()
-        # ThinLTO is not supported
-        message(STATUS "ThinLTO not available, fallback to CMAKE IPO")
-        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
-    endif()
-    else()
-    message(STATUS "IPO not supported: ${LTOError}")
-    endif()
-endif()
-
-
-if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MATCHES "AppleClang")
-    add_compile_options(-O3 -ffunction-sections -fdata-sections)
-    add_link_options(-Wl,--gc-sections)
-elseif (CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
-#    add_compile_options(/O2)
-else ()
-    add_compile_options(-O2)
-endif()
-
-if (CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
-    add_compile_options(/Zc:preprocessor)
-    add_compile_options(/Zc:__cplusplus)
-endif()
-
-set(PROFILING OFF)
-
-add_library(${CMAKE_PROJECT_NAME} SHARED
-    init.cpp
+# Single source-of-truth for both the Android/standalone library and embedded
+# consumers.  init.cpp is intentionally a wrapper source rather than part of
+# the core: hosts can initialize after preparing their writable directory.
+set(MOBILEGLUES_CORE_SOURCES
     main.cpp
     gl/gl_stub.cpp
     gl/gl_native.cpp
@@ -115,7 +75,6 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
     gl/glsl/glsl_for_es.cpp
     gl/glsl/cache.cpp
     gl/FSR1/FSR1.cpp
-
     gl/vertexattrib.cpp
     glx/lookup.cpp
     egl/egl.cpp
@@ -128,57 +87,110 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
     config/stats.cpp
 )
 
-target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
-    ./includes
-    ./3rdparty/xxhash)
-target_include_directories(${CMAKE_PROJECT_NAME} PUBLIC ${CMAKE_SOURCE_DIR}/include)
+add_library(mobileglues_core OBJECT ${MOBILEGLUES_CORE_SOURCES})
+add_library(MobileGlues::Core ALIAS mobileglues_core)
 
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
+set_target_properties(mobileglues_core PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON
+    C_VISIBILITY_PRESET hidden
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN YES
+)
+
+# These are private on purpose: an embedded host must not accidentally compile
+# its own EGL/GLES translation units against MobileGlues' vendored headers.
+target_include_directories(mobileglues_core BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/xxhash
+)
+
+if(MSVC)
+    target_compile_options(mobileglues_core PRIVATE /Zc:preprocessor /Zc:__cplusplus)
+else()
+    target_compile_options(mobileglues_core PRIVATE
+        -w
+        -g
+        -O2
+        -funwind-tables
+        -ffunction-sections
+        -fdata-sections
+        $<$<COMPILE_LANGUAGE:C>:-std=gnu99>
+    )
+    target_compile_definitions(mobileglues_core PRIVATE _THREAD_SAFE)
+
+    # Android RelWithDebInfo gets shared-library GC from NDK r27d.  Embedded
+    # platforms consume this link contract explicitly so the effective result
+    # stays equivalent even when their toolchain only enables GC for executables.
+    target_link_options(mobileglues_core INTERFACE
+        -Wl,-Bsymbolic-functions
+        -Wl,--gc-sections
+    )
+endif()
+
+if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    include(CheckIPOSupported)
+    include(CheckCCompilerFlag)
+    include(CheckCXXCompilerFlag)
+
+    check_ipo_supported(RESULT MOBILEGLUES_IPO_SUPPORTED OUTPUT MOBILEGLUES_IPO_ERROR)
+    check_c_compiler_flag("-flto=thin" MOBILEGLUES_HAS_THINLTO_C)
+    check_cxx_compiler_flag("-flto=thin" MOBILEGLUES_HAS_THINLTO_CXX)
+
+    if(MOBILEGLUES_HAS_THINLTO_C AND MOBILEGLUES_HAS_THINLTO_CXX)
+        message(STATUS "MobileGlues: ThinLTO supported")
+        target_compile_options(mobileglues_core PRIVATE -flto=thin)
+        target_link_options(mobileglues_core INTERFACE -flto=thin)
+        set(MOBILEGLUES_LTO_MODE "thin" CACHE INTERNAL "Effective MobileGlues LTO mode" FORCE)
+    elseif(MOBILEGLUES_IPO_SUPPORTED)
+        message(STATUS "MobileGlues: ThinLTO unavailable, using CMake IPO")
+        set_property(TARGET mobileglues_core PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+        set(MOBILEGLUES_LTO_MODE "ipo" CACHE INTERNAL "Effective MobileGlues LTO mode" FORCE)
+    else()
+        message(FATAL_ERROR "MobileGlues requires LTO for non-Debug builds: ${MOBILEGLUES_IPO_ERROR}")
+    endif()
+else()
+    set(MOBILEGLUES_LTO_MODE "disabled-debug" CACHE INTERNAL "Effective MobileGlues LTO mode" FORCE)
+endif()
+
+target_link_libraries(mobileglues_core PUBLIC
     glslang::glslang
     spirv-cross-c
 )
 
-if (NOT MSVC)
-    # Calls between this library's own translation units must land in this
-    # library. Without this, an internal call to an exported gl* symbol goes
-    # through a preemptible PLT slot, and in an Android app process the system
-    # libGLESv2 -- always in the global symbol scope -- can win the lookup: the
-    # DSA wrappers and the benchmark would then be calling the real driver where
-    # they meant the frontend, silently bypassing all state tracking. The
-    # symbols stay exported for dlsym and eglGetProcAddress; only who internal
-    # calls bind to changes. On the target, not in the AppleClang-guarded block
-    # above -- that block's condition has never been true (dangling NOT MATCHES),
-    # which is also why --gc-sections never made it into the link.
-    target_link_options(${CMAKE_PROJECT_NAME} PRIVATE -Wl,-Bsymbolic-functions)
+if(MOBILEGLUES_ENABLE_PROFILING)
+    find_package(Threads REQUIRED)
+    add_library(mobileglues_perfetto STATIC 3rdparty/perfetto/sdk/perfetto.cc)
+    target_include_directories(mobileglues_perfetto PUBLIC 3rdparty/perfetto/sdk)
+    target_link_libraries(mobileglues_core PRIVATE mobileglues_perfetto Threads::Threads)
+    target_compile_definitions(mobileglues_core PRIVATE PROFILING=1)
+else()
+    target_compile_definitions(mobileglues_core PRIVATE PROFILING=0)
 endif()
 
-if(MACOS)
-    # iOS
-    target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC
-        "-F${CMAKE_SOURCE_DIR}/external"
-        "-framework libEGL"
-        "-framework libGLESv2"
-        "-framework Metal"
-        "-framework Foundation"
-        "-framework QuartzCore"
+if(MOBILEGLUES_BUILD_STANDALONE)
+    add_library(mobileglues SHARED init.cpp)
+    add_library(MobileGlues::MobileGlues ALIAS mobileglues)
+    target_link_libraries(mobileglues PRIVATE mobileglues_core)
+    target_include_directories(mobileglues PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(mobileglues PRIVATE
+        MOBILEGLUES_AUTO_INIT=$<BOOL:${MOBILEGLUES_AUTO_INIT}>
     )
-elseif(ANDROID)
-    # Android
-    target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC
-        android
-        log
-    )
+
+    if(ANDROID)
+        target_link_libraries(mobileglues PUBLIC android log)
+    elseif(MACOS)
+        target_link_libraries(mobileglues PUBLIC
+            "-F${CMAKE_CURRENT_SOURCE_DIR}/external"
+            "-framework libEGL"
+            "-framework libGLESv2"
+            "-framework Metal"
+            "-framework Foundation"
+            "-framework QuartzCore"
+        )
     else()
-    # Linux — EGL/GLES are loaded dynamically via dlopen
-    target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC
-        ${CMAKE_DL_LIBS}
-    )
-endif()
-
-if (PROFILING)
-    find_package(Threads)
-    include_directories(${CMAKE_SOURCE_DIR}/3rdparty/perfetto/sdk)
-    add_library(perfetto STATIC ${CMAKE_SOURCE_DIR}/3rdparty/perfetto/sdk/perfetto.cc)
-    target_link_libraries(${CMAKE_PROJECT_NAME} perfetto ${CMAKE_THREAD_LIBS_INIT})
-    target_compile_definitions(${CMAKE_PROJECT_NAME} PUBLIC PROFILING=1)
+        target_link_libraries(mobileglues PUBLIC ${CMAKE_DL_LIBS})
+    endif()
 endif()
