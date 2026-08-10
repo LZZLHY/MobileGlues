@@ -51,6 +51,11 @@ endif()
 if(NOT MSVC)
     foreach(MOBILEGLUES_SHADER_TARGET IN ITEMS
             glslang
+            glslang-default-resource-limits
+            MachineIndependent
+            GenericCodeGen
+            OSDependent
+            SPIRV
             spirv-cross-core
             spirv-cross-glsl
             spirv-cross-c)
