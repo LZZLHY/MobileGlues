@@ -26,6 +26,33 @@
 
 #define DEBUG 0
 
+// Cache-key component describing the *behaviour* of this translator, kept
+// separate from the MobileGlues release version.
+//
+// The key built in GLSLtoGLSLES() already carries MAJOR.MINOR.REVISION, and that
+// is not sufficient: changing what this file emits does not require a version
+// bump, and during development it never gets one. The failure mode is not a
+// stale-looking log line. It is a shader that silently keeps the translation it
+// was given before the change, so the new code appears to do nothing at all.
+//
+// That is precisely what happened when the fragment-output flattening below was
+// restored. AMCL's preset sets maxGlslCacheSize to 32 MB, so the on-disk cache
+// still held entries written before the pass existed; nearly every shader was
+// served a translation without it, only the few that missed the cache showed the
+// new output, and the driver rejected the cached ones with the very error the
+// pass exists to prevent.
+//
+// ⇒ Bump this whenever a change alters the ESSL this file produces. Entries
+// persisted under an older value then stop matching and are evicted by the
+// cache's normal LRU, so no user-visible "clear your cache" step is required --
+// which matters because an installed application's cache directory outlives its
+// upgrade, and asking users to clear it is not a fix.
+//
+// Cost, stated plainly: the first launch after a bump re-translates every shader
+// because the whole persisted cache misses. That is one slower startup, and it
+// is the price of never serving a translation the current code would not produce.
+#define GLSL_TRANSLATOR_REVISION 1
+
 static TBuiltInResource InitResources() {
     TBuiltInResource Resources{};
 
@@ -637,7 +664,7 @@ std::string GLSLtoGLSLES(const char* glsl_code, GLenum glsl_type, uint essl_vers
                          int& return_code) {
     std::string sha256_string(glsl_code);
     sha256_string += "\n//" + std::to_string(MAJOR) + "." + std::to_string(MINOR) + "." + std::to_string(REVISION) +
-                     "|" + std::to_string(essl_version);
+                     "|" + std::to_string(essl_version) + "|t" + std::to_string(GLSL_TRANSLATOR_REVISION);
     const char* cachedESSL = Cache::get_instance().get(sha256_string.c_str());
     if (cachedESSL) {
         LOG_D("GLSL Hit Cache:\n%s\n-->\n%s", glsl_code, cachedESSL)
