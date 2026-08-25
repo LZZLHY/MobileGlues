@@ -18,7 +18,9 @@
 #include <regex>
 #include <strstream>
 #include <algorithm>
+#include <cctype>
 #include <sstream>
+#include <vector>
 #include "cache.h"
 #include "../../version.h"
 
@@ -345,6 +347,291 @@ std::string processOutColorLocations(const std::string& glslCode) {
     const std::string replacement = "\nlayout(location=$2) $1$2;";
     return std::regex_replace(glslCode, pattern, replacement);
 }
+
+// ---------------------------------------------------------------------------
+// Fragment outputs declared as arrays and indexed by a non-constant expression
+// ---------------------------------------------------------------------------
+// GLSL ES forbids this outright -- "Arrays of fragment outputs may only be
+// indexed by a constant integral expression" (ESSL 3.00 / 3.20 section 4.3.6)
+// -- while desktop GLSL permits it. A shader can therefore leave SPIRV-Cross as
+// perfectly valid desktop GLSL and still be rejected by the GLES driver's front
+// end. On Maleoon that reads:
+//
+//   S0015: Outputs declared as arrays may only be indexed by a constant
+//          integral expression.
+//
+// Minecraft 26.3 trips this on nearly every fragment shader, because its new
+// order-independent-transparency include writes the transmittance coefficients
+// through a loop (assets/minecraft/shaders/include/oit_add_transmittance.glsl):
+//
+//   layout(location = 0) out vec4 coeff[COEFF_ATTACHMENT_COUNT];
+//   for (int a = 0; a < COEFF_ATTACHMENT_COUNT; a++)
+//       for (int i = 0; i < 4; i++)
+//           coeff[a][i] = coefficients[a * 4 + i];
+//
+// Neither stage of this translator can absorb it: the loop survives the SPIR-V
+// round trip (there is no SPIRV-Tools in this tree to unroll it), and
+// SPIRV-Cross has no option for flattening plain I/O arrays --
+// FORCE_FLATTENED_IO_BLOCKS only covers interface blocks.
+//
+// So rewrite the declaration rather than the code that uses it:
+//
+//   layout(location = L) out T name[N];        // illegal to index dynamically
+//     ->  layout(location = L+k) out T name__mg_out_k;   // k = 0 .. N-1
+//         T name[N];                           // ordinary global: legal
+//         void main() { mg__orig_main(); name__mg_out_k = name[k]; ... }
+//
+// Every existing read and write of name[...] stays exactly as emitted, because
+// indexing a non-output array dynamically is legal. The values reach the real
+// outputs from a wrapper that runs after the original entry point returns.
+//
+// Why a wrapper instead of appending the copies to the end of main(): the
+// original main() may `return` early, and a `discard` must skip the copy
+// entirely. Wrapping gets both right without analysing control flow.
+//
+// This is a conformance fix in the GLSL-to-ESSL translator, not driver policy:
+// the restriction lives in the ES specification and applies to every ES target.
+// It is therefore deliberately not guarded by MG_PLATFORM_OHOS, and is an
+// upstream candidate.
+//
+// ⚠️ Observability: LOG_W and LOG_E compile to nothing unless DEBUG or
+// GLOBAL_DEBUG is set (gl/log.h), so every event a shipping build must be able
+// to prove or refute uses LOG_I / LOG_W_FORCE instead. The literals below are
+// also the artefact-level evidence that this pass is present in a built .so:
+// the functions have internal linkage and may be inlined away, so a symbol-name
+// probe is not a reliable check -- a string scan of the .so is.
+namespace {
+
+// Three states, deliberately not a bool. `Unparseable` has to stay distinct
+// from `Dynamic` because the correct response differs: a genuinely dynamic
+// index is what this pass exists to rewrite, whereas an index this pass cannot
+// read means the translation unit is not in the shape assumed here -- and
+// restructuring a shader on the strength of a failed parse is the fail-open
+// behaviour that would turn one unreadable declaration into a broken shader.
+enum class IndexExpressionKind {
+    Literal,
+    Dynamic,
+    Unparseable,
+};
+
+IndexExpressionKind classifyIndexExpression(const std::string& code, size_t open_bracket) {
+    const size_t close = code.find(']', open_bracket);
+    if (close == std::string::npos) return IndexExpressionKind::Unparseable;
+    bool digit_seen = false;
+    for (size_t i = open_bracket + 1; i < close; ++i) {
+        const auto c = static_cast<unsigned char>(code[i]);
+        if (std::isdigit(c)) {
+            digit_seen = true;
+        } else if (!std::isspace(c)) {
+            return IndexExpressionKind::Dynamic;
+        }
+    }
+    // "[]" and "[ ]" carry no index at all: unreadable rather than literal zero.
+    return digit_seen ? IndexExpressionKind::Literal : IndexExpressionKind::Unparseable;
+}
+
+struct DynamicUseScan {
+    bool dynamic = false;
+    bool unparseable = false;
+};
+
+// Is `name` indexed by anything other than a literal after its declaration?
+// Whole-identifier matching only, so `coeffScale[i]` never counts as a use of
+// `coeff`, and `mg_coeff[i]` does not either.
+DynamicUseScan scanForDynamicUse(const std::string& code, const std::string& name, size_t from) {
+    DynamicUseScan scan;
+    size_t pos = from;
+    while ((pos = code.find(name, pos)) != std::string::npos) {
+        const size_t after = pos + name.length();
+        const bool left_is_boundary =
+            (pos == 0) || !(std::isalnum(static_cast<unsigned char>(code[pos - 1])) || code[pos - 1] == '_');
+        size_t cursor = after;
+        while (cursor < code.length() && std::isspace(static_cast<unsigned char>(code[cursor]))) ++cursor;
+        if (left_is_boundary && cursor < code.length() && code[cursor] == '[') {
+            switch (classifyIndexExpression(code, cursor)) {
+            case IndexExpressionKind::Dynamic:
+                scan.dynamic = true;
+                break;
+            case IndexExpressionKind::Unparseable:
+                scan.unparseable = true;
+                break;
+            case IndexExpressionKind::Literal:
+                break;
+            }
+        }
+        pos = after;
+    }
+    return scan;
+}
+
+struct ArrayOutputDecl {
+    size_t pos = 0;
+    size_t length = 0;
+    int location = 0;
+    int count = 0;
+    std::string qualifiers;
+    std::string precision;
+    std::string type;
+    std::string name;
+};
+
+// Upper bound on the outputs a single declaration may expand into. It mirrors
+// TBuiltInResource::maxDrawBuffers set above; a larger array cannot be a legal
+// fragment output set on any target this translator emits for, so such a
+// declaration is treated as one this pass does not understand rather than
+// silently emitting 33+ outputs.
+constexpr int kMaxFragmentOutputArraySize = 32;
+
+const char* const kOriginalEntryPoint = "mg__orig_main";
+
+// Interpolation and auxiliary storage qualifiers are captured so they can be
+// carried onto every scalar output the rewrite emits. Dropping `flat` would
+// silently change interpolation, and for integer outputs `flat` is mandatory --
+// losing it turns a legal shader into an illegal one.
+std::vector<ArrayOutputDecl> collectRewritableArrayOutputs(const std::string& essl) {
+    static const std::regex decl_pattern(
+        R"(layout\s*\(\s*location\s*=\s*(\d+)\s*\)\s*)"
+        R"(((?:(?:flat|smooth|noperspective|centroid|sample)\s+)*))"
+        R"(out\s+((?:highp|mediump|lowp)\s+)?(\w+)\s+(\w+)\s*\[\s*(\d+)\s*\]\s*;)");
+
+    std::vector<ArrayOutputDecl> decls;
+    const auto end = std::sregex_iterator();
+    for (auto it = std::sregex_iterator(essl.begin(), essl.end(), decl_pattern); it != end; ++it) {
+        const std::smatch& m = *it;
+        ArrayOutputDecl decl;
+        decl.pos = static_cast<size_t>(m.position(0));
+        decl.length = static_cast<size_t>(m.length(0));
+        decl.location = std::atoi(m[1].str().c_str());
+        decl.qualifiers = m[2].str();
+        decl.precision = m[3].matched ? m[3].str() : "";
+        decl.type = m[4].str();
+        decl.name = m[5].str();
+        decl.count = std::atoi(m[6].str().c_str());
+        trim(decl.qualifiers);
+        trim(decl.precision);
+
+        if (decl.count <= 0 || decl.count > kMaxFragmentOutputArraySize) {
+            LOG_W_FORCE("[Shader] Not flattening fragment output array %s[%d]: size outside 1..%d",
+                        decl.name.c_str(), decl.count, kMaxFragmentOutputArraySize)
+            continue;
+        }
+        const DynamicUseScan scan = scanForDynamicUse(essl, decl.name, decl.pos + decl.length);
+        if (scan.unparseable) {
+            LOG_W_FORCE("[Shader] Not flattening fragment output array %s[%d]: an index expression could not be read",
+                        decl.name.c_str(), decl.count)
+            continue;
+        }
+        // Already conforming shaders are passed through byte for byte.
+        if (!scan.dynamic) continue;
+        decls.push_back(std::move(decl));
+    }
+    return decls;
+}
+
+// Report array-output declarations that are dynamically indexed but whose shape
+// the pattern above does not cover -- an unfamiliar qualifier, a non-literal
+// array size, more than one dimension. Without this the driver would reject
+// such a shader with nothing pointing back to this pass, which is precisely how
+// the original defect stayed unexplained for as long as it did.
+void warnAboutUnhandledArrayOutputs(const std::string& essl, const std::vector<ArrayOutputDecl>& handled) {
+    static const std::regex loose_pattern(R"(\bout\b[^;{}]{0,200}?\b(\w+)\s*\[\s*(\w+)\s*\]\s*;)");
+
+    const auto end = std::sregex_iterator();
+    for (auto it = std::sregex_iterator(essl.begin(), essl.end(), loose_pattern); it != end; ++it) {
+        const std::smatch& m = *it;
+        const auto pos = static_cast<size_t>(m.position(0));
+        const auto length = static_cast<size_t>(m.length(0));
+        const bool covered = std::any_of(handled.begin(), handled.end(), [&](const ArrayOutputDecl& decl) {
+            return (decl.pos < pos + length) && (pos < decl.pos + decl.length);
+        });
+        if (covered) continue;
+        const std::string name = m[1].str();
+        if (!scanForDynamicUse(essl, name, pos + length).dynamic) continue;
+        LOG_W_FORCE("[Shader] Fragment output array %s is indexed dynamically but its declaration is not in a shape "
+                    "this translator can rewrite; the driver will reject it (ESSL 4.3.6)",
+                    name.c_str())
+    }
+}
+
+std::string flattenDynamicFragmentOutputArrays(const std::string& essl, GLenum shaderType, int& rewritten) {
+    rewritten = 0;
+    if (shaderType != GL_FRAGMENT_SHADER) return essl;
+    if (essl.find("out") == std::string::npos) return essl;
+
+    const std::vector<ArrayOutputDecl> decls = collectRewritableArrayOutputs(essl);
+    warnAboutUnhandledArrayOutputs(essl, decls);
+    if (decls.empty()) return essl;
+
+    // The wrapper needs a name of its own. Bail out rather than shadow an
+    // existing definition, however unlikely a collision is in generated code.
+    if (essl.find(kOriginalEntryPoint) != std::string::npos) {
+        LOG_W_FORCE("[Shader] Not flattening fragment output arrays: '%s' already exists in the translated shader",
+                    kOriginalEntryPoint)
+        return essl;
+    }
+
+    std::string result;
+    result.reserve(essl.length() + decls.size() * 128);
+    std::string copy_back;
+    size_t cursor = 0;
+    for (const ArrayOutputDecl& decl : decls) {
+        result.append(essl, cursor, decl.pos - cursor);
+
+        const std::string qualifiers = decl.qualifiers.empty() ? "" : decl.qualifiers + " ";
+        const std::string precision = decl.precision.empty() ? "" : decl.precision + " ";
+        for (int k = 0; k < decl.count; ++k) {
+            const std::string element = decl.name + "__mg_out_" + std::to_string(k);
+            result += "layout(location = " + std::to_string(decl.location + k) + ") " + qualifiers + "out " +
+                      precision + decl.type + " " + element + ";\n";
+            copy_back += "    " + element + " = " + decl.name + "[" + std::to_string(k) + "];\n";
+        }
+        // The name the shader body already uses now denotes an ordinary global
+        // array, which may be indexed with anything.
+        result += precision + decl.type + " " + decl.name + "[" + std::to_string(decl.count) + "];";
+
+        cursor = decl.pos + decl.length;
+    }
+    result.append(essl, cursor, std::string::npos);
+
+    // Move the original entry point aside and copy the staging arrays out after
+    // it returns. If the entry point is not in the expected shape, abandon the
+    // whole rewrite: rewritten declarations with no copy-back emitted would be
+    // worse than not touching the shader at all.
+    static const std::regex main_pattern(R"(\bvoid\s+main\s*\(\s*\))");
+    std::smatch main_match;
+    if (!std::regex_search(result, main_match, main_pattern)) {
+        LOG_W_FORCE("[Shader] Cannot flatten dynamically indexed fragment outputs: no 'void main()' found; leaving "
+                    "the shader untouched")
+        return essl;
+    }
+    // Read both out of the match before mutating `result`: the match object
+    // holds iterators into the very string that replace() is about to move.
+    const auto main_pos = static_cast<size_t>(main_match.position(0));
+    const auto main_length = static_cast<size_t>(main_match.length(0));
+    result.replace(main_pos, main_length, std::string("void ") + kOriginalEntryPoint + "()");
+    result += "\nvoid main()\n{\n    ";
+    result += kOriginalEntryPoint;
+    result += "();\n";
+    result += copy_back;
+    result += "}\n";
+
+    // Logged only once the rewrite is known to have been completed. Reporting a
+    // flattened declaration and then bailing out above would leave a log that
+    // contradicts the shader that was actually handed to the driver.
+    for (const ArrayOutputDecl& decl : decls) {
+        // Named locals, not temporaries: LOG_I expands to more than one
+        // statement, so a `(s + " ").c_str()` argument would already be dangling
+        // by the time the second one runs.
+        const std::string qualifiers = decl.qualifiers.empty() ? std::string() : decl.qualifiers + " ";
+        const std::string precision = decl.precision.empty() ? std::string() : decl.precision + " ";
+        LOG_I("[Shader] Flattened dynamically indexed fragment output array: %s%s%s %s[%d] @location=%d",
+              qualifiers.c_str(), precision.c_str(), decl.type.c_str(), decl.name.c_str(), decl.count, decl.location)
+    }
+    rewritten = static_cast<int>(decls.size());
+    return result;
+}
+
+}  // namespace
 
 std::string GLSLtoGLSLES(const char* glsl_code, GLenum glsl_type, uint essl_version, uint glsl_version,
                          int& return_code) {
@@ -868,6 +1155,17 @@ std::string GLSLtoGLSLES_2(const char* glsl_code, GLenum glsl_type, uint essl_ve
         essl = removeLayoutBinding(essl);
     }
     essl = processOutColorLocations(essl);
+    // Must run before forceSupporterOutput(): that pass inserts precision
+    // statements relative to the shader header, and the rewrite below adds
+    // output declarations those statements have to cover.
+    {
+        int flattened_outputs = 0;
+        essl = flattenDynamicFragmentOutputArrays(essl, glsl_type, flattened_outputs);
+        if (flattened_outputs > 0) {
+            LOG_I("[Shader] Flattened %d dynamically indexed fragment output array declaration(s) for ESSL",
+                  flattened_outputs)
+        }
+    }
     essl = forceSupporterOutput(essl);
 
     LOG_D("Originally GLSL to GLSL ES Complete: \n%s", essl.c_str())
