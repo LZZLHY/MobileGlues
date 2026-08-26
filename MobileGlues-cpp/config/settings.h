@@ -97,6 +97,28 @@ enum class HideMGEnvLevel : int {
     MaxValue
 };
 
+// Upload scheduling is deliberately a three-state policy. Observe measures the
+// exact conservative merge opportunity without changing GL behaviour;
+// OrderedCoalesce copies eligible payloads and drains them before the next
+// observable GL/EGL command. The effective mode can still fail closed at runtime
+// when context or backend requirements are not satisfied.
+enum class BufferUploadMode : int {
+    Disabled = 0,
+    Observe = 1,
+    OrderedCoalesce = 2,
+    MaxValue
+};
+
+enum class BufferUploadModeSource : int {
+    Default = 0,
+    Config = 1,
+};
+
+enum class BufferCoherentAsFlushSource : int {
+    Default = 0,
+    Config = 1,
+};
+
 struct Version {
     int Major{0};
     int Minor{0};
@@ -200,6 +222,9 @@ struct global_settings_t {
     bool ext_timer_query;
     bool ext_direct_state_access;
     bool buffer_coherent_as_flush;
+    BufferCoherentAsFlushSource buffer_coherent_as_flush_source;
+    BufferUploadMode buffer_upload_mode;
+    BufferUploadModeSource buffer_upload_mode_source;
     size_t max_glsl_cache_size;
     md_backend_t multidraw_backend[MD_ENTRY_COUNT];
     // Per entry point: the user's preference order over the backends that are a

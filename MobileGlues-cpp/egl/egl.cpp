@@ -413,17 +413,195 @@ namespace {
         return fn;
     }
 
+    void finishFrameStats() {
+#if AMCL_MG_FRAME_STATS
+        mg::frame_stats::Report report{};
+        mg::frame_stats::FrameTrace trace{};
+        const bool report_ready = mg::frame_stats::presentEnd(report, &trace);
+
+        if (trace.valid) {
+            const auto& c = trace.counters;
+            const auto& sub = mg::frame_stats::category(trace, mg::frame_stats::Category::BufferSubData);
+            const auto& copy = mg::frame_stats::category(trace, mg::frame_stats::Category::BufferCopy);
+            const auto& map = mg::frame_stats::category(trace, mg::frame_stats::Category::BufferMap);
+            const auto& flush = mg::frame_stats::category(trace, mg::frame_stats::Category::BufferFlush);
+            const auto& unmap = mg::frame_stats::category(trace, mg::frame_stats::Category::BufferUnmap);
+            const auto& orphan = mg::frame_stats::category(trace, mg::frame_stats::Category::StagingOrphan);
+            const auto& stage = mg::frame_stats::category(trace, mg::frame_stats::Category::StagingUpload);
+            const auto& terrain_copy = mg::frame_stats::category(trace, mg::frame_stats::Category::TerrainCopy);
+            const auto& fbo = mg::frame_stats::category(trace, mg::frame_stats::Category::FramebufferBind);
+            const auto& draw = mg::frame_stats::category(trace, mg::frame_stats::Category::Draw);
+            const auto& dispatch = mg::frame_stats::category(trace, mg::frame_stats::Category::Dispatch);
+            const auto& barrier = mg::frame_stats::category(trace, mg::frame_stats::Category::MemoryBarrier);
+            const auto& texture = mg::frame_stats::category(trace, mg::frame_stats::Category::TextureUpload);
+            const auto& fence = mg::frame_stats::category(trace, mg::frame_stats::Category::Fence);
+            const auto& client_wait = mg::frame_stats::category(trace, mg::frame_stats::Category::ClientWait);
+            const auto& server_wait = mg::frame_stats::category(trace, mg::frame_stats::Category::ServerWait);
+            const auto& finish = mg::frame_stats::category(trace, mg::frame_stats::Category::Finish);
+
+            LOG_I("[MG-FRAME-TRACE] schema=3 seq=%llu frame_ms=%.3f events=0x%x causal=%d "
+                  "observed_calls=%llu observed_ms=%.3f outside_ms=%.3f outside_gap_max_ms=%.3f "
+                  "present_ms=%.3f present_max_ms=%.3f slowest=%s slowest_ms=%.3f",
+                  static_cast<unsigned long long>(trace.sequence), static_cast<double>(trace.frame_ns) / 1.0e6,
+                  c.event_mask, c.causal_capture ? 1 : 0, static_cast<unsigned long long>(c.gl.calls),
+                  static_cast<double>(c.gl.total_ns) / 1.0e6, static_cast<double>(c.outside_gl_ns) / 1.0e6,
+                  static_cast<double>(c.outside_gl_max_ns) / 1.0e6,
+                  static_cast<double>(c.present.total_ns) / 1.0e6,
+                  static_cast<double>(c.present.max_ns) / 1.0e6,
+                  c.slowest.name ? c.slowest.name : "none", static_cast<double>(c.slowest.duration_ns) / 1.0e6)
+            LOG_I("[MG-FRAME-TRACE-BUFFER] schema=3 seq=%llu terrain_calls=%llu terrain_staged=%llu terrain_mib=%.3f "
+                  "subdata_calls=%llu subdata_ms=%.3f subdata_max_ms=%.3f copy_calls=%llu copy_ms=%.3f "
+                  "map_calls=%llu map_mib=%.3f map_ms=%.3f flush_calls=%llu flush_mib=%.3f flush_ms=%.3f "
+                  "flush_max_ms=%.3f flush_suppressed=%llu unmap_calls=%llu unmap_ms=%.3f "
+                  "orphan_ms=%.3f orphan_max_ms=%.3f staging_ms=%.3f staging_max_ms=%.3f "
+                  "terrain_copy_ms=%.3f terrain_copy_max_ms=%.3f",
+                  static_cast<unsigned long long>(trace.sequence), static_cast<unsigned long long>(c.terrain_calls),
+                  static_cast<unsigned long long>(c.terrain_staged_calls), static_cast<double>(c.terrain_bytes) / 1048576.0,
+                  static_cast<unsigned long long>(sub.calls), static_cast<double>(sub.total_ns) / 1.0e6,
+                  static_cast<double>(sub.max_ns) / 1.0e6, static_cast<unsigned long long>(copy.calls),
+                  static_cast<double>(copy.total_ns) / 1.0e6, static_cast<unsigned long long>(map.calls),
+                  static_cast<double>(c.map_bytes) / 1048576.0, static_cast<double>(map.total_ns) / 1.0e6,
+                  static_cast<unsigned long long>(flush.calls), static_cast<double>(c.flush_bytes) / 1048576.0,
+                  static_cast<double>(flush.total_ns) / 1.0e6, static_cast<double>(flush.max_ns) / 1.0e6,
+                  static_cast<unsigned long long>(c.suppressed_flush_calls),
+                  static_cast<unsigned long long>(unmap.calls), static_cast<double>(unmap.total_ns) / 1.0e6,
+                  static_cast<double>(orphan.total_ns) / 1.0e6, static_cast<double>(orphan.max_ns) / 1.0e6,
+                  static_cast<double>(stage.total_ns) / 1.0e6, static_cast<double>(stage.max_ns) / 1.0e6,
+                  static_cast<double>(terrain_copy.total_ns) / 1.0e6,
+                  static_cast<double>(terrain_copy.max_ns) / 1.0e6)
+            LOG_I("[MG-FRAME-TRACE-PIPE] schema=3 seq=%llu fbo_calls=%llu fbo_ms=%.3f fbo_max_ms=%.3f "
+                  "draw_calls=%llu draw_ms=%.3f draw_max_ms=%.3f dispatch_calls=%llu dispatch_ms=%.3f "
+                  "barrier_calls=%llu barrier_ms=%.3f texture_calls=%llu texture_ms=%.3f "
+                  "fence_calls=%llu fence_ms=%.3f client_wait_calls=%llu client_wait_ms=%.3f "
+                  "server_wait_calls=%llu server_wait_ms=%.3f finish_calls=%llu finish_ms=%.3f",
+                  static_cast<unsigned long long>(trace.sequence), static_cast<unsigned long long>(fbo.calls),
+                  static_cast<double>(fbo.total_ns) / 1.0e6, static_cast<double>(fbo.max_ns) / 1.0e6,
+                  static_cast<unsigned long long>(draw.calls), static_cast<double>(draw.total_ns) / 1.0e6,
+                  static_cast<double>(draw.max_ns) / 1.0e6, static_cast<unsigned long long>(dispatch.calls),
+                  static_cast<double>(dispatch.total_ns) / 1.0e6, static_cast<unsigned long long>(barrier.calls),
+                  static_cast<double>(barrier.total_ns) / 1.0e6, static_cast<unsigned long long>(texture.calls),
+                  static_cast<double>(texture.total_ns) / 1.0e6, static_cast<unsigned long long>(fence.calls),
+                  static_cast<double>(fence.total_ns) / 1.0e6, static_cast<unsigned long long>(client_wait.calls),
+                  static_cast<double>(client_wait.total_ns) / 1.0e6,
+                  static_cast<unsigned long long>(server_wait.calls),
+                  static_cast<double>(server_wait.total_ns) / 1.0e6,
+                  static_cast<unsigned long long>(finish.calls), static_cast<double>(finish.total_ns) / 1.0e6)
+        }
+
+        if (!report_ready) return;
+
+        const auto& sub = mg::frame_stats::category(report, mg::frame_stats::Category::BufferSubData);
+        const auto& copy = mg::frame_stats::category(report, mg::frame_stats::Category::BufferCopy);
+        const auto& map = mg::frame_stats::category(report, mg::frame_stats::Category::BufferMap);
+        const auto& flush = mg::frame_stats::category(report, mg::frame_stats::Category::BufferFlush);
+        const auto& unmap = mg::frame_stats::category(report, mg::frame_stats::Category::BufferUnmap);
+        const auto& orphan = mg::frame_stats::category(report, mg::frame_stats::Category::StagingOrphan);
+        const auto& stage = mg::frame_stats::category(report, mg::frame_stats::Category::StagingUpload);
+        const auto& terrain_copy = mg::frame_stats::category(report, mg::frame_stats::Category::TerrainCopy);
+        const auto& fbo = mg::frame_stats::category(report, mg::frame_stats::Category::FramebufferBind);
+        const auto& draw = mg::frame_stats::category(report, mg::frame_stats::Category::Draw);
+        const auto& dispatch = mg::frame_stats::category(report, mg::frame_stats::Category::Dispatch);
+        const auto& barrier = mg::frame_stats::category(report, mg::frame_stats::Category::MemoryBarrier);
+        const auto& texture = mg::frame_stats::category(report, mg::frame_stats::Category::TextureUpload);
+        const auto& fence = mg::frame_stats::category(report, mg::frame_stats::Category::Fence);
+        const auto& client_wait = mg::frame_stats::category(report, mg::frame_stats::Category::ClientWait);
+        const auto& server_wait = mg::frame_stats::category(report, mg::frame_stats::Category::ServerWait);
+        const auto& finish = mg::frame_stats::category(report, mg::frame_stats::Category::Finish);
+        const std::uint64_t covered_ns = report.counters.gl.total_ns + report.counters.outside_gl_ns +
+                                         report.counters.present.total_ns;
+        const std::uint64_t residual_ns = report.frame_total_ns > covered_ns ? report.frame_total_ns - covered_ns : 0;
+        const double window_s = static_cast<double>(report.window_ns) / 1.0e9;
+        const double fps = window_s > 0.0 ? static_cast<double>(report.frames) / window_s : 0.0;
+        const double frame_avg_ms = report.frames > 0
+                                        ? static_cast<double>(report.frame_total_ns) / report.frames / 1.0e6
+                                        : 0.0;
+
+#if AMCL_MG_FRAME_STATS_EXHAUSTIVE
+        constexpr const char* coverage = "exhaustive";
+#else
+        constexpr const char* coverage = "causal_buffer_sync";
+#endif
+        LOG_I("[MG-FRAME-STATS] schema=3 mode=observe_only coverage=%s window_ms=%.1f frames=%llu fps=%.2f "
+              "frame_avg_ms=%.3f frame_p50_le_ms=%u frame_p95_le_ms=%u frame_p99_le_ms=%u frame_max_ms=%.3f "
+              "observed_calls=%llu observed_ms=%.3f other_ms=%.3f other_gap_max_ms=%.3f present_ms=%.3f "
+              "present_max_ms=%.3f "
+              "residual_ms=%.3f events=0x%x causal=%d slowest=%s slowest_ms=%.3f",
+              coverage, static_cast<double>(report.window_ns) / 1.0e6,
+              static_cast<unsigned long long>(report.frames), fps,
+              frame_avg_ms, mg::frame_stats::percentileUpperMs(report, 50),
+              mg::frame_stats::percentileUpperMs(report, 95), mg::frame_stats::percentileUpperMs(report, 99),
+              static_cast<double>(report.frame_max_ns) / 1.0e6,
+              static_cast<unsigned long long>(report.counters.gl.calls),
+              static_cast<double>(report.counters.gl.total_ns) / 1.0e6,
+              static_cast<double>(report.counters.outside_gl_ns) / 1.0e6,
+              static_cast<double>(report.counters.outside_gl_max_ns) / 1.0e6,
+              static_cast<double>(report.counters.present.total_ns) / 1.0e6,
+              static_cast<double>(report.counters.present.max_ns) / 1.0e6,
+              static_cast<double>(residual_ns) / 1.0e6, report.counters.event_mask,
+              report.counters.causal_capture ? 1 : 0,
+              report.counters.slowest.name ? report.counters.slowest.name : "none",
+              static_cast<double>(report.counters.slowest.duration_ns) / 1.0e6)
+        LOG_I("[MG-FRAME-STATS-BUFFER] schema=3 subdata_calls=%llu input_mib=%.3f subdata_ms=%.3f subdata_max_ms=%.3f "
+              "copy_calls=%llu copy_ms=%.3f copy_max_ms=%.3f map_calls=%llu map_mib=%.3f map_ms=%.3f map_max_ms=%.3f "
+              "flush_calls=%llu flush_mib=%.3f flush_ms=%.3f flush_max_ms=%.3f flush_suppressed=%llu "
+              "unmap_calls=%llu unmap_ms=%.3f terrain_calls=%llu terrain_staged=%llu terrain_mib=%.3f "
+              "orphan_ms=%.3f orphan_max_ms=%.3f staging_ms=%.3f staging_max_ms=%.3f "
+              "terrain_copy_ms=%.3f terrain_copy_max_ms=%.3f",
+              static_cast<unsigned long long>(sub.calls), static_cast<double>(report.counters.buffer_bytes) / 1048576.0,
+              static_cast<double>(sub.total_ns) / 1.0e6, static_cast<double>(sub.max_ns) / 1.0e6,
+              static_cast<unsigned long long>(copy.calls), static_cast<double>(copy.total_ns) / 1.0e6,
+              static_cast<double>(copy.max_ns) / 1.0e6, static_cast<unsigned long long>(map.calls),
+              static_cast<double>(report.counters.map_bytes) / 1048576.0, static_cast<double>(map.total_ns) / 1.0e6,
+              static_cast<double>(map.max_ns) / 1.0e6, static_cast<unsigned long long>(flush.calls),
+              static_cast<double>(report.counters.flush_bytes) / 1048576.0,
+              static_cast<double>(flush.total_ns) / 1.0e6, static_cast<double>(flush.max_ns) / 1.0e6,
+              static_cast<unsigned long long>(report.counters.suppressed_flush_calls),
+              static_cast<unsigned long long>(unmap.calls), static_cast<double>(unmap.total_ns) / 1.0e6,
+              static_cast<unsigned long long>(report.counters.terrain_calls),
+              static_cast<unsigned long long>(report.counters.terrain_staged_calls),
+              static_cast<double>(report.counters.terrain_bytes) / 1048576.0,
+              static_cast<double>(orphan.total_ns) / 1.0e6, static_cast<double>(orphan.max_ns) / 1.0e6,
+              static_cast<double>(stage.total_ns) / 1.0e6, static_cast<double>(stage.max_ns) / 1.0e6,
+              static_cast<double>(terrain_copy.total_ns) / 1.0e6,
+              static_cast<double>(terrain_copy.max_ns) / 1.0e6)
+        LOG_I("[MG-FRAME-STATS-PIPE] schema=3 fbo_calls=%llu fbo_ms=%.3f fbo_max_ms=%.3f draw_calls=%llu "
+              "draw_ms=%.3f draw_max_ms=%.3f dispatch_calls=%llu dispatch_ms=%.3f barrier_calls=%llu barrier_ms=%.3f "
+              "texture_calls=%llu texture_ms=%.3f fence_calls=%llu fence_ms=%.3f client_wait_calls=%llu "
+              "client_wait_ms=%.3f server_wait_calls=%llu server_wait_ms=%.3f finish_calls=%llu finish_ms=%.3f",
+              static_cast<unsigned long long>(fbo.calls), static_cast<double>(fbo.total_ns) / 1.0e6,
+              static_cast<double>(fbo.max_ns) / 1.0e6, static_cast<unsigned long long>(draw.calls),
+              static_cast<double>(draw.total_ns) / 1.0e6, static_cast<double>(draw.max_ns) / 1.0e6,
+              static_cast<unsigned long long>(dispatch.calls), static_cast<double>(dispatch.total_ns) / 1.0e6,
+              static_cast<unsigned long long>(barrier.calls), static_cast<double>(barrier.total_ns) / 1.0e6,
+              static_cast<unsigned long long>(texture.calls), static_cast<double>(texture.total_ns) / 1.0e6,
+              static_cast<unsigned long long>(fence.calls), static_cast<double>(fence.total_ns) / 1.0e6,
+              static_cast<unsigned long long>(client_wait.calls), static_cast<double>(client_wait.total_ns) / 1.0e6,
+              static_cast<unsigned long long>(server_wait.calls), static_cast<double>(server_wait.total_ns) / 1.0e6,
+              static_cast<unsigned long long>(finish.calls), static_cast<double>(finish.total_ns) / 1.0e6)
+#endif
+    }
+
     // ApplyFSR upscales into the surface, the swap presents it, the resolution
     // check reacts to a surface that has changed size. The three belong together,
     // and every path that presents a frame has to go through here.
     EGLBoolean presentSurface(EGLDisplay dpy, EGLSurface surface) {
         LOAD_EGL(eglSwapBuffers)
+        // Payload bytes belong to the current GL context, not to SDL/GLFW or to
+        // the surface. Drain before FSR and before every backend present so both
+        // window paths observe the same ordered buffer state.
+#if AMCL_MG_UPLOAD_SCHEDULER_LAB
+        mg_buffer_upload_present();
+#endif
+        mg::frame_stats::presentBegin();
         if (global_settings.fsr1_setting == FSR1_Quality_Preset::Disabled) {
-            return egl_eglSwapBuffers(dpy, surface);
+            const EGLBoolean result = egl_eglSwapBuffers(dpy, surface);
+            finishFrameStats();
+            return result;
         }
         ApplyFSR();
         const EGLBoolean result = egl_eglSwapBuffers(dpy, surface);
         CheckResolutionChange(dpy, surface);
+        finishFrameStats();
         return result;
     }
 
@@ -438,7 +616,13 @@ namespace {
                                         SwapWithDamageFn backend) {
         const bool fsr_on = global_settings.fsr1_setting != FSR1_Quality_Preset::Disabled;
         if (backend != nullptr && !fsr_on) {
-            return backend(dpy, surface, rects, n_rects);
+#if AMCL_MG_UPLOAD_SCHEDULER_LAB
+            mg_buffer_upload_present();
+#endif
+            mg::frame_stats::presentBegin();
+            const EGLBoolean result = backend(dpy, surface, rects, n_rects);
+            finishFrameStats();
+            return result;
         }
         // Once, not once a frame: a damage swap runs every frame the host presents
         // one, and this would otherwise be the loudest line in the whole trace for
@@ -554,6 +738,7 @@ extern "C"
     EGL_API EGLBoolean eglTerminate(EGLDisplay dpy) {
         LOG_D("eglTerminate, dpy: %p", dpy);
         LOAD_EGL(eglTerminate)
+        mg_buffer_upload_context_release();
         // Only the last holder actually terminates. EGL itself does not
         // reference-count this, so an early eglTerminate from one part of the
         // process would tear down resources belonging to another.
@@ -657,6 +842,7 @@ extern "C"
     EGL_API EGLBoolean eglBindAPI(EGLenum api) {
         LOG_D("eglBindAPI, api: %d", api);
         LOAD_EGL(eglBindAPI)
+        mg_buffer_upload_context_release();
         const EGLenum backend_api = api == EGL_OPENGL_API ? EGL_OPENGL_ES_API : api;
         const EGLBoolean result = egl_eglBindAPI(backend_api);
         ETRACE("eglBindAPI(%s) -> backend %s: %s", mg_egl_api_name(api), mg_egl_api_name(backend_api),
@@ -673,12 +859,14 @@ extern "C"
     EGL_API EGLBoolean eglWaitClient(void) {
         LOG_D("eglWaitClient");
         LOAD_EGL(eglWaitClient)
+        mg_buffer_upload_context_release();
         return egl_eglWaitClient();
     }
 
     EGL_API EGLBoolean eglReleaseThread(void) {
         LOG_D("eglReleaseThread");
         LOAD_EGL(eglReleaseThread)
+        mg_buffer_upload_context_release();
         const EGLBoolean result = egl_eglReleaseThread();
         ETRACE("eglReleaseThread -> %s", result == EGL_TRUE ? "ok" : "FAILED");
         if (result == EGL_TRUE) {
@@ -733,6 +921,7 @@ extern "C"
               "attrib_list: %p",
               dpy, config, share_context, attrib_list);
         LOAD_EGL(eglCreateContext)
+        mg_buffer_upload_context_release();
         if (frontend_api != EGL_OPENGL_API) {
             // An ES context still gets a record. Without one g_current_ctx stays
             // null for the whole process on any host that never calls
@@ -785,6 +974,7 @@ extern "C"
     EGL_API EGLBoolean eglDestroyContext(EGLDisplay dpy, EGLContext ctx) {
         LOG_D("eglDestroyContext, dpy: %p, ctx: %p", dpy, ctx);
         LOAD_EGL(eglDestroyContext)
+        mg_buffer_upload_context_release();
         std::lock_guard<std::mutex> lifecycle(context_lifecycle_mutex);
         MGContext* before = mg_context_find(ctx);
         const EGLBoolean result = egl_eglDestroyContext(dpy, ctx);
@@ -802,6 +992,10 @@ extern "C"
     EGL_API EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx) {
         LOG_D("eglMakeCurrent, dpy: %p, draw: %p, read: %p, ctx: %p", dpy, draw, read, ctx);
         LOAD_EGL(eglMakeCurrent)
+        // The replay must run while the old context is still current. Draining
+        // after a successful backend switch would submit old object names into
+        // the new context/share group.
+        mg_buffer_upload_context_release();
         MGContext* before = mg_context_find(ctx);
         const EGLBoolean result = egl_eglMakeCurrent(dpy, draw, read, ctx);
         ETRACE("eglMakeCurrent(dpy=%p, draw=%p, read=%p, ctx=%p, MGContext=%llu) -> %s", dpy, draw, read, ctx,
@@ -858,12 +1052,14 @@ extern "C"
     EGL_API EGLBoolean eglWaitGL(void) {
         LOG_D("eglWaitGL");
         LOAD_EGL(eglWaitGL)
+        mg_buffer_upload_context_release();
         return egl_eglWaitGL();
     }
 
     EGL_API EGLBoolean eglWaitNative(EGLint engine) {
         LOG_D("eglWaitNative, engine: %d", engine);
         LOAD_EGL(eglWaitNative)
+        mg_buffer_upload_context_release();
         return egl_eglWaitNative(engine);
     }
 
@@ -965,6 +1161,7 @@ extern "C"
     EGL_API EGLint eglClientWaitSync(EGLDisplay dpy, EGLSync sync, EGLint flags, EGLTime timeout) {
         LOG_D("eglClientWaitSync, dpy: %p, sync: %p", dpy, sync);
         LOAD_EGL_OR(eglClientWaitSync, setFrontendError(EGL_BAD_PARAMETER), EGL_FALSE)
+        mg_buffer_upload_context_release();
         return egl_eglClientWaitSync(dpy, sync, flags, timeout);
     }
 
@@ -977,6 +1174,7 @@ extern "C"
     EGL_API EGLBoolean eglWaitSync(EGLDisplay dpy, EGLSync sync, EGLint flags) {
         LOG_D("eglWaitSync, dpy: %p, sync: %p", dpy, sync);
         LOAD_EGL_OR(eglWaitSync, setFrontendError(EGL_BAD_PARAMETER), EGL_FALSE)
+        mg_buffer_upload_context_release();
         return egl_eglWaitSync(dpy, sync, flags);
     }
 

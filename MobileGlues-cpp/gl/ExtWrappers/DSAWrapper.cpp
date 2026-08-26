@@ -241,18 +241,39 @@ void glNamedBufferData(GLuint buffer, GLsizeiptr size, const void* data, GLenum 
 
 void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const void* data) {
     LOG()
+    MG_FRAME_STATS_SELECTED_GL_SCOPE()
+    if (size > 0) mg::frame_stats::recordBufferBytes(static_cast<std::uint64_t>(size));
     LOG_D("[DSA] glNamedBufferSubData, buffer: %u, offset: %lld, size: %lld, data: %p", buffer, offset, size, data);
 
     if (buffer == 0 || size <= 0 || offset < 0) {
         LOG_W("[DSA] Invalid parameters for glNamedBufferSubData");
         // return;
     }
-    temporarilyBindBuffer(buffer);
-    glBufferSubData(GL_ARRAY_BUFFER, offset, size, data);
-    CHECK_GL_ERROR;
-    restoreTemporaryBufferBinding();
+    if (!mg_buffer_sub_data_named(buffer, offset, size, data)) {
+        // Retain the legacy compatibility behaviour for invalid or generated-but
+        // not yet materialized names. Valid stores use the unified core path and
+        // no longer perturb GL_ARRAY_BUFFER merely to emulate DSA.
+        temporarilyBindBuffer(buffer);
+        glBufferSubData(GL_ARRAY_BUFFER, offset, size, data);
+        CHECK_GL_ERROR;
+        restoreTemporaryBufferBinding();
+    }
 
     LOG_D("[DSA] Buffer %u sub-data set with size %lld at offset %lld", buffer, size, offset);
+}
+
+void glNamedBufferSubDataEXT(GLuint buffer, GLintptr offset, GLsizeiptr size, const void* data) {
+    LOG()
+    MG_FRAME_STATS_SELECTED_GL_SCOPE()
+    if (size > 0) mg::frame_stats::recordBufferBytes(static_cast<std::uint64_t>(size));
+    LOG_D("[DSA] glNamedBufferSubDataEXT, buffer: %u, offset: %lld, size: %lld, data: %p", buffer, offset, size,
+          data);
+    if (!mg_buffer_sub_data_named(buffer, offset, size, data)) {
+        temporarilyBindBuffer(buffer);
+        glBufferSubData(GL_ARRAY_BUFFER, offset, size, data);
+        CHECK_GL_ERROR;
+        restoreTemporaryBufferBinding();
+    }
 }
 
 void glCopyNamedBufferSubData(GLuint readBuffer, GLuint writeBuffer, GLintptr readOffset, GLintptr writeOffset,

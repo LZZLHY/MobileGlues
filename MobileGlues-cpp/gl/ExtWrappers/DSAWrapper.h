@@ -34,6 +34,7 @@ extern "C"
     GLAPI void glNamedBufferStorage(GLuint buffer, GLsizeiptr size, const void* data, GLbitfield flags);
     GLAPI void glNamedBufferData(GLuint buffer, GLsizeiptr size, const void* data, GLenum usage);
     GLAPI void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const void* data);
+    GLAPI void glNamedBufferSubDataEXT(GLuint buffer, GLintptr offset, GLsizeiptr size, const void* data);
     GLAPI void glCopyNamedBufferSubData(GLuint readBuffer, GLuint writeBuffer, GLintptr readOffset,
                                         GLintptr writeOffset, GLsizeiptr size);
     GLAPI void glClearNamedBufferData(GLuint buffer, GLenum internalformat, GLenum format, GLenum type,

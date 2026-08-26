@@ -91,6 +91,15 @@ MGContext* mg_context_find(EGLContext handle);
 // its elements when it grows: the record is what has to stay put, so a pointer
 // handed out here stays valid until the entry is erased.
 void mg_buffer_bind_context(unsigned long long ctx_id, unsigned long long group_id);
+#ifdef __cplusplus
+extern "C" {
+#endif
+void mg_buffer_register_context(unsigned long long ctx_id, unsigned long long group_id);
+void mg_buffer_upload_present(void) noexcept;
+void mg_buffer_upload_context_release(void) noexcept;
+#ifdef __cplusplus
+}
+#endif
 void mg_texture_bind_context(unsigned long long ctx_id, unsigned long long group_id);
 void mg_framebuffer_bind_context(unsigned long long ctx_id);
 void mg_fsr1_bind_context(unsigned long long ctx_id);
@@ -101,8 +110,10 @@ void mg_fsr1_bind_context(unsigned long long ctx_id);
 // away, i.e. after the last thread has stopped using it, so the entry being
 // erased is guaranteed not to be the one any thread_local pointer refers to.
 //
-// The share group is deliberately not torn down here: sibling contexts may still
-// be using it, and the group record is small. Only per-context state is dropped.
+// Share-group bookkeeping is erased when its last registered context is
+// released. That is the only point at which no context/TLS pointer can still
+// observe the group, and it prevents repeated game launches from retaining all
+// historical buffer generations and mapping contracts.
 void mg_buffer_forget_context(unsigned long long ctx_id);
 void mg_texture_forget_context(unsigned long long ctx_id);
 void mg_framebuffer_forget_context(unsigned long long ctx_id);

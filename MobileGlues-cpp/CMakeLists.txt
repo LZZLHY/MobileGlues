@@ -104,12 +104,20 @@ set(MOBILEGLUES_CORE_SOURCES
     config/cJSON.c
     config/config.cpp
     config/gpu_utils.cpp
+    platform/driver_profile.cpp
     config/settings.cpp
     config/stats.cpp
 )
 
 add_library(mobileglues_core OBJECT ${MOBILEGLUES_CORE_SOURCES})
 add_library(MobileGlues::Core ALIAS mobileglues_core)
+
+# PF-01: platform integration belongs to the core translation units. Defining
+# this only on an embedding GLFW/shared-library wrapper compiles every guarded MG
+# branch out of the OBJECT library while leaving the final link deceptively green.
+if(CMAKE_SYSTEM_NAME STREQUAL "OHOS")
+    target_compile_definitions(mobileglues_core PRIVATE MG_PLATFORM_OHOS=1)
+endif()
 
 set_target_properties(mobileglues_core PROPERTIES
     CXX_STANDARD 20

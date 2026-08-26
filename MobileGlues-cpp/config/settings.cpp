@@ -11,6 +11,7 @@
 #include "../gl/envvars.h"
 #include "gpu_utils.h"
 #include "../gl/getter.h"
+#include "../platform/driver_profile.h"
 
 #define DEBUG 0
 
@@ -32,6 +33,10 @@ void init_settings() {
     global_settings.custom_gl_version = {0, 0, 0}; // will go default
     global_settings.fsr1_setting = FSR1_Quality_Preset::Disabled;
     global_settings.hide_mg_env_level = HideMGEnvLevel::Disabled;
+    global_settings.buffer_coherent_as_flush = false;
+    global_settings.buffer_coherent_as_flush_source = BufferCoherentAsFlushSource::Default;
+    global_settings.buffer_upload_mode = BufferUploadMode::Disabled;
+    global_settings.buffer_upload_mode_source = BufferUploadModeSource::Default;
 
 #else
 
@@ -58,6 +63,18 @@ void init_settings() {
         success ? static_cast<FSR1_Quality_Preset>(config_get_int("fsr1Setting")) : FSR1_Quality_Preset::Disabled;
     HideMGEnvLevel hideMGEnvLevel =
         success ? static_cast<HideMGEnvLevel>(config_get_int("hideMGEnvLevel")) : HideMGEnvLevel::Disabled;
+    const int bufferCoherentAsFlushRaw = success ? config_get_int("bufferCoherentAsFlush") : -1;
+    const bool hasBufferCoherentAsFlushConfig =
+        bufferCoherentAsFlushRaw == 0 || bufferCoherentAsFlushRaw == 1;
+    const bool configuredBufferCoherentAsFlush = bufferCoherentAsFlushRaw == 1;
+    const int bufferUploadModeRaw = success ? config_get_int("bufferUploadMode") : -1;
+    BufferUploadMode bufferUploadMode = BufferUploadMode::Disabled;
+    BufferUploadModeSource bufferUploadModeSource = BufferUploadModeSource::Default;
+    if (bufferUploadModeRaw >= 0 &&
+        bufferUploadModeRaw < static_cast<int>(BufferUploadMode::MaxValue)) {
+        bufferUploadMode = static_cast<BufferUploadMode>(bufferUploadModeRaw);
+        bufferUploadModeSource = BufferUploadModeSource::Config;
+    }
 
     if (customGLVersionInt < 0) {
         customGLVersionInt = 0;
@@ -183,7 +200,18 @@ void init_settings() {
     global_settings.angle_config = angleConfig;
     global_settings.angle_supported = isANGLESupported;
     LOG_D("Final ANGLE setting: %d", static_cast<int>(global_settings.angle))
-    global_settings.buffer_coherent_as_flush = (global_settings.angle == AngleMode::Disabled);
+    // The key was present in launcher presets but the old loader never read it:
+    // every native provider silently forced true from the ANGLE result. Honour
+    // an explicit 0/1, while preserving that historical provider-derived value
+    // when the key is absent or malformed. buffer.cpp deliberately scopes this
+    // value to coherent substitution for genuine persistent-write contracts;
+    // exact DYNAMIC_STORAGE is invariant regardless of this setting.
+    global_settings.buffer_coherent_as_flush = hasBufferCoherentAsFlushConfig
+                                                   ? configuredBufferCoherentAsFlush
+                                                   : (global_settings.angle == AngleMode::Disabled);
+    global_settings.buffer_coherent_as_flush_source = hasBufferCoherentAsFlushConfig
+                                                          ? BufferCoherentAsFlushSource::Config
+                                                          : BufferCoherentAsFlushSource::Default;
 
     if (global_settings.angle == AngleMode::Enabled) {
         // setenv("LIBGL_GLES", "libGLESv2_angle.so", 1);
@@ -217,6 +245,8 @@ void init_settings() {
     global_settings.custom_gl_version = customGLVersion;
     global_settings.fsr1_setting = fsr1Setting;
     global_settings.hide_mg_env_level = hideMGEnvLevel;
+    global_settings.buffer_upload_mode = bufferUploadMode;
+    global_settings.buffer_upload_mode_source = bufferUploadModeSource;
 #endif
 
     LOG_V("[MobileGlues] Setting: enableAngle                 = %s",
@@ -231,8 +261,14 @@ void init_settings() {
           static_cast<int>(global_settings.max_glsl_cache_size / 1024 / 1024))
     LOG_V("[MobileGlues] Setting: angleDepthClearFixMode      = %i",
           static_cast<int>(global_settings.angle_depth_clear_fix_mode))
-    LOG_V("[MobileGlues] Setting: bufferCoherentAsFlush       = %i",
-          static_cast<int>(global_settings.buffer_coherent_as_flush))
+    LOG_V("[MobileGlues] Setting: bufferCoherentAsFlush       = %i (source=%s)",
+          static_cast<int>(global_settings.buffer_coherent_as_flush),
+          global_settings.buffer_coherent_as_flush_source == BufferCoherentAsFlushSource::Config
+              ? "config"
+              : "provider-default")
+    LOG_V("[MobileGlues] Setting: bufferUploadMode             = %i (source=%s)",
+          static_cast<int>(global_settings.buffer_upload_mode),
+          global_settings.buffer_upload_mode_source == BufferUploadModeSource::Config ? "config" : "default")
     if (global_settings.custom_gl_version.isEmpty()) {
         LOG_V("[MobileGlues] Setting: customGLVersion             = (default)");
     } else {
@@ -602,6 +638,7 @@ md_backend_t md_next_backend(md_entry_t e, md_backend_t cur) {
 }
 
 void init_settings_post() {
+    mg::platform::RefreshDriverProfile();
     const bool has_es31 = (g_gles_caps.major > 3) || (g_gles_caps.major == 3 && g_gles_caps.minor >= 1);
     const bool has_es32 = (g_gles_caps.major > 3) || (g_gles_caps.major == 3 && g_gles_caps.minor >= 2);
     const bool has_bv_ext =
@@ -713,7 +750,14 @@ std::string dump_settings_string(std::string prefix) {
        << (global_settings.angle_depth_clear_fix_mode == AngleDepthClearFixMode::Disabled ? "Disabled" : "Enabled")
        << "\n";
 
-    ss << prefix << "BufferCoherentAsFlush: " << (global_settings.buffer_coherent_as_flush ? "True" : "False") << "\n";
+    ss << prefix << "BufferCoherentAsFlush: " << (global_settings.buffer_coherent_as_flush ? "True" : "False")
+       << " (" << (global_settings.buffer_coherent_as_flush_source == BufferCoherentAsFlushSource::Config
+                         ? "config"
+                         : "provider-default")
+       << ")\n";
+    ss << prefix << "BufferUploadMode: " << static_cast<int>(global_settings.buffer_upload_mode)
+       << " (" << (global_settings.buffer_upload_mode_source == BufferUploadModeSource::Config ? "config" : "default")
+       << ")\n";
 
     ss << prefix << "CustomGLVersion: "
        << ((GLVersion.toInt(2) == DEFAULT_GL_VERSION) ? "(Default)" : std::to_string(GLVersion.toInt(2))) << "\n";

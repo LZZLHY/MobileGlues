@@ -167,6 +167,11 @@ MGContext* mg_context_create(EGLDisplay dpy, EGLContext handle, EGLContext share
         release_locked(previous);
     }
 
+    // Register at creation rather than first make-current. A never-current
+    // sibling still belongs to the share group and must make the upload
+    // scheduler fail closed; discovering it only after it becomes current is too
+    // late for records an earlier context may already have queued.
+    mg_buffer_register_context(ctx->id, ctx->share_group->id);
     g_contexts[handle] = ctx;
     return ctx.get();
 }

@@ -1507,7 +1507,8 @@ STUB_FUNCTION_HEAD(void, glMatrixLoadTransposedEXT, GLenum mode, const GLdouble*
 STUB_FUNCTION_HEAD(void, glMatrixMultTransposefEXT, GLenum mode, const GLfloat* m); STUB_FUNCTION_END_NO_RETURN(void, glMatrixMultTransposefEXT,mode,m)
 STUB_FUNCTION_HEAD(void, glMatrixMultTransposedEXT, GLenum mode, const GLdouble* m); STUB_FUNCTION_END_NO_RETURN(void, glMatrixMultTransposedEXT,mode,m)
 STUB_FUNCTION_HEAD(void, glNamedBufferDataEXT, GLuint buffer, GLsizeiptr size, const void* data, GLenum usage); STUB_FUNCTION_END_NO_RETURN(void, glNamedBufferDataEXT,buffer,size,data,usage)
-STUB_FUNCTION_HEAD(void, glNamedBufferSubDataEXT, GLuint buffer, GLintptr offset, GLsizeiptr size, const void* data); STUB_FUNCTION_END_NO_RETURN(void, glNamedBufferSubDataEXT,buffer,offset,size,data)
+// Implemented with core DSA in ExtWrappers/DSAWrapper.cpp so EXT cannot bypass
+// the same generation-safe upload path used by glNamedBufferSubData.
 // EXT_direct_state_access spells this exactly like the core DSA entry point, so
 // forward instead of stubbing: a stub would answer GL_FALSE for every unmap, and
 // before that it answered whatever was left in the return register.

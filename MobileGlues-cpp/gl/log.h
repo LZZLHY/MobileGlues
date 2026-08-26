@@ -8,6 +8,7 @@
 #ifndef MOBILEGLUES_LOG_H
 
 #include "../includes.h"
+#include "frame_stats.h"
 
 #define FORCE_SYNC_WITH_LOG_FILE 0
 
@@ -21,9 +22,21 @@ extern "C"
 #endif
 
     const char* glEnumToString(GLenum e);
+    void mg_buffer_upload_gl_entry(const char* function_name) noexcept;
 
 #ifdef __cplusplus
 }
+#endif
+
+#ifndef AMCL_MG_UPLOAD_SCHEDULER_LAB
+#define AMCL_MG_UPLOAD_SCHEDULER_LAB 0
+#endif
+
+#if AMCL_MG_UPLOAD_SCHEDULER_LAB
+#define MG_BUFFER_UPLOAD_GL_ENTRY() mg_buffer_upload_gl_entry(__FUNCTION__)
+#else
+// The rejected scheduler must impose zero GL-entry overhead in production.
+#define MG_BUFFER_UPLOAD_GL_ENTRY() ((void)0)
 #endif
 
 #ifndef __ANDROID__
@@ -45,7 +58,8 @@ int __android_log_print(int prio, const char* tag, const char* fmt, ...);
 
 #if GLOBAL_DEBUG_FORCE_OFF
 #define LOG()                                                                                                          \
-    {}
+    MG_BUFFER_UPLOAD_GL_ENTRY();                                                                                       \
+    MG_FRAME_STATS_ALL_GL_SCOPE()
 #define LOG_D(...)                                                                                                     \
     {}
 #define LOG_D_N(...)                                                                                                   \
@@ -59,10 +73,14 @@ int __android_log_print(int prio, const char* tag, const char* fmt, ...);
 #else
 #if PROFILING
 #define LOG()                                                                                                          \
+    MG_BUFFER_UPLOAD_GL_ENTRY();                                                                                       \
+    MG_FRAME_STATS_ALL_GL_SCOPE()                                                                                      \
     perfetto::StaticString _FUNC_NAME_ = __func__;                                                                     \
     TRACE_EVENT("glcalls", _FUNC_NAME_);
 #elif LOG_CALLED_FUNCS
 #define LOG()                                                                                                          \
+    MG_BUFFER_UPLOAD_GL_ENTRY();                                                                                       \
+    MG_FRAME_STATS_ALL_GL_SCOPE()                                                                                      \
     if (DEBUG || GLOBAL_DEBUG) {                                                                                       \
         __android_log_print(ANDROID_LOG_DEBUG, RENDERERNAME, "Use function: %s", __FUNCTION__);                        \
         printf("Use function: %s\n", __FUNCTION__);                                                                    \
@@ -72,6 +90,8 @@ int __android_log_print(int prio, const char* tag, const char* fmt, ...);
 void log_unique_function(const char* func_name);
 #else
 #define LOG()                                                                                                          \
+    MG_BUFFER_UPLOAD_GL_ENTRY();                                                                                       \
+    MG_FRAME_STATS_ALL_GL_SCOPE()                                                                                      \
     if (DEBUG || GLOBAL_DEBUG) {                                                                                       \
         __android_log_print(ANDROID_LOG_DEBUG, RENDERERNAME, "\nUse function: %s", __FUNCTION__);                      \
         printf("\nUse function: %s\n", __FUNCTION__);                                                                  \

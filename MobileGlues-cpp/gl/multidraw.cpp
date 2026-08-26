@@ -9,9 +9,11 @@
 #include "../config/settings.h"
 #include "buffer.h"
 #include "enable.h"
+#include "indirect_ring_core.h"
 #include "restart.h"
 #include "../egl/context.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <limits>
@@ -276,17 +278,26 @@ static unsigned long long g_owner_ctx_id = 0;
 
 enum class md_probe_state_t { Unprobed, Working, Failed };
 
-// indirect / multiindirect paths
-static bool g_indirect_cmds_inited = false;
-static GLsizei g_cmdbufsize = 0;
-static GLuint g_indirectbuffer = 0;
+// indirect / multiindirect paths. Command stores are orphaned before every
+// upload, so reuse never waits for a previous draw and does not need a fence per
+// multi-draw call. Explicit sync here amplified render-thread frame tails on
+// Maleoon without making chunk work asynchronous.
+static constexpr std::size_t kIndirectRingSize = 8;
+struct indirect_slot_t {
+    GLuint buffer{0};
+    GLsizei capacity{0};
+};
+static std::array<indirect_slot_t, kIndirectRingSize> g_indirect_slots{};
+static mg::indirect_ring::Cursor<kIndirectRingSize> g_indirect_cursor;
+static bool g_indirect_ring_failed = false;
 
 // Arrays commands are 16 bytes, element commands 20, and the capacity counters
 // below are in commands, not bytes. Sharing one buffer between the two layouts
 // would let an Elements call skip its resize because an Arrays call had already
 // "grown" it, and then map past the end of the store.
-static GLuint g_arrays_indirectbuffer = 0;
-static GLsizei g_arrays_cmdbufsize = 0;
+static std::array<indirect_slot_t, kIndirectRingSize> g_arrays_indirect_slots{};
+static mg::indirect_ring::Cursor<kIndirectRingSize> g_arrays_indirect_cursor;
+static bool g_arrays_indirect_ring_failed = false;
 static md_probe_state_t g_arrays_mdi_state = md_probe_state_t::Unprobed;
 static md_probe_state_t g_arrays_mda_state = md_probe_state_t::Unprobed;
 
@@ -340,11 +351,12 @@ static void multidraw_check_context() {
     // Deliberately no glDelete* here: if the owning context is gone its objects
     // went with it, and if it is merely not current then these names refer to
     // objects belonging to whichever context *is* current.
-    g_indirect_cmds_inited = false;
-    g_cmdbufsize = 0;
-    g_indirectbuffer = 0;
-    g_arrays_indirectbuffer = 0;
-    g_arrays_cmdbufsize = 0;
+    g_indirect_slots.fill(indirect_slot_t{});
+    g_indirect_cursor.reset();
+    g_indirect_ring_failed = false;
+    g_arrays_indirect_slots.fill(indirect_slot_t{});
+    g_arrays_indirect_cursor.reset();
+    g_arrays_indirect_ring_failed = false;
     g_arrays_mdi_state = md_probe_state_t::Unprobed;
     g_arrays_mda_state = md_probe_state_t::Unprobed;
     g_count_program = 0;
@@ -648,10 +660,29 @@ void glMultiDrawElementsBaseVertex(GLenum mode, GLsizei* counts, GLenum type, co
 // Indirect command buffer
 // ---------------------------------------------------------------------------
 
+static bool indirect_slot_available(indirect_slot_t& slot) {
+    (void)slot;
+    return true;
+}
+
+template <std::size_t N>
+static int acquire_indirect_slot(std::array<indirect_slot_t, N>& slots,
+                                 mg::indirect_ring::Cursor<N>& cursor, bool failed) {
+    if (failed) return -1;
+    return cursor.acquire([&](std::size_t slot) { return indirect_slot_available(slots[slot]); });
+}
+
+static void retire_indirect_slot(indirect_slot_t& slot, bool& ring_failed, const char* label) {
+    (void)slot;
+    (void)ring_failed;
+    (void)label;
+}
+
 // Returns false when the command buffer could not be prepared; the caller must
 // then fall back rather than issue a draw from an unwritten buffer.
 static bool prepare_indirect_buffer(const GLsizei* counts, GLenum type, const void* const* indices, GLsizei primcount,
-                                    const GLint* basevertex, GLuint* out_prev_binding) {
+                                    const GLint* basevertex, GLuint* out_prev_binding,
+                                    std::size_t* out_slot_index) {
     if (primcount <= 0) return false;
 
     const GLsizei elementSize = mg_index_size(type);
@@ -677,25 +708,30 @@ static bool prepare_indirect_buffer(const GLsizei* counts, GLenum type, const vo
     const GLuint prev = mg_driver_bound_buffer(GL_DRAW_INDIRECT_BUFFER);
     *out_prev_binding = prev;
 
-    if (!g_indirect_cmds_inited) {
-        GLES.glGenBuffers(1, &g_indirectbuffer);
-        g_cmdbufsize = 0;
-        g_indirect_cmds_inited = true;
+    const int acquired = acquire_indirect_slot(g_indirect_slots, g_indirect_cursor, g_indirect_ring_failed);
+    if (acquired < 0) {
+        MD_WARN_ONCE("multidraw: every indirect command-buffer slot is in flight, falling back without waiting");
+        return false;
     }
-    GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, g_indirectbuffer);
+    const std::size_t slot_index = static_cast<std::size_t>(acquired);
+    indirect_slot_t& slot = g_indirect_slots[slot_index];
+    if (!slot.buffer) GLES.glGenBuffers(1, &slot.buffer);
+    if (!slot.buffer) return false;
+    GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, slot.buffer);
 
-    if (g_cmdbufsize < primcount) {
-        size_t sz = g_cmdbufsize > 0 ? static_cast<size_t>(g_cmdbufsize) : 1;
+    const bool grew = slot.capacity < primcount;
+    if (grew) {
+        size_t sz = slot.capacity > 0 ? static_cast<size_t>(slot.capacity) : 1;
         while (sz < static_cast<size_t>(primcount))
             sz *= 2;
+        slot.capacity = static_cast<GLsizei>(sz);
+    }
 
-        const size_t wanted = sz * sizeof(draw_elements_indirect_command_t);
-        GLES.glBufferData(GL_DRAW_INDIRECT_BUFFER, static_cast<GLsizeiptr>(wanted), NULL, GL_DYNAMIC_DRAW);
-
-        // Only record the new capacity once the store really grew. Assigning it
-        // unconditionally made an out-of-memory permanent: the tracked size then
-        // claimed more room than the buffer had, the resize branch was never
-        // taken again, and every later map ran past the end of the store.
+    const size_t wanted = static_cast<size_t>(slot.capacity) * sizeof(draw_elements_indirect_command_t);
+    // Detach the backing store on every reuse. Queued draws retain the old store
+    // while this buffer name immediately receives writable command storage.
+    GLES.glBufferData(GL_DRAW_INDIRECT_BUFFER, static_cast<GLsizeiptr>(wanted), NULL, GL_STREAM_DRAW);
+    if (grew) {
         GLint real_size = 0;
         GLES.glGetBufferParameteriv(GL_DRAW_INDIRECT_BUFFER, GL_BUFFER_SIZE, &real_size);
         if (real_size < 0 || static_cast<size_t>(real_size) < wanted) {
@@ -704,11 +740,10 @@ static bool prepare_indirect_buffer(const GLsizei* counts, GLenum type, const vo
             // the previously recorded capacity no longer describes it. Clearing it
             // forces a fresh allocation attempt next time; keeping the stale value
             // would skip the resize branch forever and make every later map fail.
-            g_cmdbufsize = 0;
+            slot.capacity = 0;
             GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, prev);
             return false;
         }
-        g_cmdbufsize = static_cast<GLsizei>(sz);
     }
 
     // Built on the CPU and uploaded whole, rather than written through a
@@ -744,6 +779,7 @@ static bool prepare_indirect_buffer(const GLsizei* counts, GLenum type, const vo
 
     GLES.glBufferSubData(GL_DRAW_INDIRECT_BUFFER, 0,
                          static_cast<GLsizeiptr>(primcount * sizeof(draw_elements_indirect_command_t)), pcmds);
+    *out_slot_index = slot_index;
     return true;
 }
 
@@ -906,7 +942,8 @@ void mg_glMultiDrawElementsBaseVertex_indirect(GLenum mode, GLsizei* counts, GLe
     prepareForDraw();
 
     GLuint prevIndirectBuffer = 0;
-    if (!prepare_indirect_buffer(counts, type, indices, primcount, basevertex, &prevIndirectBuffer)) {
+    std::size_t slot_index = 0;
+    if (!prepare_indirect_buffer(counts, type, indices, primcount, basevertex, &prevIndirectBuffer, &slot_index)) {
         md_fall_elements_bv(md_backend_t::Indirect, mode, counts, type, indices, primcount, basevertex);
         return;
     }
@@ -917,6 +954,7 @@ void mg_glMultiDrawElementsBaseVertex_indirect(GLenum mode, GLsizei* counts, GLe
         GLES.glDrawElementsIndirect(mode, type, offset);
     }
 
+    retire_indirect_slot(g_indirect_slots[slot_index], g_indirect_ring_failed, "multidraw elements indirect");
     GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, prevIndirectBuffer);
 
     CHECK_GL_ERROR
@@ -939,7 +977,8 @@ void mg_glMultiDrawElements_indirect(GLenum mode, const GLsizei* count, GLenum t
     prepareForDraw();
 
     GLuint prevIndirectBuffer = 0;
-    if (!prepare_indirect_buffer(count, type, indices, primcount, nullptr, &prevIndirectBuffer)) {
+    std::size_t slot_index = 0;
+    if (!prepare_indirect_buffer(count, type, indices, primcount, nullptr, &prevIndirectBuffer, &slot_index)) {
         md_fall_elements(md_backend_t::Indirect, mode, count, type, indices, primcount);
         return;
     }
@@ -950,6 +989,7 @@ void mg_glMultiDrawElements_indirect(GLenum mode, const GLsizei* count, GLenum t
         GLES.glDrawElementsIndirect(mode, type, offset);
     }
 
+    retire_indirect_slot(g_indirect_slots[slot_index], g_indirect_ring_failed, "multidraw elements indirect");
     GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, prevIndirectBuffer);
     CHECK_GL_ERROR
 }
@@ -980,13 +1020,15 @@ void mg_glMultiDrawElementsBaseVertex_multiindirect(GLenum mode, GLsizei* counts
     prepareForDraw();
 
     GLuint prevIndirectBuffer = 0;
-    if (!prepare_indirect_buffer(counts, type, indices, primcount, basevertex, &prevIndirectBuffer)) {
+    std::size_t slot_index = 0;
+    if (!prepare_indirect_buffer(counts, type, indices, primcount, basevertex, &prevIndirectBuffer, &slot_index)) {
         md_fall_elements_bv(md_backend_t::MultiIndirect, mode, counts, type, indices, primcount, basevertex);
         return;
     }
 
     GLES.glMultiDrawElementsIndirectEXT(mode, type, 0, primcount, 0);
 
+    retire_indirect_slot(g_indirect_slots[slot_index], g_indirect_ring_failed, "multidraw elements multiindirect");
     GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, prevIndirectBuffer);
 
     CHECK_GL_ERROR
@@ -1009,13 +1051,15 @@ void mg_glMultiDrawElements_multiindirect(GLenum mode, const GLsizei* count, GLe
     prepareForDraw();
 
     GLuint prevIndirectBuffer = 0;
-    if (!prepare_indirect_buffer(count, type, indices, primcount, nullptr, &prevIndirectBuffer)) {
+    std::size_t slot_index = 0;
+    if (!prepare_indirect_buffer(count, type, indices, primcount, nullptr, &prevIndirectBuffer, &slot_index)) {
         md_fall_elements(md_backend_t::MultiIndirect, mode, count, type, indices, primcount);
         return;
     }
 
     GLES.glMultiDrawElementsIndirectEXT(mode, type, 0, primcount, 0);
 
+    retire_indirect_slot(g_indirect_slots[slot_index], g_indirect_ring_failed, "multidraw elements multiindirect");
     GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, prevIndirectBuffer);
 
     CHECK_GL_ERROR
@@ -1767,7 +1811,7 @@ void mg_glMultiDrawArrays_multiarrays(GLenum mode, const GLint* first, const GLs
 // Folds the batch into one glMultiDrawArraysIndirectEXT by building a command
 // buffer. Returns false when the buffer could not be prepared.
 static bool prepare_arrays_indirect_buffer(const GLint* first, const GLsizei* count, GLsizei drawcount,
-                                           GLuint* out_prev_binding) {
+                                           GLuint* out_prev_binding, std::size_t* out_slot_index) {
     if (drawcount <= 0) return false;
 
     // Tracked, and read at entry before the command buffer is bound over it.
@@ -1777,40 +1821,43 @@ static bool prepare_arrays_indirect_buffer(const GLint* first, const GLsizei* co
     const GLuint prev = mg_driver_bound_buffer(GL_DRAW_INDIRECT_BUFFER);
     *out_prev_binding = prev;
 
-    if (!g_arrays_indirectbuffer) {
-        GLES.glGenBuffers(1, &g_arrays_indirectbuffer);
-        g_arrays_cmdbufsize = 0;
+    const int acquired =
+        acquire_indirect_slot(g_arrays_indirect_slots, g_arrays_indirect_cursor, g_arrays_indirect_ring_failed);
+    if (acquired < 0) {
+        MD_WARN_ONCE("multidraw arrays: every indirect command-buffer slot is in flight, falling back without waiting");
+        return false;
     }
-    GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, g_arrays_indirectbuffer);
+    const std::size_t slot_index = static_cast<std::size_t>(acquired);
+    indirect_slot_t& slot = g_arrays_indirect_slots[slot_index];
+    if (!slot.buffer) GLES.glGenBuffers(1, &slot.buffer);
+    if (!slot.buffer) return false;
+    GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, slot.buffer);
 
-    if (g_arrays_cmdbufsize < drawcount) {
-        size_t sz = g_arrays_cmdbufsize > 0 ? static_cast<size_t>(g_arrays_cmdbufsize) : 1;
+    const bool grew = slot.capacity < drawcount;
+    if (grew) {
+        size_t sz = slot.capacity > 0 ? static_cast<size_t>(slot.capacity) : 1;
         while (sz < static_cast<size_t>(drawcount))
             sz *= 2;
+        slot.capacity = static_cast<GLsizei>(sz);
+    }
 
-        const size_t wanted = sz * sizeof(draw_arrays_indirect_command_t);
-        GLES.glBufferData(GL_DRAW_INDIRECT_BUFFER, static_cast<GLsizeiptr>(wanted), NULL, GL_DYNAMIC_DRAW);
-
+    const size_t wanted = static_cast<size_t>(slot.capacity) * sizeof(draw_arrays_indirect_command_t);
+    GLES.glBufferData(GL_DRAW_INDIRECT_BUFFER, static_cast<GLsizeiptr>(wanted), NULL, GL_STREAM_DRAW);
+    if (grew) {
         GLint real_size = 0;
         GLES.glGetBufferParameteriv(GL_DRAW_INDIRECT_BUFFER, GL_BUFFER_SIZE, &real_size);
         if (real_size < 0 || static_cast<size_t>(real_size) < wanted) {
             MD_WARN_ONCE("multidraw arrays: indirect buffer allocation failed (wanted %zu bytes, got %d)", wanted,
                          real_size);
-            g_arrays_cmdbufsize = 0;
+            slot.capacity = 0;
             GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, prev);
             return false;
         }
-        g_arrays_cmdbufsize = static_cast<GLsizei>(sz);
     }
 
-    auto* cmds = static_cast<draw_arrays_indirect_command_t*>(GLES.glMapBufferRange(
-        GL_DRAW_INDIRECT_BUFFER, 0, static_cast<GLsizeiptr>(drawcount * sizeof(draw_arrays_indirect_command_t)),
-        GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT));
-    if (!cmds) {
-        MD_WARN_ONCE("multidraw arrays: failed to map the indirect command buffer");
-        GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, prev);
-        return false;
-    }
+    static thread_local std::vector<draw_arrays_indirect_command_t> staged;
+    staged.resize(static_cast<size_t>(drawcount));
+    draw_arrays_indirect_command_t* cmds = staged.data();
 
     for (GLsizei i = 0; i < drawcount; ++i) {
         cmds[i].count = static_cast<GLuint>(count[i] > 0 ? count[i] : 0);
@@ -1819,11 +1866,9 @@ static bool prepare_arrays_indirect_buffer(const GLint* first, const GLsizei* co
         cmds[i].baseInstanceOrReserved = 0;
     }
 
-    if (GLES.glUnmapBuffer(GL_DRAW_INDIRECT_BUFFER) == GL_FALSE) {
-        MD_WARN_ONCE("multidraw arrays: indirect command buffer contents lost on unmap");
-        GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, prev);
-        return false;
-    }
+    GLES.glBufferSubData(GL_DRAW_INDIRECT_BUFFER, 0,
+                         static_cast<GLsizeiptr>(drawcount * sizeof(draw_arrays_indirect_command_t)), cmds);
+    *out_slot_index = slot_index;
     return true;
 }
 
@@ -1871,7 +1916,8 @@ void mg_glMultiDrawArrays_multiindirect(GLenum mode, const GLint* first, const G
     prepareForDraw();
 
     GLuint prev_indirect = 0;
-    if (!prepare_arrays_indirect_buffer(first, count, drawcount, &prev_indirect)) {
+    std::size_t slot_index = 0;
+    if (!prepare_arrays_indirect_buffer(first, count, drawcount, &prev_indirect, &slot_index)) {
         md_fall_arrays(md_backend_t::MultiIndirect, mode, first, count, drawcount);
         return;
     }
@@ -1881,10 +1927,13 @@ void mg_glMultiDrawArrays_multiindirect(GLenum mode, const GLint* first, const G
 
     GLES.glMultiDrawArraysIndirectEXT(mode, 0, drawcount, 0);
 
+    const GLenum probe_error = probing ? mg_md_check() : GL_NO_ERROR;
+    retire_indirect_slot(g_arrays_indirect_slots[slot_index], g_arrays_indirect_ring_failed,
+                         "multidraw arrays multiindirect");
+
     if (probing) {
-        const GLenum err = mg_md_check();
-        if (err != GL_NO_ERROR) {
-            MD_WARN_ONCE("multidraw arrays: glMultiDrawArraysIndirectEXT failed with 0x%04x, disabling", err);
+        if (probe_error != GL_NO_ERROR) {
+            MD_WARN_ONCE("multidraw arrays: glMultiDrawArraysIndirectEXT failed with 0x%04x, disabling", probe_error);
             g_arrays_mdi_state = md_probe_state_t::Failed;
             GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, prev_indirect);
             md_fall_arrays(md_backend_t::MultiIndirect, mode, first, count, drawcount);

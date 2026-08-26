@@ -48,6 +48,19 @@ extern "C"
     // comment on the definition in gl/buffer.cpp lists where it does not.
     GLuint mg_driver_bound_buffer(GLenum target);
 
+    // Upload scheduler lifecycle. All three are no-ops in the default disabled
+    // mode. The GL-entry hook is shared by generated/native and handwritten
+    // wrappers; present/context hooks cover EGL boundaries where LOG() is absent.
+    void mg_buffer_upload_gl_entry(const char* function_name) noexcept;
+    void mg_buffer_upload_present(void) noexcept;
+    void mg_buffer_upload_context_release(void) noexcept;
+    void mg_buffer_register_context(unsigned long long ctx_id, unsigned long long group_id);
+
+    // Core/named DSA share one identity, eligibility and queue implementation.
+    // GL_FALSE asks the DSA compatibility wrapper to retain its legacy fallback
+    // for invalid or as-yet-unmaterialized names.
+    GLboolean mg_buffer_sub_data_named(GLuint buffer, GLintptr offset, GLsizeiptr size, const void* data);
+
     GLuint gen_array();
 
     GLboolean has_array(GLuint key);
@@ -97,6 +110,10 @@ extern "C"
     GLAPI GLAPIENTRY void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfield flags);
 
     GLAPI GLAPIENTRY void glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length);
+
+    GLAPI GLAPIENTRY void glGetBufferParameteriv(GLenum target, GLenum pname, GLint* params);
+
+    GLAPI GLAPIENTRY void glGetBufferParameteri64v(GLenum target, GLenum pname, GLint64* params);
 
     GLAPI GLAPIENTRY void glGenVertexArrays(GLsizei n, GLuint* arrays);
 
