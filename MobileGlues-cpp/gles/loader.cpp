@@ -341,27 +341,39 @@ void InitGLESCapabilities() {
 
     // GL_ARB_base_instance completes RenderPearl's indirect trio: its fast path
     // needs maxDrawIndirectDrawCount > 0 *and* nonZeroFirstInstance, and the
-    // latter is keyed to this one string. Advertised only when the native driver
-    // has GL_EXT_base_instance with all three entry points resolved: the direct
-    // draw family then forwards a nonzero baseinstance to those entry points
+    // latter is keyed to this one string. Advertised only when all three EXT
+    // entry points resolved *and* the extension string agrees: the direct draw
+    // family then forwards a nonzero baseinstance to those entry points
     // (gl/drawing.cpp), and indirect command buffers already reach the driver
     // untouched, so their baseInstance field is honoured by the same extension.
-    // Without the EXT the draw family would keep dropping baseinstance, so the
-    // string stays withheld exactly as before. The probe line prints in every
-    // configuration; it is the device's answer to "does the GPU have the EXT".
+    // Without the entry points the draw family would keep dropping baseinstance,
+    // so the string stays withheld exactly as before.
+    //
+    // The switch has three states, not two. Maleoon 920 resolves all three EXT
+    // symbols while omitting GL_EXT_base_instance from its extension string, so
+    // "force" exists as a controlled experiment: trust the symbols, skip the
+    // string, and let the user own the risk of an unadvertised driver path.
+    // Unset / "1" / unknown = auto (string-gated), "0" = off. The probe line
+    // prints in every configuration and names the rule that decided.
     {
-        int expose = 1;
-        GetEnvVarBool("AMCL_MG_EXPOSE_BASE_INSTANCE", &expose, 1);
+        const char* raw = getenv("AMCL_MG_EXPOSE_BASE_INSTANCE");
+        const bool off = raw && strcmp(raw, "0") == 0;
+        const bool force = raw && strcmp(raw, "force") == 0;
         const bool hasExt = g_gles_caps.GL_EXT_base_instance != 0;
         const bool hasEntryPoints = GLES.glDrawArraysInstancedBaseInstanceEXT != nullptr &&
                                     GLES.glDrawElementsInstancedBaseInstanceEXT != nullptr &&
                                     GLES.glDrawElementsInstancedBaseVertexBaseInstanceEXT != nullptr;
-        const bool advertise = expose && hasExt && hasEntryPoints;
+        const bool advertise = !off && hasEntryPoints && (hasExt || force);
         if (advertise) {
             AppendExtension("GL_ARB_base_instance");
         }
-        LOG_I("[MG-BASE-INSTANCE] probe: EXT_base_instance=%s entry_points=%d expose=%d advertise=%s",
-              hasExt ? "present" : "absent", hasEntryPoints ? 1 : 0, expose ? 1 : 0, advertise ? "yes" : "no")
+        const char* verdict = advertise          ? (hasExt ? "yes(auto)" : "yes(forced)")
+                              : off              ? "no(off)"
+                              : !hasEntryPoints ? "no(entry_points)"
+                                                 : "no(absent)";
+        LOG_I("[MG-BASE-INSTANCE] probe: EXT_base_instance=%s entry_points=%d expose=%s advertise=%s",
+              hasExt ? "present" : "absent", hasEntryPoints ? 1 : 0,
+              off ? "off" : force ? "force" : "auto", verdict)
     }
 }
 
