@@ -215,6 +215,7 @@ extern "C"
         [[maybe_unused]] int GL_EXT_read_format_bgra;
         int GL_OES_mapbuffer;
         int GL_EXT_multi_draw_indirect;
+        int GL_EXT_base_instance;
         int GL_OES_draw_elements_base_vertex;
         int GL_OES_depth_texture;
         int GL_OES_depth24;

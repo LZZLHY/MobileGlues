@@ -503,16 +503,20 @@ void glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, 
 // ---------------------------------------------------------------------------
 // The base instance family (GL 4.2 / ARB_base_instance)
 //
-// GLES has no base instance in core, and no extension for it on the drivers
-// this layer targets, so these three were stubs in gl/gl_stub.cpp: called, they
-// drew nothing at all. That is the worst of the available options -- a mesh that
-// silently never appears is harder to diagnose than one in the wrong place, and
-// baseinstance is 0 in the overwhelming majority of calls, where these commands
-// are exactly the ones GLES already implements.
+// GLES has no base instance in core, so these three were stubs in
+// gl/gl_stub.cpp: called, they drew nothing at all. That is the worst of the
+// available options -- a mesh that silently never appears is harder to diagnose
+// than one in the wrong place, and baseinstance is 0 in the overwhelming
+// majority of calls, where these commands are exactly the ones GLES already
+// implements.
 //
-// So they forward, and a non-zero base instance is reported once and then
-// ignored. The instanced attribute fetch then starts at element 0 instead of
-// baseinstance, which is wrong for that case only, and stays visible.
+// A nonzero baseinstance is forwarded to the GL_EXT_base_instance entry point
+// when the loader resolved one. gles/loader.cpp advertises GL_ARB_base_instance
+// on exactly that condition, so an application that saw the string never
+// reaches the fallback; without the EXT the old compromise stands -- forward
+// without the base instance, report once, stay visible. The zero case keeps
+// taking the core-GLES wrappers, whose restart rewrite is more capable than
+// the EXT calls below.
 // ---------------------------------------------------------------------------
 
 void glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count, GLsizei instancecount,
@@ -520,6 +524,12 @@ void glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count, 
     LOG()
     LOG_D("glDrawArraysInstancedBaseInstance, mode: %d, first: %d, count: %d, instancecount: %d, baseinstance: %u",
           mode, first, count, instancecount, baseinstance)
+    if (baseinstance != 0 && GLES.glDrawArraysInstancedBaseInstanceEXT) {
+        prepareForDraw();
+        GLES.glDrawArraysInstancedBaseInstanceEXT(mode, first, count, instancecount, baseinstance);
+        CHECK_GL_ERROR
+        return;
+    }
     if (baseinstance != 0) {
         DR_WARN_ONCE("glDrawArraysInstancedBaseInstance: baseinstance %u ignored, GLES has no base instance",
                      baseinstance);
@@ -534,6 +544,19 @@ void glDrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type
     LOG()
     LOG_D("glDrawElementsInstancedBaseInstance, mode: %d, count: %d, type: %d, instancecount: %d, baseinstance: %u",
           mode, count, type, instancecount, baseinstance)
+    if (baseinstance != 0 && GLES.glDrawElementsInstancedBaseInstanceEXT) {
+        prepareForDraw();
+        // Same policy as glMultiDrawElementsIndirect: the rewrite path cannot
+        // carry a base instance, so only the fixed-index restart is honoured.
+        if (mg_restart_needs_rewrite(type)) {
+            DR_WARN_ONCE("glDrawElementsInstancedBaseInstance: GL_PRIMITIVE_RESTART with a custom index cannot "
+                         "be rewritten with a base instance; restarts will be ignored");
+        }
+        restart_guard_t guard(type);
+        GLES.glDrawElementsInstancedBaseInstanceEXT(mode, count, type, indices, instancecount, baseinstance);
+        CHECK_GL_ERROR
+        return;
+    }
     if (baseinstance != 0) {
         DR_WARN_ONCE("glDrawElementsInstancedBaseInstance: baseinstance %u ignored, GLES has no base instance",
                      baseinstance);
@@ -546,6 +569,18 @@ void glDrawElementsInstancedBaseVertexBaseInstance(GLenum mode, GLsizei count, G
     LOG()
     LOG_D("glDrawElementsInstancedBaseVertexBaseInstance, mode: %d, count: %d, basevertex: %d, baseinstance: %u", mode,
           count, basevertex, baseinstance)
+    if (baseinstance != 0 && GLES.glDrawElementsInstancedBaseVertexBaseInstanceEXT) {
+        prepareForDraw();
+        if (mg_restart_needs_rewrite(type)) {
+            DR_WARN_ONCE("glDrawElementsInstancedBaseVertexBaseInstance: GL_PRIMITIVE_RESTART with a custom index "
+                         "cannot be rewritten with a base instance; restarts will be ignored");
+        }
+        restart_guard_t guard(type);
+        GLES.glDrawElementsInstancedBaseVertexBaseInstanceEXT(mode, count, type, indices, instancecount, basevertex,
+                                                              baseinstance);
+        CHECK_GL_ERROR
+        return;
+    }
     if (baseinstance != 0) {
         DR_WARN_ONCE(
             "glDrawElementsInstancedBaseVertexBaseInstance: baseinstance %u ignored, GLES has no base instance",

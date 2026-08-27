@@ -478,6 +478,12 @@ extern "C"
     GL_FUNC_TYPEDEF(void, glBruh)
     GL_FUNC_TYPEDEF(void, glMultiDrawElementsBaseVertexEXT, GLenum mode, const GLsizei* count, GLenum type,
                     const void* const* indices, GLsizei drawcount, const GLint* basevertex)
+    GL_FUNC_TYPEDEF(void, glDrawArraysInstancedBaseInstanceEXT, GLenum mode, GLint first, GLsizei count,
+                    GLsizei instancecount, GLuint baseinstance)
+    GL_FUNC_TYPEDEF(void, glDrawElementsInstancedBaseInstanceEXT, GLenum mode, GLsizei count, GLenum type,
+                    const void* indices, GLsizei instancecount, GLuint baseinstance)
+    GL_FUNC_TYPEDEF(void, glDrawElementsInstancedBaseVertexBaseInstanceEXT, GLenum mode, GLsizei count, GLenum type,
+                    const void* indices, GLsizei instancecount, GLint basevertex, GLuint baseinstance)
 
 #define GL_FUNC_DECL(name) name##_PTR name;
 
@@ -852,6 +858,9 @@ extern "C"
         GL_FUNC_DECL(glMultiDrawArraysIndirectEXT)
         GL_FUNC_DECL(glMultiDrawElementsIndirectEXT)
         GL_FUNC_DECL(glMultiDrawElementsBaseVertexEXT)
+        GL_FUNC_DECL(glDrawArraysInstancedBaseInstanceEXT)
+        GL_FUNC_DECL(glDrawElementsInstancedBaseInstanceEXT)
+        GL_FUNC_DECL(glDrawElementsInstancedBaseVertexBaseInstanceEXT)
 
         GL_FUNC_DECL(glBruh)
     };

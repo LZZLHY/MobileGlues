@@ -230,6 +230,8 @@ void InitGLESCapabilities() {
                 g_gles_caps.GL_OES_mapbuffer = 1;
             } else if (strcmp(extension, "GL_EXT_multi_draw_indirect") == 0) {
                 g_gles_caps.GL_EXT_multi_draw_indirect = 1;
+            } else if (strcmp(extension, "GL_EXT_base_instance") == 0) {
+                g_gles_caps.GL_EXT_base_instance = 1;
             } else if (strcmp(extension, "GL_OES_draw_elements_base_vertex") == 0) {
                 g_gles_caps.GL_OES_draw_elements_base_vertex = 1;
             } else if (strcmp(extension, "GL_OES_depth_texture") == 0) {
@@ -335,6 +337,31 @@ void InitGLESCapabilities() {
         LOG_I("[MG-INDIRECT-DRAW] expose=%d gles31=%d draw_indirect=%d multi_draw_indirect=%d",
               expose ? 1 : 0, gles31 ? 1 : 0, (expose && hasIndirect) ? 1 : 0,
               (expose && hasMultiIndirect) ? 1 : 0)
+    }
+
+    // GL_ARB_base_instance completes RenderPearl's indirect trio: its fast path
+    // needs maxDrawIndirectDrawCount > 0 *and* nonZeroFirstInstance, and the
+    // latter is keyed to this one string. Advertised only when the native driver
+    // has GL_EXT_base_instance with all three entry points resolved: the direct
+    // draw family then forwards a nonzero baseinstance to those entry points
+    // (gl/drawing.cpp), and indirect command buffers already reach the driver
+    // untouched, so their baseInstance field is honoured by the same extension.
+    // Without the EXT the draw family would keep dropping baseinstance, so the
+    // string stays withheld exactly as before. The probe line prints in every
+    // configuration; it is the device's answer to "does the GPU have the EXT".
+    {
+        int expose = 1;
+        GetEnvVarBool("AMCL_MG_EXPOSE_BASE_INSTANCE", &expose, 1);
+        const bool hasExt = g_gles_caps.GL_EXT_base_instance != 0;
+        const bool hasEntryPoints = GLES.glDrawArraysInstancedBaseInstanceEXT != nullptr &&
+                                    GLES.glDrawElementsInstancedBaseInstanceEXT != nullptr &&
+                                    GLES.glDrawElementsInstancedBaseVertexBaseInstanceEXT != nullptr;
+        const bool advertise = expose && hasExt && hasEntryPoints;
+        if (advertise) {
+            AppendExtension("GL_ARB_base_instance");
+        }
+        LOG_I("[MG-BASE-INSTANCE] probe: EXT_base_instance=%s entry_points=%d expose=%d advertise=%s",
+              hasExt ? "present" : "absent", hasEntryPoints ? 1 : 0, expose ? 1 : 0, advertise ? "yes" : "no")
     }
 }
 
@@ -712,6 +739,9 @@ bool init_target_gles() {
     INIT_GLES_FUNC(glMultiDrawArraysIndirectEXT)
     INIT_GLES_FUNC(glMultiDrawElementsIndirectEXT)
     INIT_GLES_FUNC(glMultiDrawElementsBaseVertexEXT)
+    INIT_GLES_FUNC(glDrawArraysInstancedBaseInstanceEXT)
+    INIT_GLES_FUNC(glDrawElementsInstancedBaseInstanceEXT)
+    INIT_GLES_FUNC(glDrawElementsInstancedBaseVertexBaseInstanceEXT)
     //    INIT_GLES_FUNC(glBruh)
 
     LOG_D("glMultiDrawArraysIndirectEXT() @ 0x%x", GLES.glMultiDrawArraysIndirectEXT)
