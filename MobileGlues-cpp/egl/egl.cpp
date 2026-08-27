@@ -17,11 +17,14 @@
 #include "trace.h"
 #include <MG/init.h>
 #include <EGL/eglext.h>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <memory>
 #include <ska/flat_hash_map.hpp>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -670,6 +673,69 @@ namespace {
 #endif
     }
 
+    using PresentPacingClock = std::chrono::steady_clock;
+
+    struct PresentPacingState {
+        EGLSurface surface = EGL_NO_SURFACE;
+        int fps = 0;
+        PresentPacingClock::time_point next_deadline{};
+        bool armed = false;
+    };
+
+    thread_local PresentPacingState present_pacing_state;
+
+    int configuredFramePacingFps() {
+        const char* raw = std::getenv("AMCL_MG_FRAME_PACING_FPS");
+        if (raw == nullptr || raw[0] == '\0') return 0;
+
+        int value = 0;
+        for (const char* cursor = raw; *cursor != '\0'; ++cursor) {
+            if (*cursor < '0' || *cursor > '9') return 0;
+            value = value * 10 + (*cursor - '0');
+            if (value > 240) return 0;
+        }
+        return value == 0 || value >= 30 ? value : 0;
+    }
+
+    // Pace only after a successful backend present and after frame statistics have
+    // closed the present span. The next render iteration cannot start until this
+    // function returns, so residual sleeping lowers the producer rate before the
+    // next RenderPearl submit without changing its two-slot fence contract.
+    //
+    // A missed deadline never triggers catch-up: an already slow frame returns
+    // immediately and arms a fresh period. Surface/config changes reset the phase,
+    // which also makes process-local relaunches and window recreation harmless.
+    void paceAfterPresent(EGLSurface surface, EGLBoolean result) {
+        const int fps = configuredFramePacingFps();
+        PresentPacingState& state = present_pacing_state;
+        if (result != EGL_TRUE || fps == 0) {
+            state = PresentPacingState{};
+            return;
+        }
+
+        const auto period = std::chrono::nanoseconds(1000000000LL / fps);
+        const auto now = PresentPacingClock::now();
+        if (!state.armed || state.surface != surface || state.fps != fps) {
+            // Effective-value readback (once per arm/change, not per frame): the
+            // host logs what it requested; this line proves what actually took
+            // effect at the present boundary, so a host/env drift stays visible.
+            LOG_I("[MG-PRESENT-PACING] effective_fps=%d surface=%p", fps,
+                  static_cast<void*>(surface))
+            state.surface = surface;
+            state.fps = fps;
+            state.next_deadline = now + period;
+            state.armed = true;
+            return;
+        }
+        if (now >= state.next_deadline) {
+            state.next_deadline = now + period;
+            return;
+        }
+
+        std::this_thread::sleep_until(state.next_deadline);
+        state.next_deadline = PresentPacingClock::now() + period;
+    }
+
     // ApplyFSR upscales into the surface, the swap presents it, the resolution
     // check reacts to a surface that has changed size. The three belong together,
     // and every path that presents a frame has to go through here.
@@ -685,12 +751,14 @@ namespace {
         if (global_settings.fsr1_setting == FSR1_Quality_Preset::Disabled) {
             const EGLBoolean result = egl_eglSwapBuffers(dpy, surface);
             finishFrameStats();
+            paceAfterPresent(surface, result);
             return result;
         }
         ApplyFSR();
         const EGLBoolean result = egl_eglSwapBuffers(dpy, surface);
         CheckResolutionChange(dpy, surface);
         finishFrameStats();
+        paceAfterPresent(surface, result);
         return result;
     }
 
@@ -711,6 +779,7 @@ namespace {
             mg::frame_stats::presentBegin();
             const EGLBoolean result = backend(dpy, surface, rects, n_rects);
             finishFrameStats();
+            paceAfterPresent(surface, result);
             return result;
         }
         // Once, not once a frame: a damage swap runs every frame the host presents
