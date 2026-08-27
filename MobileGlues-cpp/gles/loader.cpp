@@ -299,6 +299,43 @@ void InitGLESCapabilities() {
     if (g_gles_caps.major > 3 || (g_gles_caps.major == 3 && g_gles_caps.minor >= 1)) {
         AppendExtension("GL_ARB_vertex_attrib_binding");
     }
+
+    // RenderPearl (MC 26.3+) does not route terrain through the glMultiDraw*
+    // translation entry points; it selects a whole submission strategy at
+    // device creation from these ARB strings. Without them it falls back to
+    // one instanced draw per terrain section per pass. Only advertise what
+    // the GLES side can actually deliver:
+    //   - GL_ARB_draw_indirect: glDraw*Indirect are core GLES 3.1 and the GL
+    //     entry points forward them unchanged (gl/gl_native.cpp).
+    //   - GL_ARB_multi_draw_indirect: only with real GL_EXT_multi_draw_indirect
+    //     batching. The unrolled fallback inside glMultiDraw*Indirect turns one
+    //     app call into N driver calls -- no better than the per-section path
+    //     the app would otherwise take, so it must not lure the app over.
+    // GL_ARB_base_instance stays deliberately un-advertised: the base-instance
+    // draw family ignores a nonzero baseinstance (gl/drawing.cpp), so claiming
+    // it would draw wrong geometry, not slower geometry.
+    {
+        int expose = 1;
+        GetEnvVarBool("AMCL_MG_EXPOSE_INDIRECT_DRAW", &expose, 1);
+        const bool gles31 =
+            g_gles_caps.major > 3 || (g_gles_caps.major == 3 && g_gles_caps.minor >= 1);
+        const bool hasIndirect = gles31 && GLES.glDrawArraysIndirect != nullptr &&
+                                 GLES.glDrawElementsIndirect != nullptr;
+        const bool hasMultiIndirect = hasIndirect && g_gles_caps.GL_EXT_multi_draw_indirect &&
+                                      GLES.glMultiDrawArraysIndirectEXT != nullptr &&
+                                      GLES.glMultiDrawElementsIndirectEXT != nullptr;
+        if (expose && hasIndirect) {
+            AppendExtension("GL_ARB_draw_indirect");
+        }
+        if (expose && hasMultiIndirect) {
+            AppendExtension("GL_ARB_multi_draw_indirect");
+        }
+        // Effective-value readback: one line proves what the app will see,
+        // including the AMCL_MG_EXPOSE_INDIRECT_DRAW=0 A/B kill switch.
+        LOG_I("[MG-INDIRECT-DRAW] expose=%d gles31=%d draw_indirect=%d multi_draw_indirect=%d",
+              expose ? 1 : 0, gles31 ? 1 : 0, (expose && hasIndirect) ? 1 : 0,
+              (expose && hasMultiIndirect) ? 1 : 0)
+    }
 }
 
 bool init_target_gles() {
