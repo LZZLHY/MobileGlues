@@ -60,6 +60,9 @@ private:
 };
 
 inline void recordBufferBytes(std::uint64_t bytes) noexcept { g_collector.recordBufferBytes(bytes); }
+inline void recordClientWait(std::uint32_t flags, std::uint64_t timeout, std::uint32_t result) noexcept {
+    g_collector.recordClientWait(flags, timeout, result);
+}
 inline void recordTerrainUpload(std::uint64_t bytes) noexcept { g_collector.recordTerrainUpload(bytes); }
 inline void recordTerrainStaged() noexcept { g_collector.recordTerrainStaged(); }
 inline void recordPersistentMap() noexcept { g_collector.recordPersistentMap(); }
@@ -99,6 +102,7 @@ inline bool presentEnd(Report& report, FrameTrace* trace = nullptr) noexcept {
 
 namespace mg::frame_stats {
 inline void recordBufferBytes(std::uint64_t) noexcept {}
+inline void recordClientWait(std::uint32_t, std::uint64_t, std::uint32_t) noexcept {}
 inline void recordTerrainUpload(std::uint64_t) noexcept {}
 inline void recordTerrainStaged() noexcept {}
 inline void recordPersistentMap() noexcept {}

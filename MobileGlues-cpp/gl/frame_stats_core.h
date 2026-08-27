@@ -54,6 +54,46 @@ enum Event : std::uint32_t {
     EventSlowSelectedCall = 1U << 3U,
 };
 
+// Client-wait dimensions are deliberately independent. Each one receives the
+// same elapsed sample, so every dimension must conserve the legacy
+// Category::ClientWait calls/total/max aggregate. The Unclassified buckets make
+// a missing wrapper annotation visible instead of silently folding it into a
+// real GL parameter/result class.
+enum class ClientWaitTimeoutClass : std::uint8_t {
+    Zero = 0,
+    Finite,
+    Int64Max,
+    Ignored,
+    Other,
+    Unclassified,
+    Count
+};
+
+enum class ClientWaitFlagsClass : std::uint8_t {
+    None = 0,
+    Flush,
+    Other,
+    Unclassified,
+    Count
+};
+
+enum class ClientWaitResultClass : std::uint8_t {
+    AlreadySignaled = 0,
+    ConditionSatisfied,
+    TimeoutExpired,
+    WaitFailed,
+    Other,
+    Unclassified,
+    Count
+};
+
+constexpr std::size_t kClientWaitTimeoutClassCount =
+    static_cast<std::size_t>(ClientWaitTimeoutClass::Count);
+constexpr std::size_t kClientWaitFlagsClassCount =
+    static_cast<std::size_t>(ClientWaitFlagsClass::Count);
+constexpr std::size_t kClientWaitResultClassCount =
+    static_cast<std::size_t>(ClientWaitResultClass::Count);
+
 constexpr std::size_t kCategoryCount = static_cast<std::size_t>(Category::Count);
 constexpr std::uint64_t kDefaultReportIntervalNs = 1'000'000'000ULL;
 constexpr std::uint64_t kSlowSelectedCallNs = 1'000'000ULL;
@@ -88,6 +128,25 @@ struct DurationAggregate {
     }
 };
 
+struct ClientWaitCounters {
+    std::array<DurationAggregate, kClientWaitTimeoutClassCount> timeouts{};
+    std::array<DurationAggregate, kClientWaitFlagsClassCount> flags{};
+    std::array<DurationAggregate, kClientWaitResultClassCount> results{};
+
+    void add(std::uint64_t duration_ns, ClientWaitTimeoutClass timeout_class,
+             ClientWaitFlagsClass flags_class, ClientWaitResultClass result_class) noexcept {
+        timeouts[static_cast<std::size_t>(timeout_class)].add(duration_ns);
+        flags[static_cast<std::size_t>(flags_class)].add(duration_ns);
+        results[static_cast<std::size_t>(result_class)].add(duration_ns);
+    }
+
+    void merge(const ClientWaitCounters& other) noexcept {
+        for (std::size_t i = 0; i < timeouts.size(); ++i) timeouts[i].merge(other.timeouts[i]);
+        for (std::size_t i = 0; i < flags.size(); ++i) flags[i].merge(other.flags[i]);
+        for (std::size_t i = 0; i < results.size(); ++i) results[i].merge(other.results[i]);
+    }
+};
+
 struct SlowCall {
     const char* name{nullptr};
     std::uint64_t duration_ns{0};
@@ -105,6 +164,7 @@ struct FrameCounters {
     DurationAggregate gl;
     DurationAggregate present;
     std::array<DurationAggregate, kCategoryCount> categories{};
+    ClientWaitCounters client_wait{};
     SlowCall slowest{};
     // Time outside the calls selected by the active coverage mode. It includes
     // game/JIT/GC time and, outside a short causal window, ordinary unobserved GL.
@@ -126,6 +186,7 @@ struct FrameCounters {
         gl.merge(other.gl);
         present.merge(other.present);
         for (std::size_t i = 0; i < categories.size(); ++i) categories[i].merge(other.categories[i]);
+        client_wait.merge(other.client_wait);
         slowest.merge(other.slowest);
         outside_gl_ns += other.outside_gl_ns;
         outside_gl_max_ns = std::max(outside_gl_max_ns, other.outside_gl_max_ns);
@@ -144,6 +205,7 @@ struct FrameCounters {
 };
 
 struct Report {
+    std::uint64_t sequence{0};
     std::uint64_t window_ns{0};
     std::uint64_t frames{0};
     std::uint64_t frame_total_ns{0};
@@ -165,6 +227,21 @@ inline const DurationAggregate& category(const Report& report, Category value) n
 
 inline const DurationAggregate& category(const FrameTrace& trace, Category value) noexcept {
     return trace.counters.categories[static_cast<std::size_t>(value)];
+}
+
+inline const DurationAggregate& clientWaitTimeout(const FrameCounters& counters,
+                                                  ClientWaitTimeoutClass value) noexcept {
+    return counters.client_wait.timeouts[static_cast<std::size_t>(value)];
+}
+
+inline const DurationAggregate& clientWaitFlags(const FrameCounters& counters,
+                                                ClientWaitFlagsClass value) noexcept {
+    return counters.client_wait.flags[static_cast<std::size_t>(value)];
+}
+
+inline const DurationAggregate& clientWaitResult(const FrameCounters& counters,
+                                                 ClientWaitResultClass value) noexcept {
+    return counters.client_wait.results[static_cast<std::size_t>(value)];
 }
 
 inline std::uint32_t percentileUpperMs(const Report& report, std::uint32_t percentile) noexcept {
@@ -204,6 +281,10 @@ public:
         outer_function_name_ = function_name;
         outer_category_ = classify(function_name);
         outer_buffer_bytes_recorded_ = false;
+        outer_client_wait_recorded_ = false;
+        outer_client_wait_timeout_ = ClientWaitTimeoutClass::Unclassified;
+        outer_client_wait_flags_ = ClientWaitFlagsClass::Unclassified;
+        outer_client_wait_result_ = ClientWaitResultClass::Unclassified;
     }
 
     void glExit(std::uint64_t now_ns) noexcept {
@@ -219,11 +300,26 @@ public:
         if (outer_category_ != Category::Count) {
             frame_.categories[static_cast<std::size_t>(outer_category_)].add(elapsed);
         }
+        if (outer_category_ == Category::ClientWait) {
+            frame_.client_wait.add(elapsed, outer_client_wait_timeout_, outer_client_wait_flags_,
+                                   outer_client_wait_result_);
+        }
         if (isAlwaysSelected(outer_category_) && elapsed >= kSlowSelectedCallNs) {
             frame_.event_mask |= EventSlowSelectedCall;
             armCapture();
         }
         last_gl_exit_ns_ = now_ns;
+    }
+
+    // The wrapper records these after the backend returns, while the original
+    // GL scope is still active. A nested wrapper cannot steal ownership from the
+    // outer public call, and duplicate annotations retain first-writer identity.
+    void recordClientWait(std::uint32_t flags, std::uint64_t timeout, std::uint32_t result) noexcept {
+        if (gl_depth_ != 1 || outer_category_ != Category::ClientWait || outer_client_wait_recorded_) return;
+        outer_client_wait_timeout_ = classifyClientWaitTimeout(timeout);
+        outer_client_wait_flags_ = classifyClientWaitFlags(flags);
+        outer_client_wait_result_ = classifyClientWaitResult(result);
+        outer_client_wait_recorded_ = true;
     }
 
     // Some DSA functions implement one public operation through a nested GL
@@ -331,6 +427,7 @@ public:
         const std::uint64_t window_ns = elapsedNs(window_start_ns_, now_ns);
         if (window_ns < report_interval_ns_) return false;
 
+        report_.sequence = ++report_sequence_;
         report_.window_ns = window_ns;
         out = report_;
         report_ = {};
@@ -381,6 +478,35 @@ private:
         if (equals(name, "glWaitSync")) return Category::ServerWait;
         if (equals(name, "glFinish")) return Category::Finish;
         return Category::Count;
+    }
+
+    static ClientWaitTimeoutClass classifyClientWaitTimeout(std::uint64_t timeout) noexcept {
+        constexpr std::uint64_t int64_max =
+            static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+        if (timeout == 0) return ClientWaitTimeoutClass::Zero;
+        if (timeout < int64_max) return ClientWaitTimeoutClass::Finite;
+        if (timeout == int64_max) return ClientWaitTimeoutClass::Int64Max;
+        if (timeout == std::numeric_limits<std::uint64_t>::max()) return ClientWaitTimeoutClass::Ignored;
+        return ClientWaitTimeoutClass::Other;
+    }
+
+    static ClientWaitFlagsClass classifyClientWaitFlags(std::uint32_t flags) noexcept {
+        constexpr std::uint32_t sync_flush_commands_bit = 0x00000001U;
+        if (flags == 0) return ClientWaitFlagsClass::None;
+        if (flags == sync_flush_commands_bit) return ClientWaitFlagsClass::Flush;
+        return ClientWaitFlagsClass::Other;
+    }
+
+    static ClientWaitResultClass classifyClientWaitResult(std::uint32_t result) noexcept {
+        constexpr std::uint32_t already_signaled = 0x911AU;
+        constexpr std::uint32_t timeout_expired = 0x911BU;
+        constexpr std::uint32_t condition_satisfied = 0x911CU;
+        constexpr std::uint32_t wait_failed = 0x911DU;
+        if (result == already_signaled) return ClientWaitResultClass::AlreadySignaled;
+        if (result == condition_satisfied) return ClientWaitResultClass::ConditionSatisfied;
+        if (result == timeout_expired) return ClientWaitResultClass::TimeoutExpired;
+        if (result == wait_failed) return ClientWaitResultClass::WaitFailed;
+        return ClientWaitResultClass::Other;
     }
 
     static bool isAlwaysSelected(Category value) noexcept {
@@ -442,9 +568,14 @@ private:
     std::uint64_t present_start_ns_{0};
     std::uint64_t window_start_ns_{0};
     std::uint64_t frame_sequence_{0};
+    std::uint64_t report_sequence_{0};
     const char* outer_function_name_{nullptr};
     Category outer_category_{Category::Count};
     bool outer_buffer_bytes_recorded_{false};
+    bool outer_client_wait_recorded_{false};
+    ClientWaitTimeoutClass outer_client_wait_timeout_{ClientWaitTimeoutClass::Unclassified};
+    ClientWaitFlagsClass outer_client_wait_flags_{ClientWaitFlagsClass::Unclassified};
+    ClientWaitResultClass outer_client_wait_result_{ClientWaitResultClass::Unclassified};
     std::uint32_t capture_frames_remaining_{0};
     std::uint32_t capture_cooldown_frames_{0};
     std::uint32_t emitted_trace_frames_{0};

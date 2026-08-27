@@ -413,6 +413,90 @@ namespace {
         return fn;
     }
 
+#if AMCL_MG_FRAME_STATS
+    void logClientWaitBreakdown(const char* marker, std::uint64_t sequence,
+                                const mg::frame_stats::FrameCounters& counters) {
+        using mg::frame_stats::Category;
+        using mg::frame_stats::ClientWaitFlagsClass;
+        using mg::frame_stats::ClientWaitResultClass;
+        using mg::frame_stats::ClientWaitTimeoutClass;
+
+        const auto& total = counters.categories[static_cast<std::size_t>(Category::ClientWait)];
+        const auto& zero = mg::frame_stats::clientWaitTimeout(counters, ClientWaitTimeoutClass::Zero);
+        const auto& finite = mg::frame_stats::clientWaitTimeout(counters, ClientWaitTimeoutClass::Finite);
+        const auto& int64_max = mg::frame_stats::clientWaitTimeout(counters, ClientWaitTimeoutClass::Int64Max);
+        const auto& ignored = mg::frame_stats::clientWaitTimeout(counters, ClientWaitTimeoutClass::Ignored);
+        const auto& other = mg::frame_stats::clientWaitTimeout(counters, ClientWaitTimeoutClass::Other);
+        const auto& timeout_unclassified =
+            mg::frame_stats::clientWaitTimeout(counters, ClientWaitTimeoutClass::Unclassified);
+
+        LOG_I("[%s] schema=4 seq=%llu client_wait_calls=%llu client_wait_ms=%.3f client_wait_max_ms=%.3f "
+              "zero_calls=%llu zero_ms=%.3f zero_max_ms=%.3f finite_calls=%llu finite_ms=%.3f "
+              "finite_max_ms=%.3f i64max_calls=%llu i64max_ms=%.3f i64max_max_ms=%.3f "
+              "ignored_calls=%llu ignored_ms=%.3f ignored_max_ms=%.3f other_calls=%llu other_ms=%.3f "
+              "other_max_ms=%.3f unclassified_calls=%llu unclassified_ms=%.3f unclassified_max_ms=%.3f",
+              marker, static_cast<unsigned long long>(sequence), static_cast<unsigned long long>(total.calls),
+              static_cast<double>(total.total_ns) / 1.0e6, static_cast<double>(total.max_ns) / 1.0e6,
+              static_cast<unsigned long long>(zero.calls), static_cast<double>(zero.total_ns) / 1.0e6,
+              static_cast<double>(zero.max_ns) / 1.0e6, static_cast<unsigned long long>(finite.calls),
+              static_cast<double>(finite.total_ns) / 1.0e6, static_cast<double>(finite.max_ns) / 1.0e6,
+              static_cast<unsigned long long>(int64_max.calls), static_cast<double>(int64_max.total_ns) / 1.0e6,
+              static_cast<double>(int64_max.max_ns) / 1.0e6, static_cast<unsigned long long>(ignored.calls),
+              static_cast<double>(ignored.total_ns) / 1.0e6, static_cast<double>(ignored.max_ns) / 1.0e6,
+              static_cast<unsigned long long>(other.calls), static_cast<double>(other.total_ns) / 1.0e6,
+              static_cast<double>(other.max_ns) / 1.0e6,
+              static_cast<unsigned long long>(timeout_unclassified.calls),
+              static_cast<double>(timeout_unclassified.total_ns) / 1.0e6,
+              static_cast<double>(timeout_unclassified.max_ns) / 1.0e6)
+
+        const auto& flags_none = mg::frame_stats::clientWaitFlags(counters, ClientWaitFlagsClass::None);
+        const auto& flags_flush = mg::frame_stats::clientWaitFlags(counters, ClientWaitFlagsClass::Flush);
+        const auto& flags_other = mg::frame_stats::clientWaitFlags(counters, ClientWaitFlagsClass::Other);
+        const auto& flags_unclassified =
+            mg::frame_stats::clientWaitFlags(counters, ClientWaitFlagsClass::Unclassified);
+        LOG_I("[%s-FLAGS] schema=4 seq=%llu none_calls=%llu none_ms=%.3f none_max_ms=%.3f "
+              "flush_calls=%llu flush_ms=%.3f flush_max_ms=%.3f other_calls=%llu other_ms=%.3f "
+              "other_max_ms=%.3f unclassified_calls=%llu unclassified_ms=%.3f unclassified_max_ms=%.3f",
+              marker, static_cast<unsigned long long>(sequence), static_cast<unsigned long long>(flags_none.calls),
+              static_cast<double>(flags_none.total_ns) / 1.0e6, static_cast<double>(flags_none.max_ns) / 1.0e6,
+              static_cast<unsigned long long>(flags_flush.calls), static_cast<double>(flags_flush.total_ns) / 1.0e6,
+              static_cast<double>(flags_flush.max_ns) / 1.0e6, static_cast<unsigned long long>(flags_other.calls),
+              static_cast<double>(flags_other.total_ns) / 1.0e6,
+              static_cast<double>(flags_other.max_ns) / 1.0e6,
+              static_cast<unsigned long long>(flags_unclassified.calls),
+              static_cast<double>(flags_unclassified.total_ns) / 1.0e6,
+              static_cast<double>(flags_unclassified.max_ns) / 1.0e6)
+
+        const auto& already =
+            mg::frame_stats::clientWaitResult(counters, ClientWaitResultClass::AlreadySignaled);
+        const auto& satisfied =
+            mg::frame_stats::clientWaitResult(counters, ClientWaitResultClass::ConditionSatisfied);
+        const auto& timeout =
+            mg::frame_stats::clientWaitResult(counters, ClientWaitResultClass::TimeoutExpired);
+        const auto& failed = mg::frame_stats::clientWaitResult(counters, ClientWaitResultClass::WaitFailed);
+        const auto& result_other = mg::frame_stats::clientWaitResult(counters, ClientWaitResultClass::Other);
+        const auto& result_unclassified =
+            mg::frame_stats::clientWaitResult(counters, ClientWaitResultClass::Unclassified);
+        LOG_I("[%s-RESULT] schema=4 seq=%llu already_calls=%llu already_ms=%.3f already_max_ms=%.3f "
+              "satisfied_calls=%llu satisfied_ms=%.3f satisfied_max_ms=%.3f timeout_calls=%llu "
+              "timeout_ms=%.3f timeout_max_ms=%.3f failed_calls=%llu failed_ms=%.3f failed_max_ms=%.3f "
+              "other_calls=%llu other_ms=%.3f other_max_ms=%.3f unclassified_calls=%llu "
+              "unclassified_ms=%.3f unclassified_max_ms=%.3f",
+              marker, static_cast<unsigned long long>(sequence), static_cast<unsigned long long>(already.calls),
+              static_cast<double>(already.total_ns) / 1.0e6, static_cast<double>(already.max_ns) / 1.0e6,
+              static_cast<unsigned long long>(satisfied.calls), static_cast<double>(satisfied.total_ns) / 1.0e6,
+              static_cast<double>(satisfied.max_ns) / 1.0e6, static_cast<unsigned long long>(timeout.calls),
+              static_cast<double>(timeout.total_ns) / 1.0e6, static_cast<double>(timeout.max_ns) / 1.0e6,
+              static_cast<unsigned long long>(failed.calls), static_cast<double>(failed.total_ns) / 1.0e6,
+              static_cast<double>(failed.max_ns) / 1.0e6, static_cast<unsigned long long>(result_other.calls),
+              static_cast<double>(result_other.total_ns) / 1.0e6,
+              static_cast<double>(result_other.max_ns) / 1.0e6,
+              static_cast<unsigned long long>(result_unclassified.calls),
+              static_cast<double>(result_unclassified.total_ns) / 1.0e6,
+              static_cast<double>(result_unclassified.max_ns) / 1.0e6)
+    }
+#endif
+
     void finishFrameStats() {
 #if AMCL_MG_FRAME_STATS
         mg::frame_stats::Report report{};
@@ -439,7 +523,7 @@ namespace {
             const auto& server_wait = mg::frame_stats::category(trace, mg::frame_stats::Category::ServerWait);
             const auto& finish = mg::frame_stats::category(trace, mg::frame_stats::Category::Finish);
 
-            LOG_I("[MG-FRAME-TRACE] schema=3 seq=%llu frame_ms=%.3f events=0x%x causal=%d "
+            LOG_I("[MG-FRAME-TRACE] schema=4 seq=%llu frame_ms=%.3f events=0x%x causal=%d "
                   "observed_calls=%llu observed_ms=%.3f outside_ms=%.3f outside_gap_max_ms=%.3f "
                   "present_ms=%.3f present_max_ms=%.3f slowest=%s slowest_ms=%.3f",
                   static_cast<unsigned long long>(trace.sequence), static_cast<double>(trace.frame_ns) / 1.0e6,
@@ -449,7 +533,7 @@ namespace {
                   static_cast<double>(c.present.total_ns) / 1.0e6,
                   static_cast<double>(c.present.max_ns) / 1.0e6,
                   c.slowest.name ? c.slowest.name : "none", static_cast<double>(c.slowest.duration_ns) / 1.0e6)
-            LOG_I("[MG-FRAME-TRACE-BUFFER] schema=3 seq=%llu terrain_calls=%llu terrain_staged=%llu terrain_mib=%.3f "
+            LOG_I("[MG-FRAME-TRACE-BUFFER] schema=4 seq=%llu terrain_calls=%llu terrain_staged=%llu terrain_mib=%.3f "
                   "subdata_calls=%llu subdata_ms=%.3f subdata_max_ms=%.3f copy_calls=%llu copy_ms=%.3f "
                   "map_calls=%llu map_mib=%.3f map_ms=%.3f flush_calls=%llu flush_mib=%.3f flush_ms=%.3f "
                   "flush_max_ms=%.3f flush_suppressed=%llu unmap_calls=%llu unmap_ms=%.3f "
@@ -469,7 +553,7 @@ namespace {
                   static_cast<double>(stage.total_ns) / 1.0e6, static_cast<double>(stage.max_ns) / 1.0e6,
                   static_cast<double>(terrain_copy.total_ns) / 1.0e6,
                   static_cast<double>(terrain_copy.max_ns) / 1.0e6)
-            LOG_I("[MG-FRAME-TRACE-PIPE] schema=3 seq=%llu fbo_calls=%llu fbo_ms=%.3f fbo_max_ms=%.3f "
+            LOG_I("[MG-FRAME-TRACE-PIPE] schema=4 seq=%llu fbo_calls=%llu fbo_ms=%.3f fbo_max_ms=%.3f "
                   "draw_calls=%llu draw_ms=%.3f draw_max_ms=%.3f dispatch_calls=%llu dispatch_ms=%.3f "
                   "barrier_calls=%llu barrier_ms=%.3f texture_calls=%llu texture_ms=%.3f "
                   "fence_calls=%llu fence_ms=%.3f client_wait_calls=%llu client_wait_ms=%.3f "
@@ -486,6 +570,7 @@ namespace {
                   static_cast<unsigned long long>(server_wait.calls),
                   static_cast<double>(server_wait.total_ns) / 1.0e6,
                   static_cast<unsigned long long>(finish.calls), static_cast<double>(finish.total_ns) / 1.0e6)
+            logClientWaitBreakdown("MG-FRAME-TRACE-WAIT", trace.sequence, c);
         }
 
         if (!report_ready) return;
@@ -521,12 +606,13 @@ namespace {
 #else
         constexpr const char* coverage = "causal_buffer_sync";
 #endif
-        LOG_I("[MG-FRAME-STATS] schema=3 mode=observe_only coverage=%s window_ms=%.1f frames=%llu fps=%.2f "
+        LOG_I("[MG-FRAME-STATS] schema=4 seq=%llu mode=observe_only coverage=%s window_ms=%.1f frames=%llu fps=%.2f "
               "frame_avg_ms=%.3f frame_p50_le_ms=%u frame_p95_le_ms=%u frame_p99_le_ms=%u frame_max_ms=%.3f "
               "observed_calls=%llu observed_ms=%.3f other_ms=%.3f other_gap_max_ms=%.3f present_ms=%.3f "
               "present_max_ms=%.3f "
               "residual_ms=%.3f events=0x%x causal=%d slowest=%s slowest_ms=%.3f",
-              coverage, static_cast<double>(report.window_ns) / 1.0e6,
+              static_cast<unsigned long long>(report.sequence), coverage,
+              static_cast<double>(report.window_ns) / 1.0e6,
               static_cast<unsigned long long>(report.frames), fps,
               frame_avg_ms, mg::frame_stats::percentileUpperMs(report, 50),
               mg::frame_stats::percentileUpperMs(report, 95), mg::frame_stats::percentileUpperMs(report, 99),
@@ -541,13 +627,14 @@ namespace {
               report.counters.causal_capture ? 1 : 0,
               report.counters.slowest.name ? report.counters.slowest.name : "none",
               static_cast<double>(report.counters.slowest.duration_ns) / 1.0e6)
-        LOG_I("[MG-FRAME-STATS-BUFFER] schema=3 subdata_calls=%llu input_mib=%.3f subdata_ms=%.3f subdata_max_ms=%.3f "
+        LOG_I("[MG-FRAME-STATS-BUFFER] schema=4 seq=%llu subdata_calls=%llu input_mib=%.3f subdata_ms=%.3f subdata_max_ms=%.3f "
               "copy_calls=%llu copy_ms=%.3f copy_max_ms=%.3f map_calls=%llu map_mib=%.3f map_ms=%.3f map_max_ms=%.3f "
               "flush_calls=%llu flush_mib=%.3f flush_ms=%.3f flush_max_ms=%.3f flush_suppressed=%llu "
               "unmap_calls=%llu unmap_ms=%.3f terrain_calls=%llu terrain_staged=%llu terrain_mib=%.3f "
               "orphan_ms=%.3f orphan_max_ms=%.3f staging_ms=%.3f staging_max_ms=%.3f "
               "terrain_copy_ms=%.3f terrain_copy_max_ms=%.3f",
-              static_cast<unsigned long long>(sub.calls), static_cast<double>(report.counters.buffer_bytes) / 1048576.0,
+              static_cast<unsigned long long>(report.sequence), static_cast<unsigned long long>(sub.calls),
+              static_cast<double>(report.counters.buffer_bytes) / 1048576.0,
               static_cast<double>(sub.total_ns) / 1.0e6, static_cast<double>(sub.max_ns) / 1.0e6,
               static_cast<unsigned long long>(copy.calls), static_cast<double>(copy.total_ns) / 1.0e6,
               static_cast<double>(copy.max_ns) / 1.0e6, static_cast<unsigned long long>(map.calls),
@@ -564,11 +651,12 @@ namespace {
               static_cast<double>(stage.total_ns) / 1.0e6, static_cast<double>(stage.max_ns) / 1.0e6,
               static_cast<double>(terrain_copy.total_ns) / 1.0e6,
               static_cast<double>(terrain_copy.max_ns) / 1.0e6)
-        LOG_I("[MG-FRAME-STATS-PIPE] schema=3 fbo_calls=%llu fbo_ms=%.3f fbo_max_ms=%.3f draw_calls=%llu "
+        LOG_I("[MG-FRAME-STATS-PIPE] schema=4 seq=%llu fbo_calls=%llu fbo_ms=%.3f fbo_max_ms=%.3f draw_calls=%llu "
               "draw_ms=%.3f draw_max_ms=%.3f dispatch_calls=%llu dispatch_ms=%.3f barrier_calls=%llu barrier_ms=%.3f "
               "texture_calls=%llu texture_ms=%.3f fence_calls=%llu fence_ms=%.3f client_wait_calls=%llu "
               "client_wait_ms=%.3f server_wait_calls=%llu server_wait_ms=%.3f finish_calls=%llu finish_ms=%.3f",
-              static_cast<unsigned long long>(fbo.calls), static_cast<double>(fbo.total_ns) / 1.0e6,
+              static_cast<unsigned long long>(report.sequence), static_cast<unsigned long long>(fbo.calls),
+              static_cast<double>(fbo.total_ns) / 1.0e6,
               static_cast<double>(fbo.max_ns) / 1.0e6, static_cast<unsigned long long>(draw.calls),
               static_cast<double>(draw.total_ns) / 1.0e6, static_cast<double>(draw.max_ns) / 1.0e6,
               static_cast<unsigned long long>(dispatch.calls), static_cast<double>(dispatch.total_ns) / 1.0e6,
@@ -578,6 +666,7 @@ namespace {
               static_cast<unsigned long long>(client_wait.calls), static_cast<double>(client_wait.total_ns) / 1.0e6,
               static_cast<unsigned long long>(server_wait.calls), static_cast<double>(server_wait.total_ns) / 1.0e6,
               static_cast<unsigned long long>(finish.calls), static_cast<double>(finish.total_ns) / 1.0e6)
+        logClientWaitBreakdown("MG-FRAME-STATS-WAIT", report.sequence, report.counters);
 #endif
     }
 

@@ -230,7 +230,10 @@ NATIVE_FUNCTION_HEAD(void, glDrawArraysInstanced, GLenum mode, GLint first, GLsi
 NATIVE_FUNCTION_HEAD(GLsync, glFenceSync, GLenum condition, GLbitfield flags) MG_FRAME_STATS_SELECTED_GL_SCOPE() NATIVE_FUNCTION_END(GLsync, glFenceSync, condition,flags)
 NATIVE_FUNCTION_HEAD(GLboolean, glIsSync, GLsync sync) NATIVE_FUNCTION_END(GLboolean, glIsSync, sync)
 NATIVE_FUNCTION_HEAD(void, glDeleteSync, GLsync sync) NATIVE_FUNCTION_END_NO_RETURN(void, glDeleteSync, sync)
-NATIVE_FUNCTION_HEAD(GLenum, glClientWaitSync, GLsync sync, GLbitfield flags, GLuint64 timeout) MG_FRAME_STATS_SELECTED_GL_SCOPE() NATIVE_FUNCTION_END(GLenum, glClientWaitSync, sync,flags,timeout)
+NATIVE_FUNCTION_HEAD(GLenum, glClientWaitSync, GLsync sync, GLbitfield flags, GLuint64 timeout)
+    MG_FRAME_STATS_SELECTED_GL_SCOPE()
+    NATIVE_FUNCTION_END_WITH_RESULT_OBSERVER(
+        GLenum, glClientWaitSync, mg::frame_stats::recordClientWait(flags, timeout, ret), sync,flags,timeout)
 NATIVE_FUNCTION_HEAD(void, glWaitSync, GLsync sync, GLbitfield flags, GLuint64 timeout) MG_FRAME_STATS_SELECTED_GL_SCOPE() NATIVE_FUNCTION_END_NO_RETURN(void, glWaitSync, sync,flags,timeout)
 // NATIVE_FUNCTION_HEAD(void, glGetInteger64v, GLenum pname, GLint64 *data) NATIVE_FUNCTION_END_NO_RETURN(void, glGetInteger64v, pname,data)   // moved to gl/enable.cpp so it agrees with glIsEnabled
 NATIVE_FUNCTION_HEAD(void, glGetSynciv, GLsync sync, GLenum pname, GLsizei bufSize, GLsizei *length, GLint *values) NATIVE_FUNCTION_END_NO_RETURN(void, glGetSynciv, sync,pname,bufSize,length,values)

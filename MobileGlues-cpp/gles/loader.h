@@ -153,10 +153,25 @@ extern "C"
     if (ERR != GL_NO_ERROR) LOG_E("ERROR: %d", ERR)                                                                    \
     return ret;                                                                                                        \
     }
+#define NATIVE_FUNCTION_END_WITH_RESULT_OBSERVER(type, name, observer, ...)                                            \
+    LOG_D("Use native function: %s @ %s(...)", RENDERERNAME, __FUNCTION__);                                            \
+    type ret = GLES.name(__VA_ARGS__);                                                                                 \
+    observer;                                                                                                          \
+    GLenum ERR = GLES.glGetError();                                                                                    \
+    if (ERR != GL_NO_ERROR) LOG_E("ERROR: %d", ERR)                                                                    \
+    return ret;                                                                                                        \
+    }
 #else
 #define NATIVE_FUNCTION_END(type, name, ...)                                                                           \
     LOG_D("Use native function: %s @ %s(...)", RENDERERNAME, __FUNCTION__);                                            \
     type ret = GLES.name(__VA_ARGS__);                                                                                 \
+    CHECK_GL_ERROR                                                                                                     \
+    return ret;                                                                                                        \
+    }
+#define NATIVE_FUNCTION_END_WITH_RESULT_OBSERVER(type, name, observer, ...)                                            \
+    LOG_D("Use native function: %s @ %s(...)", RENDERERNAME, __FUNCTION__);                                            \
+    type ret = GLES.name(__VA_ARGS__);                                                                                 \
+    observer;                                                                                                          \
     CHECK_GL_ERROR                                                                                                     \
     return ret;                                                                                                        \
     }
