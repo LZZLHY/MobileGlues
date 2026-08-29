@@ -424,6 +424,23 @@ public:
             --capture_cooldown_frames_;
         }
 
+        // Fifth arming trigger: the slow frame itself. The other four are all GL
+        // event driven, so a client whose slow frames contain no MG terrain
+        // upload, no persistent map, no explicit flush and no >= 1 ms always-on
+        // call opened the window for none of them. Measured on device: a 4315 ms
+        // frame whose 4239 ms was a single gap containing no always-on GL call at
+        // all. kUnarmedTraceFrameNs already emitted a trace for such a frame, but
+        // because nothing armed the window every causal category inside that
+        // trace read zero -- it named the slow frame without naming where the
+        // time went. Arming here is what gives that trace its contents.
+        //
+        // Deliberately placed after the countdown above so a full kCaptureFrames
+        // window is granted and kCaptureCooldownFrames is honoured: the observed
+        // fraction stays bounded at kCaptureFrames/(kCaptureFrames +
+        // kCaptureCooldownFrames), which is why this cannot regress into the
+        // exhaustive mode's whole-frame timing cost.
+        if (frame_ns >= kSlowFrameNs) armCapture();
+
         const std::uint64_t window_ns = elapsedNs(window_start_ns_, now_ns);
         if (window_ns < report_interval_ns_) return false;
 
@@ -509,19 +526,31 @@ private:
         return ClientWaitResultClass::Other;
     }
 
+    // BufferAllocation belongs here, not in causalCategory(): it is a buffer call
+    // like every other member, and on a pre-1.20 client it carries essentially all
+    // per-frame buffer traffic. Measured on device (1.18.2, Fabric 0.19.3):
+    // subdata/copy/map/flush/unmap/terrain call counts are all zero, so while this
+    // category was causal-only the always-on surface was nearly empty and none of
+    // the four GL-event arming triggers could fire -- no MG terrain fast path, no
+    // glMapBufferRange, no glFlushMappedBufferRange, and no always-on call
+    // reaching kSlowSelectedCallNs. Same build before/after this change: glBufferData
+    // went from never being the window's slowest observed call to being it in
+    // 275 of 275 report windows.
     static bool isAlwaysSelected(Category value) noexcept {
         return value == Category::BufferSubData || value == Category::BufferCopy ||
                value == Category::BufferMap || value == Category::BufferFlush ||
-               value == Category::BufferUnmap || value == Category::Fence ||
-               value == Category::ClientWait || value == Category::ServerWait ||
-               value == Category::Finish;
+               value == Category::BufferUnmap || value == Category::BufferAllocation ||
+               value == Category::Fence || value == Category::ClientWait ||
+               value == Category::ServerWait || value == Category::Finish;
     }
 
+    // Kept disjoint from isAlwaysSelected() so a category is sampled under
+    // exactly one policy.
     static bool causalCategory(Category value) noexcept {
-        return value == Category::BufferAllocation || value == Category::FramebufferBind ||
-               value == Category::Draw || value == Category::Dispatch ||
-               value == Category::MemoryBarrier || value == Category::TextureUpload ||
-               value == Category::ShaderCompile || value == Category::ProgramLink;
+        return value == Category::FramebufferBind || value == Category::Draw ||
+               value == Category::Dispatch || value == Category::MemoryBarrier ||
+               value == Category::TextureUpload || value == Category::ShaderCompile ||
+               value == Category::ProgramLink;
     }
 
     static const char* categoryName(Category value) noexcept {

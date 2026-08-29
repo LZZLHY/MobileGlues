@@ -1492,6 +1492,12 @@ extern "C" void mg_buffer_upload_context_release(void) noexcept {
 
 void glBufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage) {
     LOG()
+    // Always-on rather than causal-only: on a pre-1.20 vanilla client this is the
+    // only per-frame buffer write path, and none of the four armCapture() triggers
+    // can fire there, so a causal-only scope reported observed=0% and left slow
+    // frames unattributable. See isAlwaysSelected() in gl/frame_stats_core.h for
+    // the full precondition. Nested DSA forwarding is depth-deduplicated.
+    MG_FRAME_STATS_SELECTED_GL_SCOPE()
     LOG_D("glBufferData, target = %s, size = %d, data = 0x%x, usage = %s", glEnumToString(target), size, data,
           glEnumToString(usage))
     const GLuint frontend = find_bound_buffer_by_target(target);
@@ -1750,6 +1756,9 @@ GLboolean glUnmapBuffer(GLenum target) {
 
 void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfield flags) {
     LOG()
+    // Same policy as glBufferData: the whole BufferAllocation category is
+    // always-on so allocation cost stays visible without a causal window.
+    MG_FRAME_STATS_SELECTED_GL_SCOPE()
     const GLuint frontend = find_bound_buffer_by_target(target);
     if (frontend != 0 && frontend < g_buffer_storage_contracts.size() &&
         g_buffer_storage_contracts[frontend].immutable) {

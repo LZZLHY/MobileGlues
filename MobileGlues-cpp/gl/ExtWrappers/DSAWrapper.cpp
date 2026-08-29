@@ -207,6 +207,9 @@ void glCreateBuffers(GLsizei n, GLuint* buffers) {
 
 void glNamedBufferStorage(GLuint buffer, GLsizeiptr size, const void* data, GLbitfield flags) {
     LOG()
+    // Owns the timing for the whole DSA operation; the glBufferStorage call below
+    // sees insideGlCall() and does not double count. Mirrors glNamedBufferSubData.
+    MG_FRAME_STATS_SELECTED_GL_SCOPE()
     LOG_D("[DSA] glNamedBufferStorage, buffer: %u, size: %lld, data: %p, flags: %u", buffer, size, data, flags);
 
     if (buffer == 0 || size <= 0) {
@@ -224,6 +227,9 @@ void glNamedBufferStorage(GLuint buffer, GLsizeiptr size, const void* data, GLbi
 
 void glNamedBufferData(GLuint buffer, GLsizeiptr size, const void* data, GLenum usage) {
     LOG()
+    // Owns the timing for the whole DSA operation; the glBufferData call below sees
+    // insideGlCall() and does not double count. Mirrors glNamedBufferSubData.
+    MG_FRAME_STATS_SELECTED_GL_SCOPE()
     LOG_D("[DSA] glNamedBufferData, buffer: %u, size: %lld, data: %p, usage: %u", buffer, size, data, usage);
 
     if (buffer == 0 || size <= 0) {
