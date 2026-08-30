@@ -17,6 +17,15 @@
 
 #define DEBUG 0
 
+// The upload-path probe below is a diagnostic, and a diagnostic that cannot be
+// compiled out is not a diagnostic but a permanent cost. Default off: it answers
+// a question (which enum pairs a client actually passes) that is answered once
+// per client, not continuously, and its call site is reached on every single
+// texture upload.
+#ifndef AMCL_MG_UPLOAD_PROBE
+#define AMCL_MG_UPLOAD_PROBE 0
+#endif
+
 // GL 3.0 enums that live in glext.h, which not every include path pulls in.
 #ifndef GL_BGR_INTEGER
 #define GL_BGR_INTEGER 0x8D9A
@@ -254,6 +263,8 @@ mg_unpack_state_t current_unpack_state() {
     return st;
 }
 
+#if AMCL_MG_UPLOAD_PROBE
+
 // ── Upload path probe ────────────────────────────────────────────────────────
 // Answers the one question static reading of this file cannot: does a real client
 // take the fast path (the enum pair is one GLES accepts, find_upload_rule returns
@@ -273,8 +284,17 @@ mg_unpack_state_t current_unpack_state() {
 // Cost per upload: one increment plus a linear scan of a bucket table that stays
 // single-digit in practice, and one group of log lines every
 // k_probe_report_interval uploads. It reads no clock, allocates nothing and issues
-// no GL call -- which is why it can stay on without becoming an observer effect on
-// the very number it is measuring.
+// no GL call.
+//
+// That list was originally written as the reason this could stay on without
+// becoming an observer effect on the very number it is measuring. It does not
+// support that conclusion, and the claim is withdrawn. "Cheap per call" is not
+// "free", the multiplier here is every texture upload the client makes (about 60
+// per frame on 1.18.2), and the function-local thread_local costs a guard check
+// plus a TLS lookup on top of the arithmetic. Nothing measured it against the
+// frame rate, so it was an assumption wearing a cost model. Hence the compile
+// switch above: the honest form of this claim is an A/B, and until one exists the
+// probe is off in shipping builds.
 //
 // The four call sites need no extra argument to tell apart: (want_format != 0,
 // three_d) maps exactly onto glTexSubImage2D / glTexImage2D / glTexSubImage3D /
@@ -348,6 +368,8 @@ void upload_probe_note(GLenum format, GLenum type, GLenum want_format, bool thre
     }
 }
 
+#endif // AMCL_MG_UPLOAD_PROBE
+
 } // namespace
 
 bool mg_upload_has_data(const void* pixels) {
@@ -367,10 +389,12 @@ mg_upload_fix_t::mg_upload_fix_t(GLsizei width, GLsizei height, GLsizei depth, G
     has_data_ = mg_upload_has_data(pixels_in);
 
     const upload_rule_t* rule = find_upload_rule(format_in, type_in, want_format);
+#if AMCL_MG_UPLOAD_PROBE
     // Recorded before the early return below so a dropped upload still counts: the
     // question the probe answers is which enum pairs arrive here, not which ones
     // reached the driver.
     upload_probe_note(format_in, type_in, want_format, three_d, rule != nullptr);
+#endif
     if (!rule) {
         if (is_reversed_family(format_in, type_in)) {
             TR_WARN_ONCE("pixel transfer: unhandled combination %s + %s, the driver will reject this upload",

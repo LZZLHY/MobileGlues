@@ -18,6 +18,31 @@
 #define AMCL_MG_FRAME_STATS_EXHAUSTIVE 0
 #endif
 
+// Whether the per-GL-call scopes are compiled at all. This is a second axis, not
+// a second name for AMCL_MG_FRAME_STATS.
+//
+// AMCL_MG_FRAME_STATS used to control two things that cost four orders of
+// magnitude apart: the present-boundary frame accounting (one clock pair per
+// frame -- tens per second) and the scope installed on GL wrappers (tens to
+// hundreds of thousands per second). Turning the observer off to measure its own
+// cost therefore also removed the frame rate it was being measured against,
+// which is the one number an A/B of this needs to keep.
+//
+// With this at 0 the wrapper scopes become the same statement the optimiser
+// removes that AMCL_MG_FRAME_STATS=0 produces, while presentBegin/presentEnd and
+// the report keep emitting: fps, frame_ms percentiles and present_ms stay
+// comparable against every session recorded before the switch existed.
+// observed_calls and the per-category rows read zero, and that zero means "not
+// instrumented", never "did not happen" -- the same reading rule the causal
+// coverage already required.
+#ifndef AMCL_MG_FRAME_STATS_GL_SCOPES
+#define AMCL_MG_FRAME_STATS_GL_SCOPES 1
+#endif
+
+#if AMCL_MG_FRAME_STATS_EXHAUSTIVE && !AMCL_MG_FRAME_STATS_GL_SCOPES
+#error "AMCL_MG_FRAME_STATS_EXHAUSTIVE times every wrapped call and cannot be combined with AMCL_MG_FRAME_STATS_GL_SCOPES=0"
+#endif
+
 #if AMCL_MG_FRAME_STATS
 
 #include <ctime>
@@ -90,12 +115,28 @@ inline bool presentEnd(Report& report, FrameTrace* trace = nullptr) noexcept {
 #if AMCL_MG_FRAME_STATS_EXHAUSTIVE
 #define MG_FRAME_STATS_ALL_GL_SCOPE() MG_FRAME_STATS_SCOPE(Exhaustive)
 #define MG_FRAME_STATS_SELECTED_GL_SCOPE() ((void)0);
-#else
+#elif AMCL_MG_FRAME_STATS_GL_SCOPES
 // In selective mode every wrapper pays only a predictable inactive branch.
 // During a two-frame causal window the scope clocks only draw/FBO/dispatch/
 // barrier/texture/shader calls; ordinary state/query calls remain untouched.
+//
+// "Only a branch" describes the unarmed state, and what arms the window is not
+// under this file's control: presentEnd() arms on any frame at or over
+// kSlowFrameNs, so below that frame rate the causal window is open for its
+// bounded duty cycle continuously rather than around an event. The always-on
+// Selected scope has no window at all -- it clocks every call it is installed on,
+// and on a pre-1.20 client glBufferData carries the whole per-frame buffer path.
+// Both are deliberate; this switch is how their combined cost gets measured
+// instead of argued about.
 #define MG_FRAME_STATS_ALL_GL_SCOPE() MG_FRAME_STATS_SCOPE(Causal)
 #define MG_FRAME_STATS_SELECTED_GL_SCOPE() MG_FRAME_STATS_SCOPE(Selected)
+#else
+// Frame-boundary accounting only. No wrapper installs a scope, so no GL call
+// reads a clock, classifies a function name, or touches the collector's
+// thread-local -- while the report still names the frame rate those calls are
+// being blamed for.
+#define MG_FRAME_STATS_ALL_GL_SCOPE() ((void)0);
+#define MG_FRAME_STATS_SELECTED_GL_SCOPE() ((void)0);
 #endif
 
 #else
