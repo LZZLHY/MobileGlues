@@ -254,6 +254,100 @@ mg_unpack_state_t current_unpack_state() {
     return st;
 }
 
+// ── Upload path probe ────────────────────────────────────────────────────────
+// Answers the one question static reading of this file cannot: does a real client
+// take the fast path (the enum pair is one GLES accepts, find_upload_rule returns
+// nullptr, and the caller's pointer goes straight to the driver -- no conversion,
+// no glPixelStorei, no synchronization point) or the slow path (a rule matches, so
+// every pixel goes through a function pointer, twelve glPixelStorei calls bracket
+// the upload, and a bound unpack PBO additionally forces glMapBufferRange(READ))?
+// The two differ by orders of magnitude in what this layer itself costs, and which
+// enum pair Minecraft passes cannot be derived here -- LOG_D is compiled out of
+// release builds.
+//
+// The verdict is the slow/total ratio. Near zero means the time a profiler sees
+// inside glTexSubImage2D is the driver's own cost and this layer has nothing to
+// give back; a significant share means that part is this layer's own work and is
+// worth optimizing.
+//
+// Cost per upload: one increment plus a linear scan of a bucket table that stays
+// single-digit in practice, and one group of log lines every
+// k_probe_report_interval uploads. It reads no clock, allocates nothing and issues
+// no GL call -- which is why it can stay on without becoming an observer effect on
+// the very number it is measuring.
+//
+// The four call sites need no extra argument to tell apart: (want_format != 0,
+// three_d) maps exactly onto glTexSubImage2D / glTexImage2D / glTexSubImage3D /
+// glTexImage3D.
+constexpr unsigned long long k_probe_report_interval = 2048ull;
+constexpr size_t k_probe_max_buckets = 24;
+
+struct upload_probe_bucket_t {
+    GLenum format;
+    GLenum type;
+    bool has_want;
+    bool three_d;
+    bool converted;
+    unsigned long long count;
+};
+
+struct upload_probe_state_t {
+    upload_probe_bucket_t buckets[k_probe_max_buckets];
+    size_t used;
+    unsigned long long total;
+    unsigned long long converted;
+    unsigned long long unbucketed;
+};
+
+upload_probe_state_t& upload_probe() {
+    static thread_local upload_probe_state_t state{};
+    return state;
+}
+
+void upload_probe_note(GLenum format, GLenum type, GLenum want_format, bool three_d, bool converted) {
+    upload_probe_state_t& st = upload_probe();
+    ++st.total;
+    if (converted) ++st.converted;
+
+    const bool has_want = want_format != 0;
+    upload_probe_bucket_t* slot = nullptr;
+    for (size_t i = 0; i < st.used; ++i) {
+        upload_probe_bucket_t& b = st.buckets[i];
+        if (b.format == format && b.type == type && b.has_want == has_want && b.three_d == three_d &&
+            b.converted == converted) {
+            slot = &b;
+            break;
+        }
+    }
+    if (slot != nullptr) {
+        ++slot->count;
+    } else if (st.used < k_probe_max_buckets) {
+        slot = &st.buckets[st.used++];
+        slot->format = format;
+        slot->type = type;
+        slot->has_want = has_want;
+        slot->three_d = three_d;
+        slot->converted = converted;
+        slot->count = 1;
+    } else {
+        // The table is a fixed array on purpose: a diagnostic must not be able to
+        // grow without bound on a hostile enum stream. Anything past it is still
+        // counted in total/converted, so the verdict ratio stays correct.
+        ++st.unbucketed;
+    }
+
+    if (st.total % k_probe_report_interval != 0) return;
+
+    LOG_I("[MG-UPLOAD-PROBE] schema=1 total=%llu slow=%llu fast=%llu buckets=%zu unbucketed=%llu", st.total,
+          st.converted, st.total - st.converted, st.used, st.unbucketed)
+    for (size_t i = 0; i < st.used; ++i) {
+        const upload_probe_bucket_t& b = st.buckets[i];
+        LOG_I("[MG-UPLOAD-PROBE-BUCKET] schema=1 path=%s format=%s type=%s dim=%s want=%d count=%llu",
+              b.converted ? "slow" : "fast", glEnumToString(b.format), glEnumToString(b.type),
+              b.three_d ? "3d" : "2d", b.has_want ? 1 : 0, b.count)
+    }
+}
+
 } // namespace
 
 bool mg_upload_has_data(const void* pixels) {
@@ -273,6 +367,10 @@ mg_upload_fix_t::mg_upload_fix_t(GLsizei width, GLsizei height, GLsizei depth, G
     has_data_ = mg_upload_has_data(pixels_in);
 
     const upload_rule_t* rule = find_upload_rule(format_in, type_in, want_format);
+    // Recorded before the early return below so a dropped upload still counts: the
+    // question the probe answers is which enum pairs arrive here, not which ones
+    // reached the driver.
+    upload_probe_note(format_in, type_in, want_format, three_d, rule != nullptr);
     if (!rule) {
         if (is_reversed_family(format_in, type_in)) {
             TR_WARN_ONCE("pixel transfer: unhandled combination %s + %s, the driver will reject this upload",
