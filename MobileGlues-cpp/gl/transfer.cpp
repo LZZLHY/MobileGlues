@@ -288,13 +288,22 @@ mg_unpack_state_t current_unpack_state() {
 //
 // That list was originally written as the reason this could stay on without
 // becoming an observer effect on the very number it is measuring. It does not
-// support that conclusion, and the claim is withdrawn. "Cheap per call" is not
-// "free", the multiplier here is every texture upload the client makes (about 60
-// per frame on 1.18.2), and the function-local thread_local costs a guard check
-// plus a TLS lookup on top of the arithmetic. Nothing measured it against the
-// frame rate, so it was an assumption wearing a cost model. Hence the compile
-// switch above: the honest form of this claim is an A/B, and until one exists the
-// probe is off in shipping builds.
+// support that conclusion, and the claim is withdrawn -- not because the cost is
+// large, but because nothing had measured it. "Cheap per call" is not "free", the
+// multiplier here is every texture upload the client makes (about 60 per frame on
+// 1.18.2), and the function-local thread_local costs a guard check plus a TLS
+// lookup on top of the arithmetic. That is an argument for measuring, which is
+// what the switch above is for.
+//
+// The A/B has since been run (2026-08-30, Maleoon 920, MC 1.18.2 vanilla): this
+// probe and the frame-stats GL scopes off together did not raise the active-world
+// present rate over the same build with all of it on, and the session with almost
+// no instrumentation at all was the slowest of the set. So the honest statement is
+// neither the original claim nor its opposite: the per-call work is real and the
+// switch belongs here, but this probe is not what sets that client's frame rate.
+// It stays off in shipping builds because a diagnostic answering a question that
+// does not change while a client runs has no business being resident -- not
+// because turning it off made anything faster.
 //
 // The four call sites need no extra argument to tell apart: (want_format != 0,
 // three_d) maps exactly onto glTexSubImage2D / glTexImage2D / glTexSubImage3D /

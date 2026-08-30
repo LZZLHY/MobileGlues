@@ -35,6 +35,18 @@
 // observed_calls and the per-category rows read zero, and that zero means "not
 // instrumented", never "did not happen" -- the same reading rule the causal
 // coverage already required.
+//
+// ⭐ What the first A/B this made possible actually said (2026-08-30, Maleoon 920,
+// MC 1.18.2 vanilla, same world and settings, active-world present rate):
+//
+//   obs_calls(max)=2      weighted 24.48   p50 23.39     (instrumentation absent)
+//   obs_calls(max)=81903  weighted 46.18   p50 43.89     (everything on)
+//   obs_calls(max)=0      weighted 42.38   p50 39.54     (this switch at 0)
+//
+// The run with no instrumentation is the slowest of the three. Turning the scopes
+// off did not beat leaving them on. Whatever these scopes cost on this client, it
+// is not what sets its frame rate -- so this switch is a measurement tool and a
+// default-hygiene decision, not a performance fix. Do not cite it as one.
 #ifndef AMCL_MG_FRAME_STATS_GL_SCOPES
 #define AMCL_MG_FRAME_STATS_GL_SCOPES 1
 #endif
