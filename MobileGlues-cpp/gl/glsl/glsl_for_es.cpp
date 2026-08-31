@@ -15,6 +15,7 @@
 #include "../log.h"
 #include "glslang/SPIRV/GlslangToSpv.h"
 #include <string>
+#include <atomic>
 #include <regex>
 #include <strstream>
 #include <algorithm>
@@ -22,6 +23,7 @@
 #include <sstream>
 #include <vector>
 #include "cache.h"
+#include "uniform_initializer_core.h"
 #include "../../version.h"
 
 #define DEBUG 0
@@ -51,7 +53,18 @@
 // Cost, stated plainly: the first launch after a bump re-translates every shader
 // because the whole persisted cache misses. That is one slower startup, and it
 // is the price of never serving a translation the current code would not produce.
-#define GLSL_TRANSLATOR_REVISION 1
+//
+// Revision history, so a bump is never mistaken for a no-op:
+//   t1  the fragment-output flattening pass this comment was written for.
+//   t2  process_uniform_declarations() became token-aware and fail-closed. The
+//       previous substring scan corrupted twelve Minecraft 26.3 snapshot 9
+//       terrain fragment shaders, and those corrupted translations were already
+//       persisted on devices; without this bump an upgraded install keeps
+//       serving them and the fix appears to do nothing at all.
+//
+// Never reuse or lower a value: an old entry that becomes reachable again is a
+// translation the current code would not produce. Roll forward to t3 instead.
+#define GLSL_TRANSLATOR_REVISION 2
 
 static TBuiltInResource InitResources() {
     TBuiltInResource Resources{};
@@ -267,106 +280,80 @@ void trim(std::string& str) {
     str.erase(std::find_if(str.rbegin(), str.rend(), [](int ch) { return !std::isspace(ch); }).base(), str.end());
 }
 
-// Process all uniform declarations into `uniform <precision> <type> <name>;` form
+// Strip initializers from global uniform declarations, which GLSL ES forbids
+// (ESSL 3.00/3.20 section 4.3.5) while desktop GLSL allows them.
+//
+// The pass itself is unchanged in purpose; the rewriter it delegates to is not.
+// The previous version matched `uniform` as a substring at any character
+// position and treated any `=` before the next `;` as an initializer, so on
+// Minecraft 26.3 snapshot 9 it started inside SPIRV-Cross's
+// `_uniform_instance_00_01`, accepted the `==` of an `if` condition, and
+// swallowed the condition together with the first local declaration of the
+// branch -- twelve unusable terrain fragment programs and an immediate exit. The
+// reasoning, the fail-closed rules and the lexer live in
+// uniform_initializer_core.h, which has no dependency past the standard library
+// precisely so those rules can be exercised without a device.
+//
+// Nothing driver-, platform- or application-specific belongs in here: the
+// restriction is in the ES specification and the defect was lexical.
 std::string process_uniform_declarations(const std::string& glslCode) {
-    std::string result;
-    size_t scan_pos = 0;
-    size_t chunk_start = 0;
-    const size_t length = glslCode.length();
-    const std::vector<std::string> precision_kws = {"highp", "lowp", "mediump"};
+    mg::glsl::UniformInitializerRewrite rewrite = mg::glsl::stripGlobalUniformInitializers(glslCode);
+    const mg::glsl::UniformInitializerStats& stats = rewrite.stats;
 
-    result.reserve(glslCode.length());
+    // Process-wide cumulative counters, reported rather than a per-shader line
+    // or a one-shot "pass is active" line.
+    //
+    // Per-shader would be several hundred lines of noise. A one-shot readiness
+    // line would be worse than that: a channel that is up but has never carried
+    // an event reads exactly like one that works. These only go up, so the log
+    // says how much was actually processed.
+    //
+    // They exist because of what the first device run of this fix looked like.
+    // Vanilla Minecraft 26.3 declares no uniform initializers anywhere, so a
+    // line conditioned on "stripped something" can never appear on that
+    // workload -- and the run therefore carried no direct evidence that the new
+    // rewriter had run, only the absence of the old corruption. Absence of a
+    // symptom is not presence of a fix.
+    //
+    // Note the line is emitted from the translation path, so a session served
+    // entirely from the persisted cache produces none of it. That is the
+    // intended reading: it distinguishes "translated N shaders" from "translated
+    // nothing because everything was cached", which a readiness line could not.
+    static std::atomic<unsigned long long> total_shaders{0};
+    static std::atomic<unsigned long long> total_seen{0};
+    static std::atomic<unsigned long long> total_stripped{0};
+    static std::atomic<unsigned long long> total_declined{0};
 
-    while (scan_pos < length) {
-        if (glslCode.compare(scan_pos, 7, "uniform") == 0) {
-            if (scan_pos > chunk_start) {
-                result.append(glslCode, chunk_start, scan_pos - chunk_start);
-            }
+    const unsigned long long shaders = total_shaders.fetch_add(1) + 1;
+    const unsigned long long seen = total_seen.fetch_add(stats.seen) + stats.seen;
+    const unsigned long long stripped = total_stripped.fetch_add(stats.stripped) + stats.stripped;
+    const unsigned long long declined =
+        total_declined.fetch_add(stats.unhandled_with_initializer) + stats.unhandled_with_initializer;
 
-            const size_t decl_start = scan_pos;
-            scan_pos += 7; // Skip "uniform"
-
-            std::string precision, type;
-            bool found_precision = false;
-
-            while (scan_pos < length) {
-                while (scan_pos < length && std::isspace(glslCode[scan_pos]))
-                    ++scan_pos;
-
-                for (const auto& kw : precision_kws) {
-                    if (glslCode.compare(scan_pos, kw.length(), kw) == 0) {
-                        precision = " " + kw;
-                        scan_pos += kw.length();
-                        found_precision = true;
-                        break;
-                    }
-                }
-                if (found_precision) break;
-
-                const size_t type_start = scan_pos;
-                while (scan_pos < length && (std::isalnum(glslCode[scan_pos]) || glslCode[scan_pos] == '_')) {
-                    ++scan_pos;
-                }
-                type = glslCode.substr(type_start, scan_pos - type_start);
-                break;
-            }
-
-            while (scan_pos < length) {
-                while (scan_pos < length && std::isspace(glslCode[scan_pos]))
-                    ++scan_pos;
-
-                bool found = false;
-                for (const auto& kw : precision_kws) {
-                    if (glslCode.compare(scan_pos, kw.length(), kw) == 0) {
-                        if (precision.empty()) precision = " " + kw;
-                        scan_pos += kw.length();
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) break;
-            }
-
-            if (type.empty()) {
-                const size_t type_start = scan_pos;
-                while (scan_pos < length && (std::isalnum(glslCode[scan_pos]) || glslCode[scan_pos] == '_')) {
-                    ++scan_pos;
-                }
-                type = glslCode.substr(type_start, scan_pos - type_start);
-            }
-
-            while (scan_pos < length && std::isspace(glslCode[scan_pos]))
-                ++scan_pos;
-            const size_t name_start = scan_pos;
-            while (scan_pos < length && (std::isalnum(glslCode[scan_pos]) || glslCode[scan_pos] == '_')) {
-                ++scan_pos;
-            }
-            const std::string name = glslCode.substr(name_start, scan_pos - name_start);
-
-            size_t decl_end = glslCode.find(';', scan_pos);
-            if (decl_end == std::string::npos)
-                decl_end = length;
-            else
-                ++decl_end;
-            const bool has_initializer = (glslCode.find('=', scan_pos) < decl_end);
-            if (has_initializer) {
-                result.append("uniform").append(precision).append(" ").append(type).append(" ").append(name).append(
-                    ";");
-            } else {
-                result.append(glslCode, decl_start, decl_end - decl_start);
-            }
-
-            scan_pos = chunk_start = decl_end;
-        } else {
-            ++scan_pos;
-        }
+    // The first translated shader always reports, so the pass is provable on a
+    // workload it never rewrites; after that only a change in what matters.
+    if (shaders == 1 || stats.stripped > 0 || stats.unhandled_with_initializer > 0) {
+        LOG_I("[Shader] Token-aware uniform initializer pass t%d: shaders=%llu uniform_tokens=%llu stripped=%llu "
+              "declined_with_initializer=%llu",
+              GLSL_TRANSLATOR_REVISION, shaders, seen, stripped, declined)
     }
-
-    if (chunk_start < length) {
-        result.append(glslCode, chunk_start, length - chunk_start);
+    // The case worth a shipping-build warning is narrow on purpose: a uniform
+    // with no initializer is the norm and says nothing, whereas one this pass
+    // declined to touch *while an initializer is present* is about to be
+    // rejected by the driver, and that rejection has to be traceable to here
+    // rather than looking like an unexplained shader error.
+    if (stats.unhandled_with_initializer > 0) {
+        LOG_W_FORCE("[Shader] Left %d global uniform declaration(s) that appear to carry an initializer unchanged; "
+                    "the driver may reject them (ESSL 4.3.5). Shapes not rewritten: declarator %d, interface block "
+                    "%d, multiple declarators %d, preprocessor %d, unterminated %d",
+                    static_cast<int>(stats.unhandled_with_initializer),
+                    static_cast<int>(stats.unhandled_declarator),
+                    static_cast<int>(stats.unhandled_interface_block),
+                    static_cast<int>(stats.unhandled_multiple_declarators),
+                    static_cast<int>(stats.unhandled_preprocessor),
+                    static_cast<int>(stats.unhandled_unterminated))
     }
-
-    return result;
+    return std::move(rewrite.code);
 }
 
 std::string processOutColorLocations(const std::string& glslCode) {
