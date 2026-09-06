@@ -38,6 +38,8 @@ extern "C"
 
     void* proc_address(void* lib, const char* name);
     extern void *gles, *egl;
+    extern void (*mg_texture_barrier_backend)();
+    void mg_set_gl_error(GLenum error);
 
     // True only when the ANGLE image is the one that actually got loaded --
     // load_libs() falls back to the system driver when it cannot be opened.
@@ -110,6 +112,7 @@ extern "C"
     GLenum ERR = GLES.glGetError();                                                                                    \
     while (ERR != GL_NO_ERROR) {                                                                                       \
         LOG_E("ERROR: %d @ %s:%d", ERR, __FILE__, __LINE__)                                                            \
+        mg_set_gl_error(ERR);                                                                                         \
         ERR = GLES.glGetError();                                                                                       \
     }
 
@@ -119,6 +122,7 @@ extern "C"
     ERR = GLES.glGetError();                                                                                           \
     while (ERR != GL_NO_ERROR) {                                                                                       \
         LOG_E("ERROR: %d @ %s:%d", ERR, __FILE__, __LINE__)                                                            \
+        mg_set_gl_error(ERR);                                                                                         \
         ERR = GLES.glGetError();                                                                                       \
     }
 #else

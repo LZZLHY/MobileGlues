@@ -23,6 +23,12 @@
 
 static GLclampd currentDepthValue;
 
+extern "C" GLAPI GLAPIENTRY void glTextureBarrier() {
+    LOG()
+    if (mg_texture_barrier_backend) mg_texture_barrier_backend();
+    else mg_set_gl_error(GL_INVALID_OPERATION);
+}
+
 #include "framebuffer.h"
 
 void glClearDepth(GLclampd depth) {
@@ -130,6 +136,10 @@ void InitDepthClearCoreProfile() {
 }
 
 void DrawDepthClearTri() {
+    GLint prevProgram = 0, prevVAO = 0, prevArrayBuffer = 0;
+    GLES.glGetIntegerv(GL_CURRENT_PROGRAM, &prevProgram);
+    GLES.glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prevVAO);
+    GLES.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prevArrayBuffer);
     InitDepthClearCoreProfile();
     depth_clear_objects_t& obj = depth_clear_objects();
 
@@ -147,8 +157,9 @@ void DrawDepthClearTri() {
     GLES.glUseProgram(obj.program);
     GLES.glBindVertexArray(obj.vao);
     GLES.glDrawArrays(GL_TRIANGLES, 0, 3);
-    GLES.glBindVertexArray(0);
-    GLES.glUseProgram(0);
+    GLES.glBindVertexArray(prevVAO);
+    GLES.glBindBuffer(GL_ARRAY_BUFFER, prevArrayBuffer);
+    GLES.glUseProgram(prevProgram);
 
     GLES.glDepthFunc(prevDepthFunc);
     GLES.glDepthMask(prevDepthMask);

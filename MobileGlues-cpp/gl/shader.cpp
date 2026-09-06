@@ -1,134 +1,257 @@
-// MobileGlues - gl/shader.cpp
 // Copyright (c) 2025-2026 MobileGL-Dev
-// Licensed under the GNU Lesser General Public License v2.1:
-//   https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
 // SPDX-License-Identifier: LGPL-2.1-only
-// End of Source File Header
-
-#include <cctype>
+// MobileGlues shader objects and submissions. LGPL-2.1-only.
 #include "shader.h"
-
-#include <GL/gl.h>
-#include "log.h"
 #include "program.h"
+#include "../egl/context.h"
 #include "../gles/loader.h"
-#include "../includes.h"
 #include "glsl/glsl_for_es.h"
-#include "../config/settings.h"
+#include "glsl/uniform_initializer_core.h"
+#include "mg.h"
 #include "FSR1/FSR1.h"
-
+#include "../config/settings.h"
+#include <algorithm>
+#include <climits>
+#include <cstring>
+#include <sstream>
 #define DEBUG 0
 
-struct shader_t shaderInfo;
+mg_shader_group& mg_shader_objects() {
+    if (g_current_ctx && g_current_ctx->share_group && g_current_ctx->share_group->shader_objects)
+        return *g_current_ctx->share_group->shader_objects;
+    static thread_local mg_shader_group fallback;
+    return fallback;
+}
 
-UnorderedMap<GLuint, bool> shader_map_is_sampler_buffer_emulated;
-
-bool can_run_essl3(unsigned int esversion, const char* glsl) {
-    if (strncmp(glsl, "#version 100", 12) == 0) {
-        return true;
+void mg_collect_deleted_shaders(mg_shader_group& group) {
+    for (auto it = group.shaders.begin(); it != group.shaders.end();) {
+        bool attached = false;
+        for (const auto& p : group.programs) {
+            if (std::find(p.second.attached.begin(), p.second.attached.end(), it->first) != p.second.attached.end()) {
+                attached = true;
+                break;
+            }
+        }
+        if (it->second.deleted && !attached)
+            it = group.shaders.erase(it);
+        else
+            ++it;
     }
+}
 
-    unsigned int glsl_version = 0;
-    if (strncmp(glsl, "#version 300 es", 15) == 0) {
-        glsl_version = 300;
-    } else if (strncmp(glsl, "#version 310 es", 15) == 0) {
-        glsl_version = 310;
-    } else if (strncmp(glsl, "#version 320 es", 15) == 0) {
-        glsl_version = 320;
-    } else {
-        return false;
+bool mg_shader_translate(mg_shader_record& shader, const mg_frag_bindings* outputs, std::string& source,
+                         mg_glsl_metadata& metadata, std::string& error) {
+    int rc = -1;
+    try {
+        size_t start = 0;
+        mg::glsl::detail::skipTrivia(shader.original, start);
+        std::istringstream header(shader.original.substr(start));
+        std::string directive, profile;
+        unsigned version = 0;
+        header >> directive >> version >> profile;
+        const bool direct = directive == "#version" &&
+                            (version == 100 || (profile == "es" && version >= 300 && version <= hardware->es_version));
+        if (direct && (!outputs || outputs->empty())) {
+            source = shader.original;
+            metadata = {};
+            return true;
+        }
+        // Program-specific output bindings use the parsed AST, not edits of
+        // auto-assigned locations in a different shader's converted source.
+        source = GLSLtoGLSLES(shader.original.c_str(), shader.type, hardware->es_version,
+                              getGLSLVersion(shader.original.c_str()), rc, outputs);
+        if (rc >= 0 && !source.empty()) {
+            mg_read_translation_metadata(source, metadata);
+            return true;
+        }
+        error = mg_translation_error();
+        if (error.empty()) error = "MobileGlues GLSL translation failed (stage code " + std::to_string(rc) + ")";
     }
-    return esversion >= glsl_version;
+    catch (const std::exception& ex) {
+        error = std::string("MobileGlues GLSL translation exception: ") + ex.what();
+    }
+    catch (...) {
+        error = "MobileGlues GLSL translation failed with an unknown exception";
+    }
+    source.clear();
+    return false;
 }
 
-bool is_direct_shader(const char* glsl) {
-    bool es3_ability = can_run_essl3(hardware->es_version, glsl);
-    return es3_ability;
+static void copy_shader_text(const std::string& text, GLsizei size, GLsizei* length, GLchar* out) {
+    if (length) *length = 0;
+    if (size < 0) {
+        mg_set_gl_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (size == 0 || !out) return;
+    const size_t n = std::min(text.size(), static_cast<size_t>(size - 1));
+    std::memcpy(out, text.data(), n);
+    out[n] = 0;
+    if (length) *length = static_cast<GLsizei>(n);
 }
 
-bool check_if_sampler_buffer_used(std::string str) {
-    return str.find("samplerBuffer") != std::string::npos;
-}
-
-void glShaderSource(GLuint shader, GLsizei count, const GLchar* const* string, const GLint* length) {
+void glShaderSource(GLuint shader, GLsizei count, const GLchar* const* strings, const GLint* lengths) {
     LOG()
-    shaderInfo.id = 0;
-    shaderInfo.converted = "";
-    shaderInfo.frag_data_changed_converted.clear();
-    shaderInfo.frag_data_changed = 0;
-    size_t l = 0;
-    for (int i = 0; i < count; i++)
-        l += (length && length[i] >= 0) ? length[i] : strlen(string[i]);
-    std::string glsl_src, essl_src;
-    glsl_src.reserve(l + 1);
-    if (length) {
-        for (int i = 0; i < count; i++) {
-            if (length[i] >= 0)
-                glsl_src += std::string_view(string[i], length[i]);
-            else
-                glsl_src += string[i];
-        }
-    } else {
-        for (int i = 0; i < count; i++) {
-            glsl_src += string[i];
+    if (count < 0 || (count > 0 && !strings)) {
+        mg_set_gl_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (!GLES.glIsShader(shader)) {
+        mg_set_gl_error(GL_INVALID_VALUE);
+        return;
+    }
+    auto& group = mg_shader_objects();
+    std::lock_guard<std::recursive_mutex> lock(group.mutex);
+    auto& record = group.shaders[shader];
+    if (!record.type) {
+        GLint type = 0;
+        GLES.glGetShaderiv(shader, GL_SHADER_TYPE, &type);
+        record.type = type;
+    }
+    std::string original;
+    try {
+        for (GLsizei i = 0; i < count; ++i) {
+            if (!strings[i]) {
+                mg_set_gl_error(GL_INVALID_VALUE);
+                return;
+            }
+            const size_t n = lengths && lengths[i] >= 0 ? static_cast<size_t>(lengths[i]) : std::strlen(strings[i]);
+            if (n > static_cast<size_t>(INT_MAX) - original.size()) {
+                mg_set_gl_error(GL_OUT_OF_MEMORY);
+                return;
+            }
+            original.append(strings[i], n);
         }
     }
-
-    bool is_sampler_buffer_emulated = hardware->emulate_texture_buffer && check_if_sampler_buffer_used(glsl_src);
-
-    if (is_direct_shader(glsl_src.c_str())) {
-        LOG_D("[INFO] [Shader] Direct shader source: ")
-        LOG_D("%s", glsl_src.c_str())
-        essl_src = glsl_src;
-    } else {
-        int glsl_version = getGLSLVersion(glsl_src.c_str());
-        LOG_D("[INFO] [Shader] Shader source: ")
-        LOG_D("%s", glsl_src.c_str())
-        GLint shaderType;
-        GLES.glGetShaderiv(shader, GL_SHADER_TYPE, &shaderType);
-        int return_code = 0;
-        essl_src = GLSLtoGLSLES(glsl_src.c_str(), shaderType, hardware->es_version, glsl_version, return_code);
-
-        if (essl_src.empty()) {
-            LOG_E("Failed to convert shader %d.", shader)
-            return;
-        }
-        LOG_D("\n[INFO] [Shader] Converted Shader source: \n%s", essl_src.c_str())
+    catch (const std::bad_alloc&) {
+        mg_set_gl_error(GL_OUT_OF_MEMORY);
+        return;
     }
-    if (!essl_src.empty()) {
-        shaderInfo.id = shader;
-        shaderInfo.converted = essl_src;
-        const char* s[] = {essl_src.c_str()};
-        GLES.glShaderSource(shader, count, s, nullptr);
-        if (hardware->emulate_texture_buffer)
-            shader_map_is_sampler_buffer_emulated[shader] = is_sampler_buffer_emulated;
-    } else
-        LOG_E("Failed to convert glsl.")
-    CHECK_GL_ERROR
+    record.generation = group.generation++;
+    record.original = std::move(original);
+    record.converted.clear();
+    record.failure.clear();
+    record.metadata = {};
+    // Empty input is still a source update. It must remove the old driver text.
+    if (!record.original.empty())
+        mg_shader_translate(record, nullptr, record.converted, record.metadata, record.failure);
+    if (record.original.empty()) record.converted.clear();
+    std::string submitted = record.converted;
+    if (!record.failure.empty()) {
+        submitted = "#version 300 es\n#error MobileGlues_translation_failed\n";
+        LOG_W_FORCE("[MG-SHADER-FAIL] shader=%u generation=%llu count=%d: %s", shader,
+                    static_cast<unsigned long long>(record.generation), count, record.failure.c_str())
+    }
+    const GLchar* text = submitted.data();
+    const GLint length = static_cast<GLint>(submitted.size());
+    GLES.glShaderSource(shader, 1, &text, &length);
+}
+
+void glCompileShader(GLuint shader) {
+    LOG()
+    auto& group = mg_shader_objects();
+    std::lock_guard<std::recursive_mutex> lock(group.mutex);
+    GLES.glCompileShader(shader);
+    GLint status = GL_FALSE;
+    GLES.glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
+    const auto it = group.shaders.find(shader);
+    if (it != group.shaders.end()) {
+        it->second.compiled = status == GL_TRUE && it->second.failure.empty();
+        if (it->second.compiled) {
+            it->second.compiled_original = it->second.original;
+            it->second.compiled_metadata = it->second.metadata;
+        }
+    }
+    if (!status) {
+        char log[4096]{};
+        glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
+        LOG_W_FORCE("[MG-SHADER-COMPILE] shader=%u failed: %s", shader, log)
+    }
 }
 
 void glGetShaderiv(GLuint shader, GLenum pname, GLint* params) {
     LOG()
-    GLES.glGetShaderiv(shader, pname, params);
-    if (global_settings.ignore_error >= IgnoreErrorLevel::Partial && pname == GL_COMPILE_STATUS && !*params) {
-        GLchar infoLog[512];
-        GLES.glGetShaderInfoLog(shader, 512, nullptr, infoLog);
-        LOG_W_FORCE("Shader %d compilation failed: \n%s", shader, infoLog)
-        LOG_W_FORCE("Now try to cheat.")
-        *params = GL_TRUE;
+    if (!params) {
+        mg_set_gl_error(GL_INVALID_VALUE);
+        return;
     }
-    CHECK_GL_ERROR
+    auto& group = mg_shader_objects();
+    std::lock_guard<std::recursive_mutex> lock(group.mutex);
+    const auto it = group.shaders.find(shader);
+    if (it != group.shaders.end()) {
+        if (pname == GL_SHADER_SOURCE_LENGTH) {
+            *params = it->second.original.empty() ? 0 : static_cast<GLint>(it->second.original.size() + 1);
+            return;
+        }
+        if (!it->second.failure.empty()) {
+            if (pname == GL_COMPILE_STATUS) {
+                *params = GL_FALSE;
+                return;
+            }
+            if (pname == GL_INFO_LOG_LENGTH) {
+                *params = static_cast<GLint>(it->second.failure.size() + 1);
+                return;
+            }
+        }
+    }
+    GLES.glGetShaderiv(shader, pname, params);
 }
 
-GLuint glCreateShader(GLenum shaderType) {
-    if (global_settings.fsr1_setting != FSR1_Quality_Preset::Disabled && !fsrInitialized) {
-        InitFSRResources();
+void glGetShaderInfoLog(GLuint shader, GLsizei size, GLsizei* length, GLchar* log) {
+    auto& group = mg_shader_objects();
+    std::lock_guard<std::recursive_mutex> lock(group.mutex);
+    const auto it = group.shaders.find(shader);
+    if (it != group.shaders.end() && !it->second.failure.empty()) {
+        copy_shader_text(it->second.failure, size, length, log);
+        return;
     }
+    GLES.glGetShaderInfoLog(shader, size, length, log);
+}
 
+void glGetShaderSource(GLuint shader, GLsizei size, GLsizei* length, GLchar* source) {
+    auto& group = mg_shader_objects();
+    std::lock_guard<std::recursive_mutex> lock(group.mutex);
+    const auto it = group.shaders.find(shader);
+    if (it != group.shaders.end()) {
+        copy_shader_text(it->second.original, size, length, source);
+        return;
+    }
+    GLES.glGetShaderSource(shader, size, length, source);
+}
+
+GLuint glCreateShader(GLenum type) {
     LOG()
-    LOG_D("glCreateShader(%s)", glEnumToString(shaderType))
-    GLuint shader = GLES.glCreateShader(shaderType);
-    if (shader != 0 && hardware->emulate_texture_buffer) shader_map_is_sampler_buffer_emulated[shader] = false;
-    CHECK_GL_ERROR
+    if (global_settings.fsr1_setting != FSR1_Quality_Preset::Disabled && !fsrInitialized) InitFSRResources();
+    const GLuint shader = GLES.glCreateShader(type);
+    if (shader) {
+        auto& group = mg_shader_objects();
+        std::lock_guard<std::recursive_mutex> lock(group.mutex);
+        auto& record = group.shaders[shader];
+        record = {};
+        record.type = type;
+        record.generation = group.generation++;
+    }
     return shader;
+}
+
+void glDeleteShader(GLuint shader) {
+    LOG()
+    auto& group = mg_shader_objects();
+    std::lock_guard<std::recursive_mutex> lock(group.mutex);
+    mg_begin_driver_operation();
+    GLES.glDeleteShader(shader);
+    if (!mg_end_driver_operation("glDeleteShader")) return;
+    auto it = group.shaders.find(shader);
+    if (it != group.shaders.end()) it->second.deleted = true;
+    mg_collect_deleted_shaders(group);
+}
+
+extern "C"
+{
+    GLAPI GLAPIENTRY void glCompileShaderARB(GLuint) __attribute__((alias("glCompileShader")));
+    GLAPI GLAPIENTRY void glDeleteShaderARB(GLuint) __attribute__((alias("glDeleteShader")));
+    GLAPI GLAPIENTRY void glGetShaderInfoLogARB(GLuint, GLsizei, GLsizei*, GLchar*)
+        __attribute__((alias("glGetShaderInfoLog")));
+    GLAPI GLAPIENTRY void glGetShaderSourceARB(GLuint, GLsizei, GLsizei*, GLchar*)
+        __attribute__((alias("glGetShaderSource")));
 }

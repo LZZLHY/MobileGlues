@@ -192,7 +192,7 @@ namespace {
     // two orders of magnitude cheaper than the SHA-256 it replaces.
     //
     // thread_local, not members, because the pair is always issued from one
-    // thread while this class takes no lock anywhere: two threads translating at
+    // thread while container access uses the cache mutex: two threads translating at
     // once could otherwise interleave the two stores and leave one thread's
     // bytes standing next to the other thread's digest.
     thread_local string g_hash_memo_source;
@@ -222,8 +222,9 @@ void Cache::flushIfDue() {
     save();
 }
 
-const char* Cache::get(const char* glsl) {
-    if (global_settings.max_glsl_cache_size <= 0) return nullptr;
+bool Cache::get(const char* glsl, std::string& result) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    if (global_settings.max_glsl_cache_size <= 0 || !glsl) return false;
     flushIfDue();
 
     const size_t length = strlen(glsl);
@@ -236,15 +237,17 @@ const char* Cache::get(const char* glsl) {
         g_hash_memo_source.assign(glsl, length);
         g_hash_memo_digest = hash;
         g_hash_memo_valid = true;
-        return nullptr;
+        return false;
     }
 
     cacheList.splice(cacheList.end(), cacheList, it->second);
-    return it->second->essl.c_str();
+    result = it->second->essl;
+    return true;
 }
 
 void Cache::put(const char* glsl, const char* essl) {
-    if (global_settings.max_glsl_cache_size <= 0) return;
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    if (global_settings.max_glsl_cache_size <= 0 || !glsl || !essl) return;
 
     const size_t length = strlen(glsl);
     array<uint8_t, 32> hash;
@@ -285,49 +288,63 @@ void Cache::maintainCacheSize() {
 }
 
 bool Cache::load() {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     try {
         // check_path() runs long before the first translation, but the path is a
         // global that starts null and ifstream would take it straight to fopen.
         if (!glsl_cache_file_path) return false;
-        ifstream file(glsl_cache_file_path, ios::binary);
+        ifstream file(glsl_cache_file_path, ios::binary | ios::ate);
         if (!file) return false;
-
-        size_t count;
-        file.read(reinterpret_cast<char*>(&count), sizeof(count));
-
+        if (global_settings.max_glsl_cache_size <= 0) return false;
+        const auto end = file.tellg();
+        const size_t limit = static_cast<size_t>(global_settings.max_glsl_cache_size);
+        if (end < static_cast<std::streamoff>(sizeof(size_t)) ||
+            static_cast<uint64_t>(end) > static_cast<uint64_t>(limit) + sizeof(size_t)) return false;
+        size_t remaining = static_cast<size_t>(end) - sizeof(size_t);
+        file.seekg(0);
+        size_t count = 0;
+        if (!file.read(reinterpret_cast<char*>(&count), sizeof(count))) return false;
+        constexpr size_t header = 32 + sizeof(size_t);
+        if (count > remaining / (header + 1)) return false;
+        std::list<CacheEntry> loaded;
+        size_t loadedSize = 0;
         while (count--) {
             array<uint8_t, 32> hash{};
-            size_t esslSize;
-
-            file.read(reinterpret_cast<char*>(hash.data()), hash.size());
-            file.read(reinterpret_cast<char*>(&esslSize), sizeof(esslSize));
-
+            size_t esslSize = 0;
+            if (remaining < header || !file.read(reinterpret_cast<char*>(hash.data()), hash.size()) ||
+                !file.read(reinterpret_cast<char*>(&esslSize), sizeof(esslSize))) return false;
+            remaining -= header;
+            if (esslSize == 0 || esslSize > remaining || esslSize > limit) return false;
             string essl(esslSize, '\0');
-            file.read(essl.data(), (long)esslSize);
-
-            if (cacheMap.count(hash)) continue;
-
-            size_t entryMemory = sizeof(CacheEntry::sha256) + sizeof(size_t) + esslSize;
-            cacheSize += entryMemory;
-
-            cacheList.emplace_back(CacheEntry{hash, move(essl), esslSize});
-            cacheMap[hash] = prev(cacheList.end());
+            if (!file.read(essl.data(), static_cast<std::streamsize>(esslSize)) ||
+                essl.back() != '\0' || essl.find('\0') != esslSize - 1) return false;
+            remaining -= esslSize;
+            loadedSize += header + esslSize;
+            if (loadedSize > limit) return false;
+            essl.pop_back();
+            loaded.emplace_back(CacheEntry{hash, std::move(essl), esslSize});
         }
-
+        if (remaining != 0 || file.peek() != std::char_traits<char>::eof()) return false;
+        // Build the complete index before replacing any active cache state.
+        decltype(cacheMap) index;
+        for (auto it = loaded.begin(); it != loaded.end(); ++it) {
+            if (!index.emplace(it->sha256, it).second) return false;
+        }
+        cacheList.swap(loaded);
+        cacheMap.swap(index);
+        cacheSize = loadedSize;
+        pendingEntries = 0;
         maintainCacheSize();
         return true;
     }
     catch (...) {
-        LOG_W_FORCE("Error while loading glsl cache file. Clearing it...")
-        cacheMap.clear();
-        cacheSize = 0;
-        cacheList.clear();
-        save();
+        LOG_W_FORCE("Invalid or unreadable GLSL cache; keeping the active cache unchanged")
         return false;
     }
 }
 
 void Cache::save() {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     if (global_settings.max_glsl_cache_size <= 0) return;
     if (!glsl_cache_file_path) return;
 

@@ -100,38 +100,7 @@ static inline GLsizei mg_index_size(GLenum type) {
 // buffer is simply vertex 65535, so it must be rebased like any other index.
 // Translating it unconditionally would turn a legitimate vertex reference into an
 // out-of-range one.
-static void mg_rebase_indices_to_u32(GLuint* dst, const void* src, GLsizei count, GLenum type, GLint basevertex,
-                                     bool restart_enabled, GLuint sentinel) {
-    const GLuint bv = static_cast<GLuint>(basevertex);
-
-#define MG_REBASE_LOOP(SRCTYPE)                                                                                        \
-    do {                                                                                                               \
-        const SRCTYPE* s = static_cast<const SRCTYPE*>(src);                                                           \
-        if (restart_enabled) {                                                                                         \
-            for (GLsizei j = 0; j < count; ++j)                                                                        \
-                dst[j] = (static_cast<GLuint>(s[j]) == sentinel) ? 0xFFFFFFFFu : (static_cast<GLuint>(s[j]) + bv);     \
-        } else {                                                                                                       \
-            for (GLsizei j = 0; j < count; ++j)                                                                        \
-                dst[j] = static_cast<GLuint>(s[j]) + bv;                                                                \
-        }                                                                                                              \
-    } while (0)
-
-    switch (type) {
-    case GL_UNSIGNED_INT:
-        MG_REBASE_LOOP(GLuint);
-        break;
-    case GL_UNSIGNED_SHORT:
-        MG_REBASE_LOOP(GLushort);
-        break;
-    case GL_UNSIGNED_BYTE:
-        MG_REBASE_LOOP(GLubyte);
-        break;
-    default:
-        break;
-    }
-
-#undef MG_REBASE_LOOP
-}
+#include "index_rebase_core.h"
 
 // Vertices per primitive for the separable modes. 0 means "not separable, do not
 // fuse"; is_strip_like_mode covers those already.

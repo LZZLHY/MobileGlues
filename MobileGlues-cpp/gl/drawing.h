@@ -26,6 +26,7 @@ struct SamplerInfo {
     GLint locHeight;
     std::vector<GLint> samplers;
 };
+void setupBufferTextureUniforms(GLuint program);
 
 #ifdef __cplusplus
 extern "C"

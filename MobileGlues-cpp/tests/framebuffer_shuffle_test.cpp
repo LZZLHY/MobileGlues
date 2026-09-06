@@ -13,9 +13,11 @@
 
 // --- the four externals framebuffer.cpp reaches for --------------------------
 struct gles_func_t g_gles_func{};
-namespace FSR1_Context { GLuint g_renderFBO = 0; bool g_dirty = false; }
+namespace FSR1_Context { thread_local GLuint g_renderFBO = 0; thread_local bool g_dirty = false; }
 void set_gl_state_current_draw_fbo(GLuint v) { gl_state->current_draw_fbo = v; }
 void mg_set_gl_error(GLenum) {}
+void mg_begin_driver_operation() {}
+bool mg_end_driver_operation(const char*) { return true; }
 int __android_log_print(int, const char*, const char*, ...) { return 0; }
 extern "C" void write_log(const char*, ...) {}
 global_settings_t global_settings{};
@@ -27,7 +29,7 @@ static std::map<int, GLuint> physical;   // attachment index -> texture name
 static std::vector<GLenum>   draw_list;  // what the driver was last told
 static GLuint bound_draw_fb = 0;
 
-static void fake_bind_fb(GLenum, GLuint fb) { bound_draw_fb = fb; }
+static void fake_bind_fb(GLenum target, GLuint fb) { if(target!=GL_READ_FRAMEBUFFER)bound_draw_fb = fb; }
 static void fake_fbtex2d(GLenum, GLenum att, GLenum, GLuint tex, GLint) {
     physical[att - GL_COLOR_ATTACHMENT0] = tex;
 }
@@ -42,10 +44,11 @@ static void fake_fbtex(GLenum, GLenum att, GLuint tex, GLint) {
 }
 static void fake_drawbuffers(GLsizei n, const GLenum* b) { draw_list.assign(b, b + n); }
 static void fake_getintegerv(GLenum pname, GLint* v) {
-    *v = (pname == GL_MAX_COLOR_ATTACHMENTS || pname == GL_MAX_DRAW_BUFFERS) ? 8 : 0;
+    *v = pname == GL_MAX_COLOR_ATTACHMENTS ? 8 : pname == GL_MAX_DRAW_BUFFERS ? 4 : 0;
 }
 static void fake_deletefb(GLsizei, const GLuint*) {}
-static void fake_readbuffer(GLenum) {}
+static GLenum selected_read=GL_COLOR_ATTACHMENT0;
+static void fake_readbuffer(GLenum value) {selected_read=value;}
 static GLenum fake_checkfb(GLenum) { return GL_FRAMEBUFFER_COMPLETE; }
 static GLenum fake_geterror() { return GL_NO_ERROR; }
 static void fake_blit(GLint,GLint,GLint,GLint,GLint,GLint,GLint,GLint,GLbitfield,GLenum) {}
@@ -142,6 +145,22 @@ int main() {
     { GLenum b[] = {GL_COLOR_ATTACHMENT0}; glDrawBuffers(1, b); }
     expect("recycled name did not inherit colortex0", physical[0], 555);
 
+    printf("9. single output uses slot zero even when attachment index exceeds MAX_DRAW_BUFFERS\n");
+    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT7,GL_TEXTURE_2D,107,0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT7);
+    expect("single draw-buffer count",draw_list.size(),1);
+    expect("single output target",physical[0],107);
+    printf("10. replacing an attachment preserves the active output permutation\n");
+    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,100,0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT1,GL_TEXTURE_2D,101,0);
+    {GLenum b[]={GL_COLOR_ATTACHMENT1,GL_COLOR_ATTACHMENT0};glDrawBuffers(2,b);}
+    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT1,GL_TEXTURE_2D,201,0);
+    expect("output zero follows replacement",physical[0],201);
+    expect("output one still follows logical zero",physical[1],100);
+    printf("11. reading an attachment not selected for drawing retains its image\n");
+    {GLenum b[]={GL_COLOR_ATTACHMENT1};glDrawBuffers(1,b);}
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    expect("read logical zero after shuffle",physical[selected_read-GL_COLOR_ATTACHMENT0],100);
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "all checks passed", fails);
     return fails != 0;
 }

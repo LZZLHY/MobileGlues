@@ -6,22 +6,24 @@
 // End of Source File Header
 #include "glsl_for_es.h"
 
-#include <glslang/Public/ShaderLang.h>
-#include <glslang/Include/Types.h>
-#include <glslang/Public/ShaderLang.h>
+#include "../../3rdparty/glslang/glslang/Public/ShaderLang.h"
+#include "../../3rdparty/glslang/glslang/Include/Types.h"
+#include "../../3rdparty/glslang/glslang/MachineIndependent/localintermediate.h"
 #include <spirv_cross/spirv_cross_c.h>
 #include <iostream>
 #include <fstream>
 #include "../log.h"
-#include "glslang/SPIRV/GlslangToSpv.h"
+#include "../../3rdparty/glslang/SPIRV/GlslangToSpv.h"
 #include <string>
 #include <atomic>
 #include <regex>
-#include <strstream>
+#include <stdexcept>
 #include <algorithm>
 #include <cctype>
 #include <sstream>
 #include <vector>
+#include <mutex>
+#include <set>
 #include "cache.h"
 #include "uniform_initializer_core.h"
 #include "../../version.h"
@@ -64,7 +66,34 @@
 //
 // Never reuse or lower a value: an old entry that becomes reachable again is a
 // translation the current code would not produce. Roll forward to t3 instead.
-#define GLSL_TRANSLATOR_REVISION 2
+#define GLSL_TRANSLATOR_REVISION 3
+
+namespace {
+thread_local std::string translation_error;
+std::once_flag glslang_once;
+void ensure_glslang() { std::call_once(glslang_once, [] {
+    if (!glslang::InitializeProcess()) throw std::runtime_error("glslang initialization failed");
+}); }
+}
+std::string mg_translation_error() { return translation_error; }
+
+void mg_read_translation_metadata(const std::string& essl, mg_glsl_metadata& metadata) {
+    metadata = {};
+    std::istringstream lines(essl);
+    std::string line, tag;
+    while (std::getline(lines, line)) {
+        std::istringstream fields(line);
+        fields >> tag;
+        if (tag == "//MG_BIND") {
+            mg_glsl_binding binding;
+            if (fields >> binding.kind >> binding.binding >> binding.count >> binding.name)
+                metadata.bindings.push_back(std::move(binding));
+        } else if (tag == "//MG_BUFFER") {
+            std::string name;
+            if (fields >> name) metadata.buffer_samplers.push_back(std::move(name));
+        }
+    }
+}
 
 static TBuiltInResource InitResources() {
     TBuiltInResource Resources{};
@@ -648,27 +677,33 @@ std::string flattenDynamicFragmentOutputArrays(const std::string& essl, GLenum s
 }  // namespace
 
 std::string GLSLtoGLSLES(const char* glsl_code, GLenum glsl_type, uint essl_version, uint glsl_version,
-                         int& return_code) {
+                         int& return_code, const mg_frag_bindings* outputs) {
+    translation_error.clear();
     std::string sha256_string(glsl_code);
     sha256_string += "\n//" + std::to_string(MAJOR) + "." + std::to_string(MINOR) + "." + std::to_string(REVISION) +
-                     "|" + std::to_string(essl_version) + "|t" + std::to_string(GLSL_TRANSLATOR_REVISION);
-    const char* cachedESSL = Cache::get_instance().get(sha256_string.c_str());
-    if (cachedESSL) {
-        LOG_D("GLSL Hit Cache:\n%s\n-->\n%s", glsl_code, cachedESSL)
+                     "|" + std::to_string(essl_version) + "|t" + std::to_string(GLSL_TRANSLATOR_REVISION) +
+                     "|stage=" + std::to_string(glsl_type) + "|buffer=" +
+                     std::to_string(hardware->emulate_texture_buffer) + "|querylod=" +
+                     std::to_string(g_gles_caps.GL_EXT_texture_query_lod);
+    if (outputs) for (const auto& binding : *outputs)
+        sha256_string += "|out:" + binding.first + "=" + std::to_string(binding.second);
+    std::string cachedESSL;
+    if (Cache::get_instance().get(sha256_string.c_str(), cachedESSL)) {
+        LOG_D("GLSL Hit Cache:\n%s\n-->\n%s", glsl_code, cachedESSL.c_str())
         return_code = 0;
-        return (char*)cachedESSL;
+        return cachedESSL;
     }
 
     return_code = -1;
     // std::string converted = glsl_version<140? GLSLtoGLSLES_1(glsl_code, glsl_type, essl_version,
     // return_code):GLSLtoGLSLES_2(glsl_code, glsl_type, essl_version, return_code);
-    std::string converted = GLSLtoGLSLES_2(glsl_code, glsl_type, essl_version, return_code);
+    std::string converted = GLSLtoGLSLES_2(glsl_code, glsl_type, essl_version, return_code, outputs);
     if (return_code >= 0 && !converted.empty()) {
         converted = process_uniform_declarations(converted);
         Cache::get_instance().put(sha256_string.c_str(), converted.c_str());
     }
 
-    return (return_code >= 0) ? converted : glsl_code;
+    return (return_code >= 0) ? converted : std::string{};
 }
 
 std::string replace_line_starting_with(const std::string& glslCode, const std::string& starting,
@@ -983,8 +1018,44 @@ int get_or_add_glsl_version(std::string& glsl) {
     return glsl_version;
 }
 
+namespace {
+class SourceBindings : public glslang::TIntermTraverser {
+    const mg_frag_bindings* outputs;
+    GLenum stage;
+    mg_glsl_metadata& metadata;
+    std::set<std::string> seen;
+public:
+    SourceBindings(const mg_frag_bindings* o, GLenum s, mg_glsl_metadata& m)
+        : outputs(o), stage(s), metadata(m) {}
+    void visitSymbol(glslang::TIntermSymbol* symbol) override {
+        using namespace glslang;
+        auto& q = symbol->getQualifier();
+        const auto& type = symbol->getType();
+        const std::string name = symbol->getName().c_str();
+        if (stage == GL_FRAGMENT_SHADER && outputs && q.storage == EvqVaryingOut && !q.hasLocation()) {
+            const auto binding = outputs->find(name);
+            if (binding != outputs->end()) q.layoutLocation = binding->second;
+        }
+        // This walk happens on the parsed tree before link/automatic binding
+        // allocation. Macro-expanded source qualifiers retain their priority.
+        if (!q.hasBinding()) return;
+        mg_glsl_binding binding;
+        binding.binding = q.layoutBinding;
+        binding.count = type.isArray() ? std::max(1, type.getOuterArraySize()) : 1;
+        binding.name = name;
+        if (type.getBasicType() == EbtBlock) {
+            binding.kind = q.storage == EvqBuffer ? "ssbo" : "ubo";
+            binding.name = type.getTypeName().c_str();
+        } else if (type.getBasicType() == EbtSampler) {
+            binding.kind = type.getSampler().isImage() ? "image" : "sampler";
+        } else return;
+        if (seen.insert(binding.kind + ":" + binding.name).second) metadata.bindings.push_back(binding);
+    }
+};
+}
+
 std::vector<unsigned int> glsl_to_spirv(GLenum shader_type, int glsl_version, const char* const* shader_src,
-                                        int& errc) {
+                                        int& errc, const mg_frag_bindings* outputs, mg_glsl_metadata& metadata) {
     EShLanguage shader_language;
     switch (shader_type) {
     case GL_VERTEX_SHADER:
@@ -1025,17 +1096,21 @@ std::vector<unsigned int> glsl_to_spirv(GLenum shader_type, int glsl_version, co
     TBuiltInResource TBuiltInResource_resources = InitResources();
 
     if (!shader.parse(&TBuiltInResource_resources, glsl_version, true, EShMsgDefault)) {
-        LOG_D("GLSL Compiling ERROR: \n%s", shader.getInfoLog())
+        translation_error = std::string("glslang parse: ") + shader.getInfoLog();
+        LOG_W_FORCE("%s", translation_error.c_str())
         errc = -1;
         return {};
     }
     LOG_D("GLSL Compiled.")
+    SourceBindings bindings(outputs, shader_type, metadata);
+    shader.getIntermediate()->getTreeRoot()->traverse(&bindings);
 
     glslang::TProgram program;
     program.addShader(&shader);
 
     if (!program.link(EShMsgDefault)) {
-        LOG_D("Shader Linking ERROR: %s", program.getInfoLog())
+        translation_error = std::string("glslang link: ") + program.getInfoLog();
+        LOG_W_FORCE("%s", translation_error.c_str())
         errc = -1;
         return {};
     }
@@ -1071,7 +1146,8 @@ static bool spvc_ok(spvc_context context, spvc_result res, const char* what) {
     if (res == SPVC_SUCCESS) {
         return true;
     }
-    LOG_E("Error: %s failed in spirv-cross: %s", what, spvc_context_get_last_error_string(context))
+    translation_error = std::string("SPIRV-Cross ") + what + ": " + spvc_context_get_last_error_string(context);
+    LOG_W_FORCE("%s", translation_error.c_str())
     return false;
 }
 
@@ -1084,7 +1160,7 @@ std::string spirv_to_essl(std::vector<unsigned int> spirv, uint essl_version, in
     const SpvId* p_spirv = spirv.data();
     size_t word_count = spirv.size();
 
-    LOG_D("spirv_code.size(): %d", spirv.size())
+    LOG_D("spirv_code.size(): %zu", spirv.size())
 
     // Declared before 'essl': the compiled source lives in context-owned memory and is only
     // copied out when the std::string is constructed, so the guard has to outlive it.
@@ -1139,19 +1215,44 @@ std::string spirv_to_essl(std::vector<unsigned int> spirv, uint essl_version, in
     return essl;
 }
 
-static bool glslang_inited = false;
-std::string GLSLtoGLSLES_2(const char* glsl_code, GLenum glsl_type, uint essl_version, int& return_code) {
+std::string GLSLtoGLSLES_2(const char* glsl_code, GLenum glsl_type, uint essl_version, int& return_code,
+                         const mg_frag_bindings* outputs) {
+    ensure_glslang();
+    mg_glsl_metadata metadata;
+    if (hardware->emulate_texture_buffer) {
+        // Tokenize declarations, ignoring comments and preprocessor lines.
+        std::string_view input(glsl_code);
+        size_t p = 0;
+        bool buffer_type = false;
+        while (p < input.size()) {
+            if (!mg::glsl::detail::skipTrivia(input, p).ok || p == input.size()) break;
+            if (input[p] == '#') { while (p < input.size() && input[p] != '\n') ++p; continue; }
+            if (!mg::glsl::detail::isIdentifierStart(input[p])) { ++p; buffer_type = false; continue; }
+            const size_t start = p++;
+            while (p < input.size() && mg::glsl::detail::isIdentifierChar(input[p])) ++p;
+            const std::string token(input.substr(start, p - start));
+            if (buffer_type) metadata.buffer_samplers.push_back(token);
+            buffer_type = token == "isamplerBuffer";
+        }
+    }
     std::string correct_glsl_str = preprocess_glsl(glsl_code, glsl_type);
     LOG_D("Firstly converted GLSL:\n%s", correct_glsl_str.c_str())
     int glsl_version = get_or_add_glsl_version(correct_glsl_str);
-
-    if (!glslang_inited) {
-        glslang::InitializeProcess();
-        glslang_inited = true;
+    // SPIR-V generation requires ES 3.10 input. An ES 3.00 shader normally
+    // bypasses translation, but a program-specific output binding needs the
+    // parsed AST. Promote only that compiler input; Cross still emits the
+    // actual target ESSL version requested by the backend.
+    if (glsl_version == 300) {
+        const std::regex es300(R"((^|\n)\s*#\s*version\s+300\s+es\b)");
+        if (std::regex_search(correct_glsl_str, es300)) {
+            correct_glsl_str = std::regex_replace(correct_glsl_str, es300, "$1#version 310 es");
+            glsl_version = 310;
+        }
     }
+
     const char* s[] = {correct_glsl_str.c_str()};
     int errc = 0;
-    std::vector<unsigned int> spirv_code = glsl_to_spirv(glsl_type, glsl_version, s, errc);
+    std::vector<unsigned int> spirv_code = glsl_to_spirv(glsl_type, glsl_version, s, errc, outputs, metadata);
     if (errc != 0) {
         return_code = -1;
         return "";
@@ -1165,9 +1266,8 @@ std::string GLSLtoGLSLES_2(const char* glsl_code, GLenum glsl_type, uint essl_ve
 
     // Post-processing ESSL
 
-    if (glsl_type != GL_COMPUTE_SHADER) {
-        essl = removeLayoutBinding(essl);
-    }
+    // SPIRV-Cross already gates layout(binding) by the target ESSL version.
+    // Removing it here destroyed sampler/UBO/SSBO defaults on graphics stages.
     essl = processOutColorLocations(essl);
     // Must run before forceSupporterOutput(): that pass inserts precision
     // statements relative to the shader header, and the rewrite below adds
@@ -1181,6 +1281,11 @@ std::string GLSLtoGLSLES_2(const char* glsl_code, GLenum glsl_type, uint essl_ve
         }
     }
     essl = forceSupporterOutput(essl);
+    for (const auto& binding : metadata.bindings)
+        essl += "\n//MG_BIND " + binding.kind + " " + std::to_string(binding.binding) + " " +
+                std::to_string(binding.count) + " " + binding.name;
+    for (const auto& name : metadata.buffer_samplers) essl += "\n//MG_BUFFER " + name;
+    essl += "\n";
 
     LOG_D("Originally GLSL to GLSL ES Complete: \n%s", essl.c_str())
     return_code = errc;

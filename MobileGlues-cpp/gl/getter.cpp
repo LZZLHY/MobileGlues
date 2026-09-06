@@ -14,6 +14,7 @@
 #include <format>
 #include <vector>
 #include <random>
+#include <atomic>
 #include "FSR1/FSR1.h"
 #include "log.h"
 #include "mg.h"
@@ -26,17 +27,46 @@
 Version GLVersion;
 
 namespace {
-// See mg_set_gl_error in gl/mg.h for why this exists and why it is per thread.
-thread_local GLenum g_frontend_error = GL_NO_ERROR;
+thread_local GLenum fallback_errors[8]{};
+GLenum* pending_errors() { return g_current_ctx ? gl_state->errors : fallback_errors; }
 } // namespace
 
 void mg_set_gl_error(GLenum error) {
     if (error == GL_NO_ERROR) return;
-    // First error wins. A later, vaguer failure must not paper over the one that
-    // actually explains what the application did wrong.
-    if (g_frontend_error != GL_NO_ERROR) return;
-    g_frontend_error = error;
-    LOG_D("MobileGlues raised %s", glEnumToString(error))
+    GLenum* errors = pending_errors();
+    for (int i = 0; i < 8; ++i) if (errors[i] == error) return;
+    for (int i = 0; i < 8; ++i) if (errors[i] == GL_NO_ERROR) { errors[i] = error; break; }
+    static std::atomic<unsigned> failures{0};
+    const unsigned n = ++failures;
+    if (n <= 32 || (n & (n - 1)) == 0) {
+        LOG_W_FORCE("[MG-GL-ERROR] code=0x%x count=%u", error, n)
+    }
+}
+
+void mg_begin_driver_operation() {
+    if (!GLES.glGetError) return;
+    for (int i = 0; i < 16; ++i) {
+        GLenum error = GLES.glGetError();
+        if (error == GL_NO_ERROR) break;
+        mg_set_gl_error(error);
+    }
+}
+
+bool mg_end_driver_operation(const char* operation) {
+    bool success = true;
+    if (!GLES.glGetError) return true;
+    for (int i = 0; i < 16; ++i) {
+        GLenum error = GLES.glGetError();
+        if (error == GL_NO_ERROR) break;
+        success = false;
+        mg_set_gl_error(error);
+    }
+    if (!success) {
+        static std::atomic<unsigned> failures{0};
+        const unsigned n = ++failures;
+        if (n <= 32 || (n & (n - 1)) == 0) LOG_W_FORCE("[MG-GL-FAIL] operation=%s count=%u", operation, n)
+    }
+    return success;
 }
 
 void glGetIntegerv(GLenum pname, GLint* params) {
@@ -97,8 +127,8 @@ void glGetIntegerv(GLenum pname, GLint* params) {
     case GL_MAX_TEXTURE_IMAGE_UNITS: {
         int es_params = 16;
         GLES.glGetIntegerv(pname, &es_params);
-        CHECK_GL_ERROR(*params) = es_params * 2;
-        // Why is the real GL_MAX_TEXTURE_IMAGE_UNITS bigger than what GLES.glGetIntegerv returns?
+        CHECK_GL_ERROR
+        (*params) = es_params;
         break;
     }
     case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS: {
@@ -182,30 +212,14 @@ void glGetIntegerv(GLenum pname, GLint* params) {
 
 GLenum glGetError() {
     LOG()
-    // Both are consumed whether or not they get reported: leaving either latched
-    // would hand it to a later, unrelated glGetError.
-    const GLenum backend = GLES.glGetError();
-    const GLenum frontend = g_frontend_error;
-    g_frontend_error = GL_NO_ERROR;
-
-    // GL_NO_ERROR, always, in every configuration and whatever ignoreError says.
-    //
-    // Deliberate, and not the same thing as not knowing. This layer emulates
-    // enough of desktop GL on top of GLES that a faithfully forwarded error is
-    // more often an artefact of how a call had to be translated than something the
-    // application got wrong -- and hosts treat errors as fatal or fall back to
-    // slower paths on them. One example from inside this very library:
-    // gl/buffer.cpp's glMapBuffer asks glGetError and returns nullptr if it is
-    // not clear, a branch that only stays dead because of this.
-    //
-    // What the errors are still for is the log. Every path that raises one names
-    // itself right next to the call, so a quiet failure is diagnosable from a
-    // logcat even though the application will never be told.
-    const GLenum swallowed = frontend != GL_NO_ERROR ? frontend : backend;
-    if (swallowed != GL_NO_ERROR) {
-        LOG_W("glGetError -> %s, reported to the application as GL_NO_ERROR", glEnumToString(swallowed))
+    GLenum* errors = pending_errors();
+    if (errors[0] != GL_NO_ERROR) {
+        const GLenum result = errors[0];
+        for (int i = 1; i < 8; ++i) errors[i - 1] = errors[i];
+        errors[7] = GL_NO_ERROR;
+        return result;
     }
-    return GL_NO_ERROR;
+    return GLES.glGetError ? GLES.glGetError() : GL_NO_ERROR;
 }
 
 static std::string es_ext;

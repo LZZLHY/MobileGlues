@@ -131,6 +131,7 @@ set_target_properties(mobileglues_core PROPERTIES
 # These are private on purpose: an embedded host must not accidentally compile
 # its own EGL/GLES translation units against MobileGlues' vendored headers.
 target_include_directories(mobileglues_core BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/glslang
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/xxhash

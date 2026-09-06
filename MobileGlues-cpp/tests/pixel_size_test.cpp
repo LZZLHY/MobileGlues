@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <thread>
 #include <GL/gl.h>
 #include <GL/glext.h>
 
@@ -88,6 +89,17 @@ int main() {
     eq("align 3 (not pow2) passes",  (long)widthalign((uintptr_t)7, (uintptr_t)3), 7);
     eq("align 1 is identity",        (long)widthalign((uintptr_t)7, (uintptr_t)1), 7);
 
+    printf("context migration keeps unpack state with the context\n");
+    gl_state_s context{};
+    gl_state=&context;mg_unpack_state_t state{};state.alignment=8;mg_unpack_state_adopt(state);
+    gl_state=&g_default_gl_state;
+    std::thread other([&]{gl_state=&context;mg_pixel_store_set(GL_UNPACK_ALIGNMENT,1);gl_state=&g_default_gl_state;});
+    other.join();gl_state=&context;
+    eq("same context mirror exists",mg_unpack_state(&state),true);
+    eq("migration observes updated alignment",state.alignment,1);
+    gl_state_s replacement{};gl_state=&replacement;
+    eq("new context does not inherit mirror",mg_unpack_state(&state),false);
+    gl_state=&g_default_gl_state;
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "all checks passed", fails);
     return fails != 0;
 }

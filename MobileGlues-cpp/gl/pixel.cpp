@@ -185,23 +185,8 @@ GLint* desktop_pixel_store_slot(GLenum pname) {
     }
 }
 
-// The mirror of the unpack parameters GLES does have, and the context it
-// describes.
-//
-// Thread-local because a context is current on one thread at a time, and keyed on
-// gl_state because that pointer is per context -- the same reason the six above
-// live behind it. The key is only half of what identifies a context, though: a
-// destroyed context's record can be handed back to the next one at the same
-// address, so a holder that has an id available should check that too. Nothing
-// here can: gl/pixel.cpp is linked by the host test harness, which has no EGL
-// layer to ask.
-struct unpack_mirror_t {
-    mg_unpack_state_t values;
-    const gl_state_s* owner = nullptr;
-    bool valid = false;
-};
-
-thread_local unpack_mirror_t g_unpack_mirror;
+// Native unpack values live in gl_state, so a context carries its mirror
+// through thread migration and a new context starts with an invalid mirror.
 
 // Where each GLES-native unpack parameter lives in the mirror, or nullptr for a
 // pname that is not one of them.
@@ -227,19 +212,10 @@ GLint* unpack_mirror_slot(mg_unpack_state_t& v, GLenum pname) {
 // Mirror one write on its way to the driver. The value still goes to the driver
 // afterwards; this only records what it will be.
 void unpack_mirror_record(GLenum pname, GLint param) {
-    GLint* slot = unpack_mirror_slot(g_unpack_mirror.values, pname);
+    mg_unpack_state_t values;
+    if (!mg_unpack_state(&values)) return;
+    GLint* slot = unpack_mirror_slot(values, pname);
     if (slot == nullptr) return;
-
-    if (g_unpack_mirror.owner != gl_state) {
-        // A context the mirror does not describe. Writing one parameter into
-        // another context's five would be worse than not mirroring at all, so the
-        // record is dropped instead and the next reader re-reads the driver --
-        // which by then has this write too, because the frontend forwards it as
-        // soon as this returns.
-        g_unpack_mirror.owner = gl_state;
-        g_unpack_mirror.valid = false;
-    }
-    if (!g_unpack_mirror.valid) return;
 
     // A value the driver refuses leaves the driver's state alone, so it has to
     // leave the mirror alone as well. GL 4.6 sec. 8.4.1: an alignment is 1, 2, 4
@@ -250,19 +226,25 @@ void unpack_mirror_record(GLenum pname, GLint param) {
         return;
     }
     *slot = param;
+    mg_unpack_state_adopt(values);
 }
 } // namespace
 
 bool mg_unpack_state(mg_unpack_state_t* out) {
-    if (!g_unpack_mirror.valid || g_unpack_mirror.owner != gl_state) return false;
-    if (out != nullptr) *out = g_unpack_mirror.values;
+    if (!gl_state || !gl_state->unpack_mirror_valid) return false;
+    if (out) {
+        const GLint* v = gl_state->unpack_mirror;
+        *out = {v[0], v[1], v[2], v[3], v[4], v[5]};
+    }
     return true;
 }
 
 void mg_unpack_state_adopt(const mg_unpack_state_t& values) {
-    g_unpack_mirror.values = values;
-    g_unpack_mirror.owner = gl_state;
-    g_unpack_mirror.valid = true;
+    if (!gl_state) return;
+    const GLint v[] = {values.alignment, values.row_length, values.skip_rows,
+                       values.skip_pixels, values.image_height, values.skip_images};
+    std::copy(v, v + 6, gl_state->unpack_mirror);
+    gl_state->unpack_mirror_valid = true;
 }
 
 bool mg_pixel_store_set(GLenum pname, GLint param) {

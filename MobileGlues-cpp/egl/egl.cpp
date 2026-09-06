@@ -11,6 +11,7 @@
 #include "../gl/FSR1/FSR1.h"
 #include "../gl/log.h"
 #include "../gl/mg.h"
+#include "../gl/getter.h"
 #include "../gles/loader.h"
 #include "../glx/lookup.h"
 #include "loader.h"
@@ -281,13 +282,11 @@ namespace {
     }
 
     EGLint defaultDesktopMajorVersion() {
-        return global_settings.custom_gl_version.isEmpty() ? DEFAULT_GL_VERSION / 10
-                                                           : global_settings.custom_gl_version.Major;
+        return GLVersion.Major;
     }
 
     EGLint defaultDesktopMinorVersion() {
-        return global_settings.custom_gl_version.isEmpty() ? DEFAULT_GL_VERSION % 10
-                                                           : global_settings.custom_gl_version.Minor;
+        return GLVersion.Minor;
     }
 
     bool makeBackendContextAttributes(const EGLint* attrib_list, std::vector<EGLint>* backend_attributes,
@@ -754,9 +753,9 @@ namespace {
             paceAfterPresent(surface, result);
             return result;
         }
+        CheckResolutionChange(dpy, surface);
         ApplyFSR();
         const EGLBoolean result = egl_eglSwapBuffers(dpy, surface);
-        CheckResolutionChange(dpy, surface);
         finishFrameStats();
         paceAfterPresent(surface, result);
         return result;

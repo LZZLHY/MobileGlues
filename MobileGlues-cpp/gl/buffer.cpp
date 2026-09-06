@@ -26,7 +26,6 @@ static_assert(GL_MAP_PERSISTENT_BIT == mg::buffer_contract::MapPersistent);
 static_assert(GL_MAP_COHERENT_BIT == mg::buffer_contract::MapCoherent);
 static_assert(GL_DYNAMIC_STORAGE_BIT == mg::buffer_contract::DynamicStorage);
 
-GLuint bound_array;
 static GLint maxBufferId = 0;
 static GLint maxArrayId = 0;
 
@@ -86,6 +85,7 @@ struct upload_stats_t {
 };
 
 struct buffer_ctx_state_t { // private to one context
+    GLuint bound_array{0};
     std::vector<GLuint> gen_arrays;
     std::vector<char> gen_array_exists;
     std::vector<GLuint> free_array_ids;
@@ -210,6 +210,7 @@ enum BindingIndex : int {
     BINDING_COUNT
 };
 #define g_bound_buffers_arr (g_bc->bound_buffers)
+#define bound_array (g_bc->bound_array)
 static_assert(BINDING_COUNT == 13, "buffer_ctx_state_t::bound_buffers must match BindingIndex");
 
 static inline int ensure_buffer_capacity(GLuint id) {
@@ -396,20 +397,9 @@ GLuint find_bound_buffer_by_target(GLenum target) {
 // is forwarded verbatim by glBindBuffer -- GLES creates the object on first bind
 // -- so it is its own driver name.
 //
-// Two limits, both shared with this layer's own glGetIntegerv:
-//   - It reports the last name bound to the target, and glDeleteBuffers does not
-//     clear the binding slots (only GL_PARAMETER_BUFFER, which has no driver-side
-//     binding to fall back on). Deleting a still-bound buffer resets the driver's
-//     binding to 0 while this keeps reporting the dead name.
-//   - It is the tracked state, so it is only the driver's state where the two
-//     agree. Every internal path that binds GL_ELEMENT_ARRAY_BUFFER or
-//     GL_DRAW_INDIRECT_BUFFER through GLES.* directly (gl/multidraw.cpp,
-//     gl/drawing.cpp, gl/restart.cpp) saves and restores around its own work, so
-//     they disagree only inside those windows -- ask before the temporary bind,
-//     never during it. gl/gl.cpp's depth-clear triangle is the one path that does
-//     not: it leaves the driver on vertex array 0 and GL_ARRAY_BUFFER 0 without
-//     putting the application's back, which desynchronises the element array
-//     binding too, since that is vertex array state.
+// Binding slots are cleared when their object is deleted. Internal raw GLES
+// operations must restore their borrowed bindings before this accessor is used.
+// The ANGLE clear pass likewise restores program, VAO and array-buffer state.
 //
 // GL_PARAMETER_BUFFER has no GLES binding at all; the mapped name is returned for
 // it anyway, because gl/multidraw.cpp is the only thing that asks and it needs the
@@ -616,6 +606,8 @@ void glGenBuffers(GLsizei n, GLuint* buffers) {
 void glDeleteBuffers(GLsizei n, const GLuint* buffers) {
     LOG()
     LOG_D("glDeleteBuffers(%i, %p)", n, buffers)
+    if (n < 0) { mg_set_gl_error(GL_INVALID_VALUE); return; }
+    if (n > 0 && !buffers) { mg_set_gl_error(GL_INVALID_VALUE); return; }
     for (int i = 0; i < n; ++i) {
         // GL resets a binding to 0 when the bound buffer is deleted. The
         // parameter buffer slot is the only source of truth gl/multidraw.cpp has
@@ -629,6 +621,12 @@ void glDeleteBuffers(GLsizei n, const GLuint* buffers) {
             GLuint real_buff = find_real_buffer(buffers[i]);
             GLES.glDeleteBuffers(1, &real_buff);
             CHECK_GL_ERROR
+        }
+        if (buffers[i] != 0) {
+            for (GLuint& binding : g_bound_buffers_arr) if (binding == buffers[i]) binding = 0;
+            // Only the bound VAO loses its element attachment on deletion.
+            // Unbound containers retain the driver's reference to the object.
+            if (get_ibo_by_vao(bound_array) == buffers[i]) update_vao_ibo_binding(bound_array, 0);
         }
         remove_buffer(buffers[i]);
     }
@@ -1510,8 +1508,10 @@ void glBufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage
         return;
     }
     borrowed_target_t t(target);
+    mg_begin_driver_operation();
     GLES.glBufferData(t.target, size, data, usage);
-    note_buffer_storage(frontend, size, mg::buffer_contract::MutableStorage());
+    if (mg_end_driver_operation("glBufferData"))
+        note_buffer_storage(frontend, size, mg::buffer_contract::MutableStorage());
     CHECK_GL_ERROR
 }
 
@@ -1628,9 +1628,10 @@ void* glMapBuffer(GLenum target, GLenum access) {
         }
         return result;
     }
-    GLint buffer_size;
+    GLint buffer_size = 0;
+    mg_begin_driver_operation();
     glGetBufferParameteriv(target, GL_BUFFER_SIZE, &buffer_size);
-    if (buffer_size <= 0 || glGetError() != GL_NO_ERROR) {
+    if (!mg_end_driver_operation("glMapBuffer/query-size") || buffer_size <= 0) {
         return nullptr;
     }
     GLbitfield flags = 0;
@@ -1770,6 +1771,7 @@ void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfiel
     const auto contract = mg::buffer_contract::ImmutableStorage(
         static_cast<std::uint32_t>(requested_flags), global_settings.buffer_coherent_as_flush);
     borrowed_target_t t(target);
+    mg_begin_driver_operation();
     if (GLES.glBufferStorageEXT) {
         flags = static_cast<GLbitfield>(contract.effective_flags);
         GLES.glBufferStorageEXT(t.target, size, data, flags);
@@ -1777,6 +1779,7 @@ void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfiel
         mg_set_gl_error(GL_INVALID_OPERATION);
         return;
     }
+    if (!mg_end_driver_operation("glBufferStorage")) return;
     note_buffer_storage(frontend, size, contract);
 
     if (size == static_cast<GLsizeiptr>(kCandidate32MiB) ||
@@ -1832,6 +1835,7 @@ void glGenVertexArrays(GLsizei n, GLuint* arrays) {
 void glDeleteVertexArrays(GLsizei n, const GLuint* arrays) {
     LOG()
     LOG_D("glDeleteVertexArrays(%i, %p)", n, arrays)
+    if (n < 0 || (n > 0 && !arrays)) { mg_set_gl_error(GL_INVALID_VALUE); return; }
     for (int i = 0; i < n; ++i) {
         if (find_real_array(arrays[i])) {
             GLuint real_array = find_real_array(arrays[i]);
@@ -1839,6 +1843,10 @@ void glDeleteVertexArrays(GLsizei n, const GLuint* arrays) {
             CHECK_GL_ERROR
         }
         remove_array(arrays[i]);
+        if (arrays[i] != 0 && bound_array == arrays[i]) {
+            bound_array = 0;
+            set_bound_buffer_by_target(GL_ELEMENT_ARRAY_BUFFER, get_ibo_by_vao(0));
+        }
     }
 }
 

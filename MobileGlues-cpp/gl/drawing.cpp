@@ -1,198 +1,71 @@
-// MobileGlues - gl/drawing.cpp
 // Copyright (c) 2025-2026 MobileGL-Dev
-// Licensed under the GNU Lesser General Public License v2.1:
-//   https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
 // SPDX-License-Identifier: LGPL-2.1-only
-// End of Source File Header
-
+// MobileGlues draw preparation. LGPL-2.1-only.
 #include "drawing.h"
+#include "shader.h"
+#include "index_rebase_core.h"
 #include "restart.h"
 #include "buffer.h"
 #include "framebuffer.h"
 #include "mg.h"
 #include "texture.h"
 #include "../egl/context.h"
-
+#include <algorithm>
 #define DEBUG 0
 
-GLuint bufSampelerProg;
-GLuint bufSampelerLoc;
-std::string bufSampelerName;
-
-extern UnorderedMap<GLuint, bool> program_map_is_sampler_buffer_emulated;
-
-UnorderedMap<GLuint, SamplerInfo> g_samplerCacheForSamplerBuffer;
-
-namespace {
-
-// The unit gl/texture.cpp parks the emulated buffer texture on. Kept in step with
-// MG_TEXTURE_BUFFER_EMULATION_UNIT there and with gl/buffer.cpp's glTexBuffer,
-// which borrows the same one.
-const GLint kBufferTextureUnit = 15;
-
-// Everything the two program maps have to say about one program, held so the
-// sampler list is not copied out of the map on every draw.
-//
-// It is not a cache of the lookups themselves. Both maps are re-probed on every
-// call, because both carry this layer's invalidation points and neither can reach
-// a file-local cache: glCreateProgram clears
-// program_map_is_sampler_buffer_emulated[program] and erases the sampler entry --
-// it exists for that, because GL hands the name of a deleted program straight back
-// out -- and glAttachShader sets the flag. Remembering either answer let a recycled
-// name keep the previous program's uniform locations, and glUseProgram cannot be
-// the invalidation point instead: it is filtered when the name repeats, and a
-// recycled name does repeat.
-//
-// What is kept is the copy below, valid only while the sampler entry it came from
-// is still the entry the map holds for this program. Copied rather than pointed at
-// across calls because g_samplerCacheForSamplerBuffer is process-wide with no lock,
-// so a pointer into it would not survive a rehash or an erase performed on another
-// thread.
-struct resolved_program_t {
-    GLuint program = 0;
-    // The entry the copy below was taken from, and the only thing that says the
-    // copy still describes this program. A mismatch costs one copy, never a wrong
-    // answer; the map's entries are inserted by this function alone, always from
-    // the live program, so a hit at the same address is the entry that was copied.
-    const SamplerInfo* source = nullptr;
-    bool emulated = false;
-    GLint locWidth = -1;
-    GLint locHeight = -1;
-    std::vector<GLint> samplers;
-};
-
-// thread_local because gl_state is: two threads with different current contexts
-// have different current programs and must not share this.
-thread_local resolved_program_t g_resolved_program;
-
-const resolved_program_t& resolve_program(GLuint program) {
-    // find() rather than operator[]: this used to insert a default-constructed
-    // entry for every program the application ever drew with, on the draw path,
-    // and could rehash the map while doing it.
-    const auto emu = program_map_is_sampler_buffer_emulated.find(program);
-    if (emu == program_map_is_sampler_buffer_emulated.end() || !emu->second) {
-        g_resolved_program.program = program;
-        g_resolved_program.source = nullptr;
-        g_resolved_program.emulated = false;
-        g_resolved_program.locWidth = -1;
-        g_resolved_program.locHeight = -1;
-        g_resolved_program.samplers.clear();
-        return g_resolved_program;
-    }
-
-    auto it = g_samplerCacheForSamplerBuffer.find(program);
-    if (it != g_samplerCacheForSamplerBuffer.end() && g_resolved_program.program == program &&
-        g_resolved_program.source == &it->second) {
-        return g_resolved_program;
-    }
-
-    const SamplerInfo* info = nullptr;
-    if (it != g_samplerCacheForSamplerBuffer.end()) {
-        info = &it->second;
-    } else {
-        // Value-initialised: SamplerInfo has no default member initialisers, and
-        // the entry is stored even when the program turns out not to carry the
-        // emulation uniforms. The old code inserted the entry *before* that check
-        // and returned without filling it in, so every later draw with the same
-        // program read whatever the allocation happened to hold -- and reprobing
-        // was skipped anyway because the key was present.
-        SamplerInfo built{};
-        built.locWidth = GLES.glGetUniformLocation(program, "u_BufferTexWidth");
-        built.locHeight = GLES.glGetUniformLocation(program, "u_BufferTexHeight");
-        if (built.locWidth == -1) {
-            LOG_W("u_BufferTexWidth uniform not found in program %d", program);
-        } else {
-            GLint numUniforms = 0;
-            GLES.glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &numUniforms);
-            LOG_D("Program %d has %d active uniforms", program, numUniforms);
-
-            for (GLint i = 0; i < numUniforms; ++i) {
-                const GLsizei bufSize = 256;
-                GLchar name[bufSize];
-                GLsizei length = 0;
-                GLint size = 0;
-                GLenum type = 0;
-                GLES.glGetActiveUniform(program, i, bufSize, &length, &size, &type, name);
-
-                if (type == GL_SAMPLER_2D || type == GL_INT_SAMPLER_2D) {
-                    built.samplers.push_back(GLES.glGetUniformLocation(program, name));
-                }
+void setupBufferTextureUniforms(GLuint program) {
+    auto& group = mg_shader_objects();
+    std::lock_guard<std::recursive_mutex> lock(group.mutex);
+    const auto it = group.programs.find(program);
+    if (it == group.programs.end() || it->second.metadata.buffer_samplers.empty()) return;
+    auto& record = it->second;
+    if (record.sampler_cache_generation != record.link_generation) {
+        record.sampler_locations.clear();
+        record.buffer_width_location = GLES.glGetUniformLocation(program, "u_BufferTexWidth");
+        record.buffer_height_location = GLES.glGetUniformLocation(program, "u_BufferTexHeight");
+        GLint count = 0;
+        GLES.glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &count);
+        for (GLint i = 0; i < count; ++i) {
+            char name[1024]{};
+            GLint size = 0;
+            GLenum type = 0;
+            GLsizei length = 0;
+            GLES.glGetActiveUniform(program, i, sizeof(name), &length, &size, &type, name);
+            std::string base(name);
+            const size_t bracket = base.find('[');
+            if (bracket != std::string::npos) base.resize(bracket);
+            if (std::find(record.metadata.buffer_samplers.begin(), record.metadata.buffer_samplers.end(), base) ==
+                record.metadata.buffer_samplers.end())
+                continue;
+            for (GLint element = 0; element < size; ++element) {
+                const std::string uniform =
+                    bracket != std::string::npos ? base + "[" + std::to_string(element) + "]" : base;
+                const GLint location = GLES.glGetUniformLocation(program, uniform.c_str());
+                if (location >= 0) record.sampler_locations.push_back(location);
             }
         }
-        info = &(g_samplerCacheForSamplerBuffer[program] = std::move(built));
+        record.sampler_cache_generation = record.link_generation;
     }
-
-    g_resolved_program.program = program;
-    g_resolved_program.source = info;
-    g_resolved_program.samplers.clear();
-
-    // A program with no u_BufferTexWidth has nothing to receive, which is what the
-    // early return used to say.
-    if (info->locWidth == -1) {
-        g_resolved_program.emulated = false;
-        g_resolved_program.locWidth = -1;
-        g_resolved_program.locHeight = -1;
-        return g_resolved_program;
+    if (record.buffer_width_location < 0 || record.sampler_locations.empty()) return;
+    GLuint texture = 0;
+    constexpr GLint unit = 15;
+    if (!mg_driver_texture_binding_at_unit(unit, GL_TEXTURE_2D, &texture)) {
+        const int previous = mg_driver_active_texture_unit();
+        GLES.glActiveTexture(GL_TEXTURE0 + unit);
+        GLint value = 0;
+        GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &value);
+        texture = value;
+        GLES.glActiveTexture(GL_TEXTURE0 + previous);
     }
-
-    g_resolved_program.emulated = true;
-    g_resolved_program.locWidth = info->locWidth;
-    g_resolved_program.locHeight = info->locHeight;
-    g_resolved_program.samplers = info->samplers;
-    return g_resolved_program;
+    const TextureObject* object = mgGetTexObjectByID(texture);
+    if (!object) return;
+    // Only original buffer samplers are rewritten. Ordinary sampler2D uniforms
+    // keep the application's unit even in a program that also uses a buffer.
+    for (GLint location : record.sampler_locations)
+        GLES.glUniform1i(location, unit);
+    GLES.glUniform1i(record.buffer_width_location, object->width);
+    GLES.glUniform1i(record.buffer_height_location, object->height);
 }
-
-} // namespace
-
-void setupBufferTextureUniforms(GLuint program) {
-    LOG_D("setupBufferTextureUniforms, program: %d", program);
-
-    const resolved_program_t& info = resolve_program(program);
-    if (!info.emulated || info.samplers.empty()) return;
-
-    // The uniform writes stay on the draw path rather than moving to glUseProgram.
-    // The size uniforms describe whatever texture is parked on the emulation unit
-    // *now*, and an application is entitled to bind its buffer texture after
-    // glUseProgram and before the draw -- resolving them at glUseProgram time would
-    // describe the previous binding. Only the map lookups above are hoisted, and
-    // those depend on the program alone.
-    //
-    // Every sampler in the program reads that one binding, so it is resolved once
-    // for the whole loop instead of once per sampler, as are the size uniforms.
-    GLuint texId = 0;
-    if (!mg_driver_texture_binding_at_unit(kBufferTextureUnit, GL_TEXTURE_2D, &texId)) {
-        // The tracked driver-side binding is not trustworthy right now (FSR1 leaves
-        // a texture bound on a unit nothing records), so pay for the round trip.
-        // Borrowing the unit has to hand it back: gl/buffer.cpp's glTexBuffer and
-        // gl/texture.cpp's glBindTexture both assume the emulation unit is only
-        // ever active inside a window that restores it.
-        const int prev_unit = mg_driver_active_texture_unit();
-        GLES.glActiveTexture(GL_TEXTURE0 + kBufferTextureUnit);
-        GLint queried = 0;
-        GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &queried);
-        GLES.glActiveTexture(GL_TEXTURE0 + prev_unit);
-        texId = static_cast<GLuint>(queried);
-    }
-    if (texId == 0) return;
-
-    const TextureObject* texObject = mgGetTexObjectByID(texId);
-    // mgGetTexObjectByID answers null for a name this layer has no record of. The
-    // dimensions are the whole point of these uniforms, so there is nothing useful
-    // to write without it.
-    if (!texObject) return;
-
-    bool wrote_sampler = false;
-    for (const GLint locSampler : info.samplers) {
-        if (locSampler < 0) continue;
-        GLES.glUniform1i(locSampler, kBufferTextureUnit);
-        wrote_sampler = true;
-    }
-    if (!wrote_sampler) return;
-
-    GLES.glUniform1i(info.locWidth, texObject->width);
-    GLES.glUniform1i(info.locHeight, texObject->height);
-}
-
 void prepareForDraw() {
     LOG_D("prepareForDraw...")
     if (hardware->emulate_texture_buffer) {
@@ -258,42 +131,42 @@ void glMemoryBarrier(GLbitfield barriers) {
 
 namespace {
 
-// Scratch index buffer for the base-vertex emulation below, and the context that
-// owns it. Modeled on gl/restart.cpp's g_restart_ibo, including the invalidation:
-// thread_local because g_current_ctx is, so two threads with different current
-// contexts keep their own name instead of trading one back and forth.
-thread_local GLuint g_basevertex_ibo = 0;
-thread_local unsigned long long g_basevertex_owner_ctx_id = 0;
+    // Scratch index buffer for the base-vertex emulation below, and the context that
+    // owns it. Modeled on gl/restart.cpp's g_restart_ibo, including the invalidation:
+    // thread_local because g_current_ctx is, so two threads with different current
+    // contexts keep their own name instead of trading one back and forth.
+    thread_local GLuint g_basevertex_ibo = 0;
+    thread_local unsigned long long g_basevertex_owner_ctx_id = 0;
 
-// Drop the cached name when the current context is not the one that created it.
-//
-// Deliberately no glDeleteBuffers: if the owning context is gone the buffer went
-// with it, and if it is merely not current then this name refers to a buffer
-// belonging to whichever context *is* current -- the glBufferData below would
-// overwrite that buffer's contents.
-void basevertex_check_context() {
-    const unsigned long long cur = g_current_ctx ? g_current_ctx->id : 0;
-    if (cur == g_basevertex_owner_ctx_id) return;
-    g_basevertex_ibo = 0;
-    g_basevertex_owner_ctx_id = cur;
-}
+    // Drop the cached name when the current context is not the one that created it.
+    //
+    // Deliberately no glDeleteBuffers: if the owning context is gone the buffer went
+    // with it, and if it is merely not current then this name refers to a buffer
+    // belonging to whichever context *is* current -- the glBufferData below would
+    // overwrite that buffer's contents.
+    void basevertex_check_context() {
+        const unsigned long long cur = g_current_ctx ? g_current_ctx->id : 0;
+        if (cur == g_basevertex_owner_ctx_id) return;
+        g_basevertex_ibo = 0;
+        g_basevertex_owner_ctx_id = cur;
+    }
 
-// Staging for the rebased index stream. Elements are GLuint so the storage is
-// always aligned for the widest index type it has to hold; the length is in whole
-// GLuints, rounded up. Grown and never shrunk, so a steady stream of draws
-// allocates nothing -- this used to be a malloc and a free per call.
-thread_local std::vector<GLuint> g_basevertex_staging;
+    // Staging for the rebased index stream. Elements are GLuint so the storage is
+    // always aligned for the widest index type it has to hold; the length is in whole
+    // GLuints, rounded up. Grown and never shrunk, so a steady stream of draws
+    // allocates nothing -- this used to be a malloc and a free per call.
+    thread_local std::vector<GLuint> g_basevertex_staging;
 
-void* basevertex_staging(size_t bytes) {
-    // Grown only. A plain resize() to the exact length shrinks after a small draw
-    // and then value-initialises the difference on the next large one -- a memset
-    // of the whole tail that the caller's memcpy overwrites immediately. Only the
-    // first `bytes` bytes are ever read, so what is past them is out of range in
-    // the same way it is in gl/multidraw.cpp and gl/restart.cpp.
-    const size_t need = (bytes + sizeof(GLuint) - 1) / sizeof(GLuint);
-    if (g_basevertex_staging.size() < need) g_basevertex_staging.resize(need);
-    return g_basevertex_staging.data();
-}
+    void* basevertex_staging(size_t bytes) {
+        // Grown only. A plain resize() to the exact length shrinks after a small draw
+        // and then value-initialises the difference on the next large one -- a memset
+        // of the whole tail that the caller's memcpy overwrites immediately. Only the
+        // first `bytes` bytes are ever read, so what is past them is out of range in
+        // the same way it is in gl/multidraw.cpp and gl/restart.cpp.
+        const size_t need = (bytes + sizeof(GLuint) - 1) / sizeof(GLuint);
+        if (g_basevertex_staging.size() < need) g_basevertex_staging.resize(need);
+        return g_basevertex_staging.data();
+    }
 
 } // namespace
 
@@ -359,10 +232,9 @@ void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const voi
             // Read-only, and it has to stay a map: gl/buffer.cpp tracks a buffer's
             // size but never its contents, so there is no shadow copy of the index
             // data to rebase from.
-            void* srcData =
-                GLES.glMapBufferRange(GL_ELEMENT_ARRAY_BUFFER,
-                                      static_cast<GLintptr>(reinterpret_cast<uintptr_t>(indices)),
-                                      static_cast<GLsizeiptr>(bytes), GL_MAP_READ_BIT);
+            void* srcData = GLES.glMapBufferRange(GL_ELEMENT_ARRAY_BUFFER,
+                                                  static_cast<GLintptr>(reinterpret_cast<uintptr_t>(indices)),
+                                                  static_cast<GLsizeiptr>(bytes), GL_MAP_READ_BIT);
             if (!srcData) {
                 // An immutable or persistently mapped index buffer cannot be read
                 // back, and there is no driver base vertex on this path to fall
@@ -377,32 +249,19 @@ void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const voi
             memcpy(tempIndices, indices, bytes);
         }
 
-        switch (type) {
-        case GL_UNSIGNED_INT:
-            for (GLsizei j = 0; j < count; ++j) {
-                ((GLuint*)tempIndices)[j] += basevertex;
-            }
-            break;
-        case GL_UNSIGNED_SHORT:
-            for (GLsizei j = 0; j < count; ++j) {
-                ((GLushort*)tempIndices)[j] += basevertex;
-            }
-            break;
-        case GL_UNSIGNED_BYTE:
-            for (GLsizei j = 0; j < count; ++j) {
-                ((GLubyte*)tempIndices)[j] += basevertex;
-            }
-            break;
-        }
-
+        std::vector<GLuint> rebased(static_cast<size_t>(count));
+        const bool preserve_restart = restart_fixed || mg_enable_state()->scalar[MGC_PRIMITIVE_RESTART_FIXED_INDEX];
+        const GLuint sentinel = type == GL_UNSIGNED_BYTE ? 0xffu : type == GL_UNSIGNED_SHORT ? 0xffffu : 0xffffffffu;
+        mg_rebase_indices_to_u32(rebased.data(), tempIndices, count, type, basevertex, preserve_restart, sentinel);
         // One persistent scratch buffer instead of a glGenBuffers/glDeleteBuffers
         // pair per draw call.
         basevertex_check_context();
         if (!g_basevertex_ibo) GLES.glGenBuffers(1, &g_basevertex_ibo);
         GLES.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_basevertex_ibo);
-        GLES.glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(bytes), tempIndices, GL_STREAM_DRAW);
+        GLES.glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(rebased.size() * sizeof(GLuint)),
+                          rebased.data(), GL_STREAM_DRAW);
 
-        GLES.glDrawElements(mode, count, type, nullptr);
+        GLES.glDrawElements(mode, count, GL_UNSIGNED_INT, nullptr);
 
         GLES.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, prevElementBuffer);
 
@@ -436,17 +295,17 @@ void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const voi
 // Brackets a draw with GLES' fixed-index restart. Scoped so an early return
 // cannot leave it enabled behind the application's back.
 namespace {
-struct restart_guard_t {
-    bool on;
-    explicit restart_guard_t(GLenum type) : on(mg_restart_needs_driver_fixed(type)) {
-        if (on) GLES.glEnable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
-    }
-    ~restart_guard_t() {
-        if (on) GLES.glDisable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
-    }
-    restart_guard_t(const restart_guard_t&) = delete;
-    restart_guard_t& operator=(const restart_guard_t&) = delete;
-};
+    struct restart_guard_t {
+        bool on;
+        explicit restart_guard_t(GLenum type) : on(mg_restart_needs_driver_fixed(type)) {
+            if (on) GLES.glEnable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
+        }
+        ~restart_guard_t() {
+            if (on) GLES.glDisable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
+        }
+        restart_guard_t(const restart_guard_t&) = delete;
+        restart_guard_t& operator=(const restart_guard_t&) = delete;
+    };
 } // namespace
 
 void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void* indices) {

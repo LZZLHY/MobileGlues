@@ -49,6 +49,8 @@ struct framebuffer_t {
     // glReadBuffer can find the texture instead of moving it again. Empty means no
     // shuffle is in effect and every attachment is where the application put it.
     std::vector<GLenum> draw_buffer_map;
+    std::vector<GLenum> logical_draw_buffers{GL_COLOR_ATTACHMENT0};
+    GLenum logical_read_buffer = GL_COLOR_ATTACHMENT0;
     // No depth_attachment / stencil_attachment. They were written and never read
     // by anything in the tree, and the branch that filled them did not recognise
     // GL_DEPTH_STENCIL_ATTACHMENT -- the usual way to attach depth -- so the one

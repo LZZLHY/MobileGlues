@@ -75,6 +75,9 @@ extern "C"
         GLuint current_program;
         GLuint current_tex_unit;
         GLuint current_draw_fbo;
+        GLenum errors[8]{};
+        GLint unpack_mirror[6]{4, 0, 0, 0, 0, 0};
+        bool unpack_mirror_valid{false};
 
         // The pixel-store parameters desktop GL has and GLES does not.
         //
@@ -123,10 +126,11 @@ extern "C"
     // untouched buffer and GL_NO_ERROR with no way to tell the two apart. This is
     // where they say what went wrong instead.
     //
-    // One slot per thread and the first error wins, which is what GL 4.6 sec 2.3.1
-    // asks for. Per thread rather than per context because several of these paths
-    // run with no context current at all.
+    // Error flags belong to the context, with a TLS fallback before a context
+    // exists. Internal driver checks preserve pending errors through this path.
     void mg_set_gl_error(GLenum error);
+    void mg_begin_driver_operation();
+    bool mg_end_driver_operation(const char* operation);
 
     GLenum pname_convert(GLenum pname);
     GLenum map_tex_target(GLenum target);

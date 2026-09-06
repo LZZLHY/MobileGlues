@@ -9,6 +9,7 @@
 #include "../egl/context.h"
 #include <mutex>
 #include <memory>
+#include <algorithm>
 #include <ska/flat_hash_map.hpp>
 #include "log.h"
 #include "../config/settings.h"
@@ -46,27 +47,27 @@ static GLint MAX_DRAW_BUFFERS = 0;
 // color_attachments is an uninitialised pointer that update_attachment writes
 // twelve bytes through.
 namespace {
-// Keyed by name rather than indexed by it. The vector this replaces was resized
-// to id + 10 on every miss, so one framebuffer name out of the usual small
-// sequential run cost a record for every name below it -- and framebuffer_t
-// carries two vectors now, which made that worse. The records are held by
-// pointer: the map moves its elements when it grows, and several functions
-// here hold a framebuffer_t& across calls that can insert another name.
-struct fbo_ctx_state_t {
-    ska::flat_hash_map<GLuint, std::unique_ptr<framebuffer_t>> table;
-    GLuint draw = 0;
-    GLuint read = 0;
-};
-std::mutex g_fbo_mutex;
-// By pointer for the same reason: g_fc is a thread_local into an entry.
-ska::flat_hash_map<unsigned long long, std::unique_ptr<fbo_ctx_state_t>> g_fbo_ctxs;
-// Per thread, not one shared instance. This is where a context this layer never
-// saw created lands, and every such thread used to read and write the same
-// tables and the same two bindings with no lock between them. A context is
-// current on one thread at a time, so a thread-local fallback is also the more
-// accurate model of what it stands for.
-thread_local fbo_ctx_state_t g_fbo_default;
-thread_local fbo_ctx_state_t* g_fc = &g_fbo_default;
+    // Keyed by name rather than indexed by it. The vector this replaces was resized
+    // to id + 10 on every miss, so one framebuffer name out of the usual small
+    // sequential run cost a record for every name below it -- and framebuffer_t
+    // carries two vectors now, which made that worse. The records are held by
+    // pointer: the map moves its elements when it grows, and several functions
+    // here hold a framebuffer_t& across calls that can insert another name.
+    struct fbo_ctx_state_t {
+        ska::flat_hash_map<GLuint, std::unique_ptr<framebuffer_t>> table;
+        GLuint draw = 0;
+        GLuint read = 0;
+    };
+    std::mutex g_fbo_mutex;
+    // By pointer for the same reason: g_fc is a thread_local into an entry.
+    ska::flat_hash_map<unsigned long long, std::unique_ptr<fbo_ctx_state_t>> g_fbo_ctxs;
+    // Per thread, not one shared instance. This is where a context this layer never
+    // saw created lands, and every such thread used to read and write the same
+    // tables and the same two bindings with no lock between them. A context is
+    // current on one thread at a time, so a thread-local fallback is also the more
+    // accurate model of what it stands for.
+    thread_local fbo_ctx_state_t g_fbo_default;
+    thread_local fbo_ctx_state_t* g_fc = &g_fbo_default;
 } // namespace
 
 void mg_framebuffer_bind_context(unsigned long long ctx_id) {
@@ -239,7 +240,8 @@ mg_fsr_read_scope_t::~mg_fsr_read_scope_t() {
 void update_attachment(GLenum target, GLenum attachment, const attachment_t& what) {
     GLuint current_fbo = (target == GL_READ_FRAMEBUFFER) ? current_read_fbo : current_draw_fbo;
     if (current_fbo == 0) return;
-    if (attachment < GL_COLOR_ATTACHMENT0 || attachment >= GL_COLOR_ATTACHMENT0 + (GLenum)max_color_attachments_or_default()) {
+    if (attachment < GL_COLOR_ATTACHMENT0 ||
+        attachment >= GL_COLOR_ATTACHMENT0 + (GLenum)max_color_attachments_or_default()) {
         return;
     }
     framebuffer_t& fbo = get_framebuffer(current_fbo);
@@ -247,11 +249,18 @@ void update_attachment(GLenum target, GLenum attachment, const attachment_t& wha
     const size_t index = attachment - GL_COLOR_ATTACHMENT0;
     if (index >= fbo.color_attachments.size()) return;
     fbo.color_attachments[index] = what;
-    // If a shuffle had moved this attachment, that record now describes where the
-    // PREVIOUS texture went; glReadBuffer would send the application there instead
-    // of to what was just attached. Only this entry is dropped -- the others are
-    // still where the shuffle put them, and forgetting that would strand them.
-    if (index < fbo.draw_buffer_map.size()) fbo.draw_buffer_map[index] = 0;
+    // The attachment wrapper updates the mapped physical slot. Its routing
+    // remains valid when the image, layer or renderbuffer is replaced.
+}
+
+static GLenum physical_attachment(GLenum target, GLenum attachment) {
+    const GLuint id = target == GL_READ_FRAMEBUFFER ? current_read_fbo : current_draw_fbo;
+    if (id == 0 || attachment < GL_COLOR_ATTACHMENT0 ||
+        attachment >= GL_COLOR_ATTACHMENT0 + max_color_attachments_or_default())
+        return attachment;
+    auto& fbo = get_framebuffer(id);
+    const size_t index = attachment - GL_COLOR_ATTACHMENT0;
+    return index < fbo.draw_buffer_map.size() && fbo.draw_buffer_map[index] ? fbo.draw_buffer_map[index] : attachment;
 }
 
 // Undo a shuffle: put every attachment glDrawBuffers moved back on its own
@@ -287,33 +296,40 @@ void reattach(GLenum target, GLenum attachment, const attachment_t& a) {
         GLES.glFramebufferRenderbuffer(target, attachment, a.textarget, a.texture);
         break;
     case attach_kind_t::None:
-        // Never reached: the caller checks for it, because "re-attach nothing" is
-        // a detach and that was the bug.
+        GLES.glFramebufferTexture2D(target, attachment, GL_TEXTURE_2D, 0, 0);
         break;
     }
 }
 
 void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
-    update_attachment(target, attachment, {attach_kind_t::Texture2D, textarget, texture, level, 0});
-    GLES.glFramebufferTexture2D(target, attachment, textarget, texture, level);
+    mg_begin_driver_operation();
+    GLES.glFramebufferTexture2D(target, physical_attachment(target, attachment), textarget, texture, level);
+    if (mg_end_driver_operation("glFramebufferTexture2D"))
+        update_attachment(target, attachment, {attach_kind_t::Texture2D, textarget, texture, level, 0});
 }
 void glFramebufferTexture(GLenum target, GLenum attachment, GLuint texture, GLint level) {
     // Kind rather than a made-up GL_TEXTURE_2D. This entry point attaches the
     // whole texture, whatever its target is, and recording it as a 2D attachment
     // meant a replay re-attached an array or 3D texture as if it were flat.
-    update_attachment(target, attachment, {attach_kind_t::TextureAll, 0, texture, level, 0});
-    GLES.glFramebufferTexture(target, attachment, texture, level);
+    mg_begin_driver_operation();
+    GLES.glFramebufferTexture(target, physical_attachment(target, attachment), texture, level);
+    if (mg_end_driver_operation("glFramebufferTexture"))
+        update_attachment(target, attachment, {attach_kind_t::TextureAll, 0, texture, level, 0});
 }
 // Wrapped rather than passed straight through, so the record knows about them.
 // While these bypassed the table, the record for an attachment they wrote stayed
 // all-zero and the glDrawBuffers shuffle detached it.
 void glFramebufferTextureLayer(GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer) {
-    update_attachment(target, attachment, {attach_kind_t::TextureLayer, 0, texture, level, layer});
-    GLES.glFramebufferTextureLayer(target, attachment, texture, level, layer);
+    mg_begin_driver_operation();
+    GLES.glFramebufferTextureLayer(target, physical_attachment(target, attachment), texture, level, layer);
+    if (mg_end_driver_operation("glFramebufferTextureLayer"))
+        update_attachment(target, attachment, {attach_kind_t::TextureLayer, 0, texture, level, layer});
 }
 void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {
-    update_attachment(target, attachment, {attach_kind_t::Renderbuffer, renderbuffertarget, renderbuffer, 0, 0});
-    GLES.glFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer);
+    mg_begin_driver_operation();
+    GLES.glFramebufferRenderbuffer(target, physical_attachment(target, attachment), renderbuffertarget, renderbuffer);
+    if (mg_end_driver_operation("glFramebufferRenderbuffer"))
+        update_attachment(target, attachment, {attach_kind_t::Renderbuffer, renderbuffertarget, renderbuffer, 0, 0});
 }
 
 void restore_home_attachments(framebuffer_t& fbo) {
@@ -346,12 +362,15 @@ void restore_home_attachments(framebuffer_t& fbo) {
 // defines, and moving them here quietly dropped three of the 500-odd aliases the
 // library exports. An application that resolves glDeleteFramebuffersARB, as
 // anything written against EXT_framebuffer_object does, got a null pointer.
-extern "C" {
-GLAPI GLAPIENTRY void glDeleteFramebuffersARB(GLsizei n, const GLuint* names) __attribute__((alias("glDeleteFramebuffers")));
-GLAPI GLAPIENTRY void glFramebufferRenderbufferARB(GLenum target, GLenum attachment, GLenum renderbuffertarget,
-                                                   GLuint renderbuffer) __attribute__((alias("glFramebufferRenderbuffer")));
-GLAPI GLAPIENTRY void glFramebufferTextureLayerARB(GLenum target, GLenum attachment, GLuint texture, GLint level,
-                                                   GLint layer) __attribute__((alias("glFramebufferTextureLayer")));
+extern "C"
+{
+    GLAPI GLAPIENTRY void glDeleteFramebuffersARB(GLsizei n, const GLuint* names)
+        __attribute__((alias("glDeleteFramebuffers")));
+    GLAPI GLAPIENTRY void glFramebufferRenderbufferARB(GLenum target, GLenum attachment, GLenum renderbuffertarget,
+                                                       GLuint renderbuffer)
+        __attribute__((alias("glFramebufferRenderbuffer")));
+    GLAPI GLAPIENTRY void glFramebufferTextureLayerARB(GLenum target, GLenum attachment, GLuint texture, GLint level,
+                                                       GLint layer) __attribute__((alias("glFramebufferTextureLayer")));
 }
 
 // Wrapped for the same reason glReadPixels is: the source is the read framebuffer,
@@ -395,167 +414,110 @@ void glDeleteFramebuffers(GLsizei n, const GLuint* names) {
 }
 void glDrawBuffer(GLenum buffer) {
     LOG()
-    LOG_D("glDrawBuffer %d", buffer)
-
-    //    GLint currentFBO;
-    //    GLES.glGetIntegerv(GL_FRAMEBUFFER_BINDING, &currentFBO);
-    if (current_draw_fbo == 0) {
-        GLenum buffers[] = {buffer};
-        glDrawBuffers(1, buffers);
-    } else {
-        // Under the FSR1 redirect the application still believes it is drawing to
-        // the window, so it names the window's buffers -- but the binding really
-        // is an FBO, whose only colour buffer is attachment 0. GL_BACK matched
-        // neither GL_NONE nor the attachment range below, so the call emitted
-        // nothing whatsoever and an earlier glDrawBuffer(GL_NONE) could never be
-        // undone.
-        if (current_draw_fbo == FSR1_Context::g_renderFBO &&
-            (buffer == GL_BACK || buffer == GL_FRONT || buffer == GL_FRONT_AND_BACK || buffer == GL_LEFT ||
-             buffer == GL_BACK_LEFT || buffer == GL_FRONT_LEFT)) {
-            LOG_D("glDrawBuffer 0x%x on the FSR1 target -> GL_COLOR_ATTACHMENT0", buffer)
-            buffer = GL_COLOR_ATTACHMENT0;
-        }
-        // The cached value, not a driver round trip on every call -- and the same
-        // one the rest of this file uses, so the two cannot disagree about how
-        // many attachments there are.
-        const GLint maxAttachments = max_color_attachments_or_default();
-
-        if (buffer == GL_NONE) {
-            get_framebuffer(current_draw_fbo).color_attachments_all_none = true;
-            std::vector<GLenum> buffers(maxAttachments, GL_NONE);
-            glDrawBuffers(maxAttachments, buffers.data());
-        } else if (buffer >= GL_COLOR_ATTACHMENT0 && buffer < GL_COLOR_ATTACHMENT0 + maxAttachments) {
-            get_framebuffer(current_draw_fbo).color_attachments_all_none = false;
-            std::vector<GLenum> buffers(maxAttachments, GL_NONE);
-            buffers[buffer - GL_COLOR_ATTACHMENT0] = buffer;
-            glDrawBuffers(maxAttachments, buffers.data());
-        }
-    }
-    CHECK_GL_ERROR;
+    if (current_draw_fbo != 0 && current_draw_fbo == FSR1_Context::g_renderFBO &&
+        (buffer == GL_BACK || buffer == GL_FRONT || buffer == GL_FRONT_AND_BACK || buffer == GL_LEFT ||
+         buffer == GL_BACK_LEFT || buffer == GL_FRONT_LEFT))
+        buffer = GL_COLOR_ATTACHMENT0;
+    // A single-output API always assigns fragment output zero.
+    glDrawBuffers(1, &buffer);
 }
+
+static void install_attachment_map(framebuffer_t& fbo, const std::vector<GLenum>& map) {
+    for (size_t i = 0; i < fbo.color_attachments.size(); ++i)
+        reattach(GL_DRAW_FRAMEBUFFER, map.empty() ? GL_COLOR_ATTACHMENT0 + i : map[i], fbo.color_attachments[i]);
+}
+
 void glDrawBuffers(GLsizei n, const GLenum* bufs) {
     LOG()
+    ensure_max_attachments();
+    const GLint maxDrawBuffers = MAX_DRAW_BUFFERS > 0 ? MAX_DRAW_BUFFERS : 4;
+    if (n < 0 || n > maxDrawBuffers || (n > 0 && !bufs)) {
+        mg_set_gl_error(GL_INVALID_VALUE);
+        return;
+    }
     if (current_draw_fbo == 0) {
         GLES.glDrawBuffers(n, bufs);
         return;
     }
-
-    framebuffer_t& fbo = get_framebuffer(current_draw_fbo);
+    auto& fbo = get_framebuffer(current_draw_fbo);
     init_framebuffer(fbo);
-
-    bool all_none = true;
-    for (int i = 0; i < n; ++i) {
-        if (bufs[i] != GL_NONE) {
-            all_none = false;
-            break;
-        }
-    }
-
-    if (all_none) {
-        LOG_D("glDrawBuffers, fb %d all_none true", current_draw_fbo)
-        fbo.color_attachments_all_none = true;
-        GLES.glDrawBuffers(n, bufs);
-        return;
-    } else {
-        LOG_D("glDrawBuffers, fb %d all_none false", current_draw_fbo)
-        fbo.color_attachments_all_none = false;
-    }
-
-    // Attachment i already in slot i is the only arrangement GLES accepts, so
-    // there is nothing to move -- and this is what applications ask for almost
-    // every time. Moving it anyway is how a renderbuffer or layered attachment,
-    // which this table cannot describe, used to get detached by a call that
-    // should have been a no-op.
-    bool identity = true;
-    for (int i = 0; i < n; i++) {
-        if (bufs[i] != GL_COLOR_ATTACHMENT0 + (GLenum)i) {
-            identity = false;
-            break;
-        }
-    }
-    if (identity) {
-        LOG_D("glDrawBuffers, fb %d identity order, nothing to move", current_draw_fbo)
-        restore_home_attachments(fbo);
-        GLES.glDrawBuffers(n, bufs);
-        return;
-    }
-
-    // A real shuffle. Every attachment it has to move must be one this layer
-    // recorded -- an unrecorded one is either genuinely empty or attached through
-    // a path that does not reach update_attachment, and "re-attaching" its zeroed
-    // record would detach whatever is really there.
-    for (int i = 0; i < n; i++) {
-        if (bufs[i] < GL_COLOR_ATTACHMENT0 || bufs[i] >= GL_COLOR_ATTACHMENT0 + (GLenum)max_color_attachments_or_default()) continue;
-        if (bufs[i] - GL_COLOR_ATTACHMENT0 >= fbo.color_attachments.size()) continue;
-        if (fbo.color_attachments[bufs[i] - GL_COLOR_ATTACHMENT0].kind != attach_kind_t::None) continue;
-        // Passed through unchanged instead. GLES rejects a non-identity draw
-        // buffer list, so the application gets GL_INVALID_OPERATION -- which is
-        // both true and something it can now see -- rather than a framebuffer that
-        // quietly lost an attachment.
-        FB_WARN_ONCE("glDrawBuffers: fb %u wants attachment %u in slot %d but nothing is recorded there; "
-                     "passing the list through rather than detaching it",
-                     current_draw_fbo, bufs[i] - GL_COLOR_ATTACHMENT0, i);
-        restore_home_attachments(fbo);
-        GLES.glDrawBuffers(n, bufs);
-        return;
-    }
-
-    // Undo whatever the last shuffle did before arranging a new one. Overwriting
-    // the map with assign() below discards the record of where the previous
-    // shuffle put things while the driver still has them there, so any slot the
-    // old shuffle moved and the new one does not name would be stranded with no
-    // way left to find it.
-    restore_home_attachments(fbo);
-
-    std::vector<GLenum> new_bufs(n);
-    fbo.draw_buffer_map.assign(max_color_attachments_or_default(), 0);
-    for (int i = 0; i < n; i++) {
-        if (bufs[i] >= GL_COLOR_ATTACHMENT0 && bufs[i] < GL_COLOR_ATTACHMENT0 + (GLenum)max_color_attachments_or_default()) {
-            GLenum logical_attachment = bufs[i];
-            GLenum physical_attachment = GL_COLOR_ATTACHMENT0 + i;
-            new_bufs[i] = physical_attachment;
-            size_t index = logical_attachment - GL_COLOR_ATTACHMENT0;
-            if (index >= fbo.color_attachments.size() || index >= fbo.draw_buffer_map.size()) {
-                new_bufs[i] = bufs[i];
-                continue;
-            }
-            reattach(GL_DRAW_FRAMEBUFFER, physical_attachment, fbo.color_attachments[index]);
-            // Remember where it went, so glReadBuffer can read it where it is
-            // rather than moving it a second time.
-            fbo.draw_buffer_map[index] = physical_attachment;
-        } else {
-            new_bufs[i] = bufs[i];
-        }
-    }
-    GLES.glDrawBuffers(n, new_bufs.data());
-}
-void glReadBuffer(GLenum src) {
-    if (current_read_fbo != 0 && src >= GL_COLOR_ATTACHMENT0 && src < GL_COLOR_ATTACHMENT0 + max_color_attachments_or_default()) {
-        framebuffer_t& fbo = get_framebuffer(current_read_fbo);
-        init_framebuffer(fbo);
-        const size_t index = static_cast<size_t>(src - GL_COLOR_ATTACHMENT0);
-        // glDrawBuffers has to move logical attachment i onto physical
-        // GL_COLOR_ATTACHMENTi, because GLES only accepts COLOR_ATTACHMENTi in slot
-        // i of the draw buffer list. After such a shuffle the texture the
-        // application calls attachment n is somewhere else, so read it there.
-        //
-        // This used to re-attach it onto GL_COLOR_ATTACHMENT0 instead, which
-        // destroyed whatever was on attachment 0 -- and did so even for a
-        // framebuffer that had never been shuffled, and even when the record was
-        // empty because the application had attached with glFramebufferRenderbuffer
-        // or one of the layered entry points, which do not reach update_attachment.
-        // Reading where the texture already is moves nothing and cannot clobber.
-        if (index < fbo.draw_buffer_map.size() && fbo.draw_buffer_map[index] != 0) {
-            GLES.glReadBuffer(fbo.draw_buffer_map[index]);
+    const size_t capacity = fbo.color_attachments.size();
+    std::vector<GLenum> logical;
+    if (n > 0) logical.assign(bufs, bufs + n);
+    std::vector<GLenum> mapping(capacity, 0), driver(n, GL_NONE);
+    std::vector<bool> occupied(capacity, false);
+    bool identity = true, all_none = true;
+    for (GLsizei slot = 0; slot < n; ++slot) {
+        const GLenum value = bufs[slot];
+        if (value == GL_NONE) continue;
+        all_none = false;
+        if (value < GL_COLOR_ATTACHMENT0 || value >= GL_COLOR_ATTACHMENT0 + capacity) {
+            mg_set_gl_error(GL_INVALID_ENUM);
             return;
         }
+        const size_t index = value - GL_COLOR_ATTACHMENT0;
+        if (mapping[index]) {
+            mg_set_gl_error(GL_INVALID_OPERATION);
+            return;
+        }
+        if (static_cast<size_t>(slot) >= capacity) {
+            mg_set_gl_error(GL_INVALID_VALUE);
+            return;
+        }
+        mapping[index] = GL_COLOR_ATTACHMENT0 + slot;
+        occupied[slot] = true;
+        driver[slot] = GL_COLOR_ATTACHMENT0 + slot;
+        identity &= index == static_cast<size_t>(slot);
     }
-    GLES.glReadBuffer(src);
+    // Complete the permutation, including attachments not currently drawn.
+    // Otherwise a shuffle can overwrite an attachment that glReadBuffer later
+    // needs, or an attachment update can hit another output's physical slot.
+    for (size_t i = 0; i < capacity; ++i)
+        if (!mapping[i] && !occupied[i]) {
+            mapping[i] = GL_COLOR_ATTACHMENT0 + i;
+            occupied[i] = true;
+        }
+    for (size_t i = 0; i < capacity; ++i)
+        if (!mapping[i]) {
+            const size_t free = std::find(occupied.begin(), occupied.end(), false) - occupied.begin();
+            mapping[i] = GL_COLOR_ATTACHMENT0 + free;
+            occupied[free] = true;
+        }
+    mg_begin_driver_operation();
+    if (!identity || !fbo.draw_buffer_map.empty()) install_attachment_map(fbo, mapping);
+    GLES.glDrawBuffers(n, driver.data());
+    if (!mg_end_driver_operation("glDrawBuffers")) {
+        install_attachment_map(fbo, fbo.draw_buffer_map);
+        std::vector<GLenum> previous(fbo.logical_draw_buffers.size(), GL_NONE);
+        for (size_t i = 0; i < previous.size(); ++i)
+            if (fbo.logical_draw_buffers[i] != GL_NONE) previous[i] = GL_COLOR_ATTACHMENT0 + i;
+        GLES.glDrawBuffers(previous.size(), previous.data());
+        return;
+    }
+    fbo.logical_draw_buffers = std::move(logical);
+    fbo.color_attachments_all_none = all_none;
+    if (identity)
+        fbo.draw_buffer_map.clear();
+    else
+        fbo.draw_buffer_map = std::move(mapping);
+    // Read-buffer selection belongs to the FBO and survives draw routing changes.
+    if (GLES.glReadBuffer) {
+        const GLuint previous = current_read_fbo;
+        if (previous != current_draw_fbo) GLES.glBindFramebuffer(GL_READ_FRAMEBUFFER, current_draw_fbo);
+        const GLenum read = fbo.logical_read_buffer;
+        const size_t index = read >= GL_COLOR_ATTACHMENT0 ? read - GL_COLOR_ATTACHMENT0 : capacity;
+        GLES.glReadBuffer(index < fbo.draw_buffer_map.size() ? fbo.draw_buffer_map[index] : read);
+        if (previous != current_draw_fbo) GLES.glBindFramebuffer(GL_READ_FRAMEBUFFER, previous);
+    }
+}
+
+void glReadBuffer(GLenum src) {
+    mg_begin_driver_operation();
+    GLES.glReadBuffer(physical_attachment(GL_READ_FRAMEBUFFER, src));
+    if (mg_end_driver_operation("glReadBuffer") && current_read_fbo != 0)
+        get_framebuffer(current_read_fbo).logical_read_buffer = src;
 }
 GLenum glCheckFramebufferStatus(GLenum target) {
     GLenum status = GLES.glCheckFramebufferStatus(target);
-    if (global_settings.ignore_error == IgnoreErrorLevel::Full && status != GL_FRAMEBUFFER_COMPLETE) {
-        return GL_FRAMEBUFFER_COMPLETE;
-    }
     return status;
 }

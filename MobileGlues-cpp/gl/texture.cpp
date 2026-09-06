@@ -931,6 +931,10 @@ void glTexImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei widt
         return;
     }
 
+    mg_begin_driver_operation();
+    GLES.glTexImage2D(target, level, internalFormat, width, height, border, format, type, fix.pixels);
+    if (!mg_end_driver_operation("glTexImage2D")) return;
+
     GET_TEXTURE_OBJECT(target);
     tex->target = ConvertGLEnumToTextureTarget(target);
     tex->internal_format = internalFormat;
@@ -944,7 +948,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei widt
 
     tex->format = format;
 
-    GLES.glTexImage2D(target, level, internalFormat, width, height, border, format, type, fix.pixels);
+
 
     CHECK_GL_ERROR
 }
@@ -989,7 +993,9 @@ void glTexImage3D(GLenum target, GLint level, GLint internalFormat, GLsizei widt
         return;
     }
 
+    mg_begin_driver_operation();
     GLES.glTexImage3D(target, level, internalFormat, width, height, depth, border, format, type, fix.pixels);
+    if (!mg_end_driver_operation("glTexImage3D")) return;
 
     GET_TEXTURE_OBJECT(target);
     tex->target = ConvertGLEnumToTextureTarget(target);
@@ -1039,7 +1045,9 @@ void glTexStorage2D(GLenum target, GLsizei levels, GLenum internalFormat, GLsize
           target, levels, internalFormat, width, height)
 
     internal_convert(&internalFormat, nullptr, nullptr, /*has_data=*/false);
+    mg_begin_driver_operation();
     GLES.glTexStorage2D(target, levels, internalFormat, width, height);
+    if (!mg_end_driver_operation("glTexStorage2D")) return;
 
     GET_TEXTURE_OBJECT(target);
     tex->target = ConvertGLEnumToTextureTarget(target);
@@ -1052,8 +1060,6 @@ void glTexStorage2D(GLenum target, GLsizei levels, GLenum internalFormat, GLsize
     tex->swizzle_param[2] = GL_BLUE;
     tex->swizzle_param[3] = GL_ALPHA;
 
-    GLenum ERR = GLES.glGetError();
-    if (ERR != GL_NO_ERROR) LOG_E("glTexStorage2D ERROR: %d", ERR)
 }
 
 void glTexStorage3D(GLenum target, GLsizei levels, GLenum internalFormat, GLsizei width, GLsizei height,
@@ -1065,7 +1071,9 @@ void glTexStorage3D(GLenum target, GLsizei levels, GLenum internalFormat, GLsize
 
     internal_convert(&internalFormat, nullptr, nullptr, /*has_data=*/false);
 
+    mg_begin_driver_operation();
     GLES.glTexStorage3D(target, levels, internalFormat, width, height, depth);
+    if (!mg_end_driver_operation("glTexStorage3D")) return;
 
     GET_TEXTURE_OBJECT(target);
     tex->target = ConvertGLEnumToTextureTarget(target);

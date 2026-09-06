@@ -8,6 +8,7 @@
 #include "context.h"
 #include "../gl/log.h"
 #include "../gl/mg.h"
+#include "../gl/shader.h"
 #include "trace.h"
 #include <mutex>
 #include <ska/flat_hash_map.hpp>
@@ -142,6 +143,7 @@ MGContext* mg_context_create(EGLDisplay dpy, EGLContext handle, EGLContext share
     if (!ctx->share_group) {
         ctx->share_group = std::make_shared<MGShareGroup>();
         ctx->share_group->id = g_next_group_id++;
+        ctx->share_group->shader_objects = std::make_shared<mg_shader_group>();
     }
 
     ETRACE("MGContext %llu created (handle=%p, client_type=%s, share_group=%llu, granted=%d.%d)", ctx->id, handle,

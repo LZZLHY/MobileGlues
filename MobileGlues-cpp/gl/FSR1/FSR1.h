@@ -28,44 +28,44 @@
 #include <GL/gl.h>
 
 namespace FSR1_Context {
-    extern GLuint g_renderFBO;
-    extern GLuint g_renderTexture;
-    extern GLuint g_depthStencilRBO;
-    extern GLuint g_quadVAO;
-    extern GLuint g_quadVBO;
-    extern GLuint g_fsrProgram;
+    extern thread_local GLuint g_renderFBO;
+    extern thread_local GLuint g_renderTexture;
+    extern thread_local GLuint g_depthStencilRBO;
+    extern thread_local GLuint g_quadVAO;
+    extern thread_local GLuint g_quadVBO;
+    extern thread_local GLuint g_fsrProgram;
     // Uniform locations of g_fsrProgram, resolved when it is linked and valid for
     // as long as it lives. -1 for a name the linker dropped, which glUniform*
     // ignores.
-    extern GLint g_inputTexLoc;
-    extern GLint g_const0Loc;
-    extern GLint g_viewportSizeLoc;
+    extern thread_local GLint g_inputTexLoc;
+    extern thread_local GLint g_const0Loc;
+    extern thread_local GLint g_viewportSizeLoc;
 
-    extern GLuint g_targetFBO;
-    extern GLuint g_targetTexture;
+    extern thread_local GLuint g_targetFBO;
+    extern thread_local GLuint g_targetTexture;
 
-    extern GLuint g_currentDrawFBO;
-    extern GLint g_viewport[4];
-    extern GLsizei g_targetWidth;
-    extern GLsizei g_targetHeight;
-    extern GLsizei g_renderWidth;
-    extern GLsizei g_renderHeight;
-    extern bool g_dirty;
+    extern thread_local GLuint g_currentDrawFBO;
+    extern thread_local GLint g_viewport[4];
+    extern thread_local GLsizei g_targetWidth;
+    extern thread_local GLsizei g_targetHeight;
+    extern thread_local GLsizei g_renderWidth;
+    extern thread_local GLsizei g_renderHeight;
+    extern thread_local bool g_dirty;
 
-    extern bool g_resolutionChanged;
-    extern GLsizei g_pendingWidth;
-    extern GLsizei g_pendingHeight;
+    extern thread_local bool g_resolutionChanged;
+    extern thread_local GLsizei g_pendingWidth;
+    extern thread_local GLsizei g_pendingHeight;
 } // namespace FSR1_Context
 
-extern bool fsrInitialized;
+extern thread_local bool fsrInitialized;
 
 // Swap the FSR1 objects when the current context changes.
 //
 // Every name above is a GL object owned by the context that created it, and
 // gl/framebuffer.cpp redirects framebuffer 0 to g_renderFBO -- in a second
-// context that name refers to nothing, or to somebody else's object. The values
-// are saved and reloaded rather than reached through a pointer because they are
-// declared extern and read from several translation units.
+// context that name refers to nothing, or to somebody else's object. Each thread
+// has its own working values; switching contexts saves and loads the complete
+// resource/dimension state under the context table's mutex.
 void mg_fsr1_bind_context(unsigned long long ctx_id);
 void ApplyFSR();
 void InitFSRResources();

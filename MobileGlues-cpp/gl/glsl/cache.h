@@ -16,6 +16,7 @@
 #include <array>
 #include <string>
 #include <cstdint>
+#include <mutex>
 
 class Cache {
 public:
@@ -28,7 +29,7 @@ public:
     Cache(const Cache&) = delete;
     Cache& operator=(const Cache&) = delete;
 
-    const char* get(const char* glsl);
+    bool get(const char* glsl, std::string& result);
     void put(const char* glsl, const char* essl);
     bool load();
     // Serialises the whole cache immediately. put() no longer calls this on
@@ -40,6 +41,9 @@ public:
     static Cache& get_instance();
 
 private:
+    // The copy returned by get and every LRU/persistence mutation share this
+    // lock. Recursive only because get/put may trigger the public save method.
+    std::recursive_mutex mutex;
     struct CacheEntry {
         std::array<uint8_t, 32> sha256;
         std::string essl;

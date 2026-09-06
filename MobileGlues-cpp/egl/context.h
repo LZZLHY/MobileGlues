@@ -35,8 +35,10 @@
 // context that never owned the cached objects.
 // ---------------------------------------------------------------------------
 
+struct mg_shader_group;
 struct MGShareGroup {
     unsigned long long id;
+    std::shared_ptr<mg_shader_group> shader_objects;
     // Objects GL shares across a share group -- buffers, textures, renderbuffers,
     // samplers, shaders, programs, syncs -- belong here. They are still
     // process-global today; moving them is the last step of this work.

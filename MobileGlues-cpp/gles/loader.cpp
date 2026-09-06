@@ -26,6 +26,7 @@
 #define DEBUG 0
 
 void *gles = nullptr, *egl = nullptr;
+void (*mg_texture_barrier_backend)() = nullptr;
 
 struct gles_func_t g_gles_func;
 
@@ -203,6 +204,7 @@ void InitGLESCapabilities() {
     memset(&g_gles_caps, 0, sizeof(struct gles_caps_t));
 
     InitGLESBaseExtensions();
+    mg_texture_barrier_backend = nullptr;
 
     GLES.glGetIntegerv(GL_MAJOR_VERSION, &g_gles_caps.major);
     GLES.glGetIntegerv(GL_MINOR_VERSION, &g_gles_caps.minor);
@@ -214,7 +216,9 @@ void InitGLESCapabilities() {
         const char* extension = (const char*)GLES.glGetStringi(GL_EXTENSIONS, i);
         if (extension) {
             LOG_D("%s", (const char*)extension)
-            if (strcmp(extension, "GL_EXT_buffer_storage") == 0) {
+            if (strcmp(extension, "GL_NV_texture_barrier") == 0) {
+                mg_texture_barrier_backend = reinterpret_cast<void (*)()>(proc_address(gles, "glTextureBarrierNV"));
+            } else if (strcmp(extension, "GL_EXT_buffer_storage") == 0) {
                 g_gles_caps.GL_EXT_buffer_storage = 1;
             } else if (strcmp(extension, "GL_EXT_disjoint_timer_query") == 0) {
                 g_gles_caps.GL_EXT_disjoint_timer_query = 1;
@@ -291,6 +295,14 @@ void InitGLESCapabilities() {
         AppendExtension("GL_EXT_direct_state_access");
     }
 
+    // Texture feedback requires the NV/ARB texture-barrier semantics, which
+    // glFinish or glMemoryBarrier alone cannot emulate on GLES. Do not claim
+    // a core version requiring that operation when the backend cannot do it.
+    const int requestedVersion = GLVersion.toInt(2);
+    if (!mg_texture_barrier_backend && requestedVersion >= 45) GLVersion = Version(44);
+    if (mg_texture_barrier_backend) AppendExtension("GL_ARB_texture_barrier");
+    LOG_I("[MG-CAPABILITIES] requested_gl=%d effective_gl=%d texture_barrier=%d",
+          requestedVersion, GLVersion.toInt(2), mg_texture_barrier_backend != nullptr)
     int glVersion = GLVersion.toInt(2);
     for (int ver = 32; ver <= glVersion; ++ver) {
         if (ver > 33 && ver < 40) continue;
