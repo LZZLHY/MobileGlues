@@ -21,8 +21,6 @@
 
 #define DEBUG 0
 
-static GLclampd currentDepthValue;
-
 extern "C" GLAPI GLAPIENTRY void glTextureBarrier() {
     LOG()
     if (mg_texture_barrier_backend) mg_texture_barrier_backend();
@@ -33,7 +31,6 @@ extern "C" GLAPI GLAPIENTRY void glTextureBarrier() {
 
 void glClearDepth(GLclampd depth) {
     LOG()
-    currentDepthValue = depth;
     GLES.glClearDepthf((float)depth);
     CHECK_GL_ERROR
 }
@@ -174,8 +171,16 @@ void glClear(GLbitfield mask) {
 
     CHECK_GL_ERROR_NO_INIT
 
+    bool depth_workaround = false;
     if (global_settings.angle == AngleMode::Enabled && mask == GL_DEPTH_BUFFER_BIT &&
-        std::fabs(currentDepthValue - 1.0f) <= 0.001f && mg_draw_framebuffer_all_none()) {
+        mg_draw_framebuffer_all_none()) {
+        // Clear depth belongs to the current driver context and can also be
+        // changed through glClearDepthf. A process-wide shadow cannot decide this.
+        GLfloat depth = 0.0f;
+        GLES.glGetFloatv(GL_DEPTH_CLEAR_VALUE, &depth);
+        depth_workaround = std::fabs(depth - 1.0f) <= 0.001f;
+    }
+    if (depth_workaround) {
         LOG_D("doing depth workaround")
         if (global_settings.angle_depth_clear_fix_mode == AngleDepthClearFixMode::Mode1)
             // Workaround for ANGLE depth-clear bug: if depth≈1.0, draw a fullscreen triangle at z=1.0 to force actual

@@ -29,7 +29,9 @@ namespace {
     GLenum pending = 0, driverError = 0;
     int surfaceWidth = 640, surfaceHeight = 480, allocations = 0, draws = 0;
     bool validSurface = true, incomplete = false;
-    int barriers = 0, shaderCompiles = 0;
+    int barriers = 0, shaderCompiles = 0, depthDraws = 0;
+    GLfloat driverClearDepth = 1.0f;
+    void clearDepth(GLfloat value) { driverClearDepth = value; }
     void textureBarrier() {
         ++barriers;
     }
@@ -90,7 +92,8 @@ namespace {
         else
             *v = depthMask;
     }
-    void getFloat(GLenum, GLfloat* v) {
+    void getFloat(GLenum pname, GLfloat* v) {
+        if (pname == GL_DEPTH_CLEAR_VALUE) { *v = driverClearDepth; return; }
         for (int i = 0; i < 4; ++i)
             v[i] = clearColor[i];
     }
@@ -208,6 +211,7 @@ namespace {
     }
     void clear(GLbitfield) {}
     void drawArrays(GLenum, GLint, GLsizei count) {
+        if (count == 3) ++depthDraws;
         if (count == 6) {
             ++draws;
             assert(colorMask[0] && colorMask[1] && !enabled[GL_SCISSOR_TEST] && !enabled[GL_BLEND] &&
@@ -312,6 +316,7 @@ int main() {
     GLES.glCheckFramebufferStatus = frameStatus;
     GLES.glGetError = getError;
     GLES.glClear = clear;
+    GLES.glClearDepthf = clearDepth;
     GLES.glDrawArrays = drawArrays;
     GLES.glBlitFramebuffer = blit;
     global_settings.fsr1_setting = FSR1_Quality_Preset::Quality;
@@ -368,6 +373,20 @@ int main() {
     assert(FSR1_Context::g_renderFBO == old);
     DrawDepthClearTri();
     assert(program == 7 && vao == 9 && array == 11);
+    global_settings.angle = AngleMode::Enabled;
+    global_settings.angle_depth_clear_fix_mode = AngleDepthClearFixMode::Mode1;
+    glClearDepth(0.0);
+    // Another context/float entry can have a different driver clear depth.
+    driverClearDepth = 1.0f;
+    const int beforeDepth = depthDraws;
+    glClear(GL_DEPTH_BUFFER_BIT);
+    std::fprintf(stderr, "ANGLE current driver depth=1: workaround_draws=%d\n", depthDraws - beforeDepth);
+    assert(depthDraws == beforeDepth + 1);
+    glClearDepth(1.0);
+    driverClearDepth = 0.0f;
+    glClear(GL_DEPTH_BUFFER_BIT);
+    assert(depthDraws == beforeDepth + 1);
+    global_settings.angle = AngleMode::Disabled;
     pending = 0;
     glTextureBarrier();
     assert(pending == GL_INVALID_OPERATION);
