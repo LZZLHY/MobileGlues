@@ -223,12 +223,24 @@ GLuint CompileFSRShader() {
     const char* sources[] = {FSR_VSSource, FSR_FSSource};
     bool success = true;
     for (int i = 0; i < 2; ++i) {
+        // FSR's bundled source is desktop GLSL 4.50. Use the translator without
+        // entering glCreateShader (which itself initializes FSR resources).
+        int translated = -1;
+        const std::string essl = GLSLtoGLSLES(sources[i], types[i], hardware->es_version,
+                                              getGLSLVersion(sources[i]), translated);
+        if (translated < 0 || essl.empty()) {
+            LOG_W_FORCE("[MG-FSR] shader translation failed: %s", mg_translation_error().c_str())
+            success = false;
+            break;
+        }
         shaders[i] = GLES.glCreateShader(types[i]);
         if (!shaders[i]) {
             success = false;
             break;
         }
-        GLES.glShaderSource(shaders[i], 1, &sources[i], nullptr);
+        const GLchar* source = essl.data();
+        const GLint sourceLength = static_cast<GLint>(essl.size());
+        GLES.glShaderSource(shaders[i], 1, &source, &sourceLength);
         GLES.glCompileShader(shaders[i]);
         GLint status = 0;
         GLES.glGetShaderiv(shaders[i], GL_COMPILE_STATUS, &status);

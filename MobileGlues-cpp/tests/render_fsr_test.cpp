@@ -9,6 +9,9 @@
 gles_func_t g_gles_func{};
 gles_caps_t g_gles_caps{};
 global_settings_t global_settings{};
+hardware_s hw{320, false};
+hardware_t hardware = &hw;
+char* glsl_cache_file_path = nullptr;
 gl_state_s g_default_gl_state{};
 thread_local gl_state_t gl_state = &g_default_gl_state;
 thread_local MGContext* g_current_ctx = nullptr;
@@ -163,7 +166,10 @@ namespace {
     GLuint createProgram() {
         return next++;
     }
-    void source(GLuint, GLsizei, const GLchar* const*, const GLint*) {}
+    void source(GLuint, GLsizei count, const GLchar* const* text, const GLint*) {
+        assert(count == 1);
+        assert(std::string(text[0]).find("#version 450") == std::string::npos);
+    }
     void compile(GLuint) {}
     void attach(GLuint, GLuint) {}
     void link(GLuint) {}
