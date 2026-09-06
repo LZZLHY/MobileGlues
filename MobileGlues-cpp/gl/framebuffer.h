@@ -50,6 +50,7 @@ struct framebuffer_t {
     // shuffle is in effect and every attachment is where the application put it.
     std::vector<GLenum> draw_buffer_map;
     std::vector<GLenum> logical_draw_buffers{GL_COLOR_ATTACHMENT0};
+    std::vector<GLenum> driver_draw_buffers{GL_COLOR_ATTACHMENT0};
     GLenum logical_read_buffer = GL_COLOR_ATTACHMENT0;
     // No depth_attachment / stencil_attachment. They were written and never read
     // by anything in the tree, and the branch that filled them did not recognise

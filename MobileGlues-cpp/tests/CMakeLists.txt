@@ -43,6 +43,7 @@ mg_test(render_shader_test render_shader_test.cpp "${MG}/gl/shader.cpp" "${MG}/g
 target_link_libraries(render_shader_test PRIVATE glslang SPIRV spirv-cross-c spirv-cross-glsl spirv-cross-core)
 mg_test(framebuffer_shuffle_test framebuffer_shuffle_test.cpp "${MG}/gl/framebuffer.cpp")
 mg_test(pixel_size_test pixel_size_test.cpp "${MG}/gl/pixel.cpp")
+mg_test(render_context_resources_test render_context_resources_test.cpp)
 mg_test(render_resource_test render_resource_test.cpp "${MG}/gl/buffer.cpp" "${MG}/gl/texture.cpp" "${MG}/gl/pixel.cpp")
 mg_test(render_fsr_test render_fsr_test.cpp "${MG}/gl/FSR1/FSR1.cpp" "${MG}/gl/gl.cpp"
     "${MG}/gl/glsl/glsl_for_es.cpp" "${MG}/gl/glsl/cache.cpp")

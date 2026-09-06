@@ -36,6 +36,7 @@
 // ---------------------------------------------------------------------------
 
 struct mg_shader_group;
+struct MGMultidrawState;
 struct MGShareGroup {
     unsigned long long id;
     std::shared_ptr<mg_shader_group> shader_objects;
@@ -57,6 +58,9 @@ struct MGContext {
 
     mg_enable_state_t enable; // per-context by definition: enable state is not shared
     gl_state_s gl;            // current program / texture unit / draw fbo, all per-context
+    std::shared_ptr<MGMultidrawState> multidraw;
+    GLuint basevertex_scratch_buffer = 0;
+    GLuint restart_scratch_buffer = 0;
 
     EGLSurface draw;
     EGLSurface read;

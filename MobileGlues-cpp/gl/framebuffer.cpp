@@ -422,9 +422,13 @@ void glDrawBuffer(GLenum buffer) {
     glDrawBuffers(1, &buffer);
 }
 
-static void install_attachment_map(framebuffer_t& fbo, const std::vector<GLenum>& map) {
-    for (size_t i = 0; i < fbo.color_attachments.size(); ++i)
-        reattach(GL_DRAW_FRAMEBUFFER, map.empty() ? GL_COLOR_ATTACHMENT0 + i : map[i], fbo.color_attachments[i]);
+static void install_attachment_map(framebuffer_t& fbo, const std::vector<GLenum>& map,
+                                   const std::vector<GLenum>& previous) {
+    for (size_t i = 0; i < fbo.color_attachments.size(); ++i) {
+        const GLenum next = i < map.size() ? map[i] : GL_COLOR_ATTACHMENT0 + i;
+        const GLenum old = i < previous.size() ? previous[i] : GL_COLOR_ATTACHMENT0 + i;
+        if (next != old) reattach(GL_DRAW_FRAMEBUFFER, next, fbo.color_attachments[i]);
+    }
 }
 
 void glDrawBuffers(GLsizei n, const GLenum* bufs) {
@@ -441,6 +445,16 @@ void glDrawBuffers(GLsizei n, const GLenum* bufs) {
     }
     auto& fbo = get_framebuffer(current_draw_fbo);
     init_framebuffer(fbo);
+    // Attachment wrappers keep the current permutation valid when images change.
+    // Repeated routing still reaches the driver for validation, without rebuilding
+    // vectors, reattaching images, or changing the FBO's read selection.
+    if (static_cast<size_t>(n) == fbo.logical_draw_buffers.size() &&
+        (n == 0 || std::equal(bufs, bufs + n, fbo.logical_draw_buffers.begin()))) {
+        mg_begin_driver_operation();
+        GLES.glDrawBuffers(n, fbo.driver_draw_buffers.data());
+        mg_end_driver_operation("glDrawBuffers");
+        return;
+    }
     const size_t capacity = fbo.color_attachments.size();
     std::vector<GLenum> logical;
     if (n > 0) logical.assign(bufs, bufs + n);
@@ -484,29 +498,27 @@ void glDrawBuffers(GLsizei n, const GLenum* bufs) {
             occupied[free] = true;
         }
     mg_begin_driver_operation();
-    if (!identity || !fbo.draw_buffer_map.empty()) install_attachment_map(fbo, mapping);
+    install_attachment_map(fbo, mapping, fbo.draw_buffer_map);
     GLES.glDrawBuffers(n, driver.data());
     if (!mg_end_driver_operation("glDrawBuffers")) {
-        install_attachment_map(fbo, fbo.draw_buffer_map);
-        std::vector<GLenum> previous(fbo.logical_draw_buffers.size(), GL_NONE);
-        for (size_t i = 0; i < previous.size(); ++i)
-            if (fbo.logical_draw_buffers[i] != GL_NONE) previous[i] = GL_COLOR_ATTACHMENT0 + i;
-        GLES.glDrawBuffers(previous.size(), previous.data());
+        install_attachment_map(fbo, fbo.draw_buffer_map, mapping);
+        GLES.glDrawBuffers(fbo.driver_draw_buffers.size(), fbo.driver_draw_buffers.data());
         return;
     }
+    const GLenum previous_read = physical_attachment(GL_DRAW_FRAMEBUFFER, fbo.logical_read_buffer);
     fbo.logical_draw_buffers = std::move(logical);
+    fbo.driver_draw_buffers = std::move(driver);
     fbo.color_attachments_all_none = all_none;
     if (identity)
         fbo.draw_buffer_map.clear();
     else
         fbo.draw_buffer_map = std::move(mapping);
     // Read-buffer selection belongs to the FBO and survives draw routing changes.
-    if (GLES.glReadBuffer) {
+    const GLenum next_read = physical_attachment(GL_DRAW_FRAMEBUFFER, fbo.logical_read_buffer);
+    if (GLES.glReadBuffer && next_read != previous_read) {
         const GLuint previous = current_read_fbo;
         if (previous != current_draw_fbo) GLES.glBindFramebuffer(GL_READ_FRAMEBUFFER, current_draw_fbo);
-        const GLenum read = fbo.logical_read_buffer;
-        const size_t index = read >= GL_COLOR_ATTACHMENT0 ? read - GL_COLOR_ATTACHMENT0 : capacity;
-        GLES.glReadBuffer(index < fbo.draw_buffer_map.size() ? fbo.draw_buffer_map[index] : read);
+        GLES.glReadBuffer(next_read);
         if (previous != current_draw_fbo) GLES.glBindFramebuffer(GL_READ_FRAMEBUFFER, previous);
     }
 }

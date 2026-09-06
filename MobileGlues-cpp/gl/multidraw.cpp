@@ -237,136 +237,87 @@ static bool is_strip_like_mode(GLenum mode) {
 // and the command fill wrote through a null pointer.
 // ---------------------------------------------------------------------------
 
-// Identified by the monotonic MGContext id, not by the EGLContext pointer.
-// EGLContext is a driver heap allocation, so destroying one and creating another
-// very often returns the same address; comparing addresses reported "same
-// context" for a context that never owned any of these objects, and the stale
-// names were then used against it. 0 means "no tracked context", which is also
-// what the bootstrap probe context looks like.
-static unsigned long long g_owner_ctx_id = 0;
-
+// GPU cache state belongs to a live context, not the last thread/context that
+// happened to issue a multi-draw. MGContext owns the opaque record's lifetime.
 enum class md_probe_state_t { Unprobed, Working, Failed };
-
-// indirect / multiindirect paths. Command stores are orphaned before every
-// upload, so reuse never waits for a previous draw and does not need a fence per
-// multi-draw call. Explicit sync here amplified render-thread frame tails on
-// Maleoon without making chunk work asynchronous.
 static constexpr std::size_t kIndirectRingSize = 8;
 struct indirect_slot_t {
     GLuint buffer{0};
     GLsizei capacity{0};
 };
-static std::array<indirect_slot_t, kIndirectRingSize> g_indirect_slots{};
-static mg::indirect_ring::Cursor<kIndirectRingSize> g_indirect_cursor;
-static bool g_indirect_ring_failed = false;
+struct MGMultidrawState {
+    std::array<indirect_slot_t, kIndirectRingSize> g_indirect_slots{};
+    mg::indirect_ring::Cursor<kIndirectRingSize> g_indirect_cursor;
+    bool g_indirect_ring_failed = false;
+    std::array<indirect_slot_t, kIndirectRingSize> g_arrays_indirect_slots{};
+    mg::indirect_ring::Cursor<kIndirectRingSize> g_arrays_indirect_cursor;
+    bool g_arrays_indirect_ring_failed = false;
+    md_probe_state_t g_arrays_mdi_state = md_probe_state_t::Unprobed;
+    md_probe_state_t g_arrays_mda_state = md_probe_state_t::Unprobed;
+    GLuint g_scratch_ibo = 0;
+    bool g_compute_inited = false;
+    bool g_compute_failed = false;
+    GLuint g_prefixsumbuffer = 0;
+    GLuint g_drawcmd_ssbo = 0;
+    GLuint g_outputibo = 0;
+    GLuint g_compute_program = 0;
+    GLint g_element_size_loc = -1;
+    GLint g_max_compute_groups_x = 0;
+    GLuint g_count_program = 0;
+    GLuint g_count_scratch = 0;
+    bool g_count_inited = false;
+    bool g_count_failed = false;
+    GLint g_count_loc_max = -1, g_count_loc_srcwords = -1, g_count_loc_srcoff = -1, g_count_loc_cntoff = -1,
+                 g_count_loc_dstwords = -1;
+    md_probe_state_t g_mdbv_state = md_probe_state_t::Unprobed;
+    md_probe_state_t g_mda_state = md_probe_state_t::Unprobed;
+};
+static thread_local MGMultidrawState g_md_default;
+static thread_local MGMultidrawState* g_md_state = &g_md_default;
+static thread_local unsigned long long g_owner_ctx_id = 0;
 
-// Arrays commands are 16 bytes, element commands 20, and the capacity counters
-// below are in commands, not bytes. Sharing one buffer between the two layouts
-// would let an Elements call skip its resize because an Arrays call had already
-// "grown" it, and then map past the end of the store.
-static std::array<indirect_slot_t, kIndirectRingSize> g_arrays_indirect_slots{};
-static mg::indirect_ring::Cursor<kIndirectRingSize> g_arrays_indirect_cursor;
-static bool g_arrays_indirect_ring_failed = false;
-static md_probe_state_t g_arrays_mdi_state = md_probe_state_t::Unprobed;
-static md_probe_state_t g_arrays_mda_state = md_probe_state_t::Unprobed;
+#define g_indirect_slots (g_md_state->g_indirect_slots)
+#define g_indirect_cursor (g_md_state->g_indirect_cursor)
+#define g_indirect_ring_failed (g_md_state->g_indirect_ring_failed)
+#define g_arrays_indirect_slots (g_md_state->g_arrays_indirect_slots)
+#define g_arrays_indirect_cursor (g_md_state->g_arrays_indirect_cursor)
+#define g_arrays_indirect_ring_failed (g_md_state->g_arrays_indirect_ring_failed)
+#define g_arrays_mdi_state (g_md_state->g_arrays_mdi_state)
+#define g_arrays_mda_state (g_md_state->g_arrays_mda_state)
+#define g_scratch_ibo (g_md_state->g_scratch_ibo)
+#define g_compute_inited (g_md_state->g_compute_inited)
+#define g_compute_failed (g_md_state->g_compute_failed)
+#define g_prefixsumbuffer (g_md_state->g_prefixsumbuffer)
+#define g_drawcmd_ssbo (g_md_state->g_drawcmd_ssbo)
+#define g_outputibo (g_md_state->g_outputibo)
+#define g_compute_program (g_md_state->g_compute_program)
+#define g_element_size_loc (g_md_state->g_element_size_loc)
+#define g_max_compute_groups_x (g_md_state->g_max_compute_groups_x)
+#define g_count_program (g_md_state->g_count_program)
+#define g_count_scratch (g_md_state->g_count_scratch)
+#define g_count_inited (g_md_state->g_count_inited)
+#define g_count_failed (g_md_state->g_count_failed)
+#define g_count_loc_max (g_md_state->g_count_loc_max)
+#define g_count_loc_srcwords (g_md_state->g_count_loc_srcwords)
+#define g_count_loc_srcoff (g_md_state->g_count_loc_srcoff)
+#define g_count_loc_cntoff (g_md_state->g_count_loc_cntoff)
+#define g_count_loc_dstwords (g_md_state->g_count_loc_dstwords)
+#define g_mdbv_state (g_md_state->g_mdbv_state)
+#define g_mda_state (g_md_state->g_mda_state)
 
-// drawelements path
-static GLuint g_scratch_ibo = 0;
-
-// compute path
-static bool g_compute_inited = false;
-static bool g_compute_failed = false;
-static GLuint g_prefixsumbuffer = 0;
-static GLuint g_drawcmd_ssbo = 0;
-static GLuint g_outputibo = 0;
-static GLuint g_compute_program = 0;
-static GLint g_element_size_loc = -1;
-static GLint g_max_compute_groups_x = 0;
-
-// glMultiDraw*IndirectCount compaction
-static GLuint g_count_program = 0;
-static GLuint g_count_scratch = 0;
-static bool g_count_inited = false;
-static bool g_count_failed = false;
-static GLint g_count_loc_max = -1, g_count_loc_srcwords = -1, g_count_loc_srcoff = -1, g_count_loc_cntoff = -1,
-             g_count_loc_dstwords = -1;
-
-// probe latches for the two extension-provided batched backends.
-//
-// One tri-state rather than a separate "probed" flag and "failed" flag: those
-// were kept in two places, only one of which multidraw_check_context() reset, so
-// after a context change the backend was re-enabled but never re-probed -- and an
-// unprobed call reports success unconditionally, which loses the whole batch on
-// a driver whose entry point is a stub.
-static md_probe_state_t g_mdbv_state = md_probe_state_t::Unprobed;
-static md_probe_state_t g_mda_state = md_probe_state_t::Unprobed;
-
-// Invalidate every cached GL object name when the current context changes.
-//
-// Object names are actually shared across a share group rather than tied to one
-// context, but EGL exposes no way to query the share group, so this compares
-// context identity.
-//
-// Destroy-and-recreate is handled correctly. Two live contexts used alternately
-// are not: each switch drops the other context's still-valid objects, so they
-// are rebuilt every time and the abandoned ones are never freed (g_outputibo can
-// be several MB). Deleting them here is not possible either, because a name from
-// the context being left is not addressable from the one being entered. Making
-// that case tidy needs a per-context map; it is not implemented.
 static void multidraw_check_context() {
     const unsigned long long cur = g_current_ctx ? g_current_ctx->id : 0;
     if (cur == g_owner_ctx_id) return;
-
-    // Deliberately no glDelete* here: if the owning context is gone its objects
-    // went with it, and if it is merely not current then these names refer to
-    // objects belonging to whichever context *is* current.
-    g_indirect_slots.fill(indirect_slot_t{});
-    g_indirect_cursor.reset();
-    g_indirect_ring_failed = false;
-    g_arrays_indirect_slots.fill(indirect_slot_t{});
-    g_arrays_indirect_cursor.reset();
-    g_arrays_indirect_ring_failed = false;
-    g_arrays_mdi_state = md_probe_state_t::Unprobed;
-    g_arrays_mda_state = md_probe_state_t::Unprobed;
-    g_count_program = 0;
-    g_count_scratch = 0;
-    g_count_inited = false;
-    g_count_failed = false;
-    g_count_loc_max = g_count_loc_srcwords = g_count_loc_srcoff = g_count_loc_cntoff = g_count_loc_dstwords = -1;
-    g_scratch_ibo = 0;
-    // gl/restart.cpp caches a scratch index buffer of its own, created with a
-    // real driver name rather than a virtual one, so it has exactly the same
-    // cross-context reuse hazard.
-    mg_restart_invalidate();
-    g_compute_inited = false;
-    // The failure latches are per-context capability facts, so they are cleared
-    // together with the objects they describe. Clearing a probe latch also has
-    // to re-arm its probe, which is why it is a single tri-state.
-    g_compute_failed = false;
-    g_mdbv_state = md_probe_state_t::Unprobed;
-    g_mda_state = md_probe_state_t::Unprobed;
-    g_prefixsumbuffer = 0;
-    g_drawcmd_ssbo = 0;
-    g_outputibo = 0;
-    g_compute_program = 0;
-    g_element_size_loc = -1;
-    g_max_compute_groups_x = 0;
-
+    if (g_current_ctx) {
+        auto& state = g_current_ctx->multidraw;
+        if (!state) state = std::make_shared<MGMultidrawState>();
+        g_md_state = state.get();
+    } else {
+        g_md_state = &g_md_default;
+    }
     g_owner_ctx_id = cur;
-    LOG_D("multidraw: context changed, scratch objects invalidated")
 }
 
-// ---------------------------------------------------------------------------
-// Entry validation
-//
-// GL 4.6 sec. 10.5 requires GL_INVALID_VALUE for a negative count and
-// GL_INVALID_ENUM for an unrecognised type. This layer has no way to raise a GL
-// error the application can observe, so the achievable goal is consistency:
-// every mode must react to the same bad input the same way. Before this, a
-// negative count was silently skipped by the unrolled paths, clamped to zero by
-// the compute path, and turned into a ~4-billion-index draw by the indirect
-// paths.
-// ---------------------------------------------------------------------------
 static bool mg_validate_multidraw(const GLsizei* counts, GLenum type, GLsizei primcount);
 
 // Shared entry gate for every mode implementation.
@@ -729,7 +680,7 @@ static bool prepare_indirect_buffer(const GLsizei* counts, GLenum type, const vo
     // thread_local for the same reason as mg_zero_basevertex: nothing in this
     // file takes a lock, and two threads can each have a current context.
     static thread_local std::vector<draw_elements_indirect_command_t> staged;
-    staged.resize(static_cast<size_t>(primcount));
+    if (staged.size() < static_cast<size_t>(primcount)) staged.resize(static_cast<size_t>(primcount));
     draw_elements_indirect_command_t* pcmds = staged.data();
 
     for (GLsizei i = 0; i < primcount; ++i) {
@@ -1476,8 +1427,10 @@ GLAPI GLAPIENTRY void mg_glMultiDrawElementsBaseVertex_compute(GLenum mode, GLsi
         std::min<uint64_t>(static_cast<uint64_t>(std::numeric_limits<GLint>::max()) / sizeof(GLuint),
                            static_cast<uint64_t>(g_max_compute_groups_x) * 64ull);
 
-    std::vector<GLuint> prefix_sum(static_cast<size_t>(primcount));
-    std::vector<drawcmd_compute_t> drawcmds(static_cast<size_t>(primcount));
+    static thread_local std::vector<GLuint> prefix_sum;
+    static thread_local std::vector<drawcmd_compute_t> drawcmds;
+    if (prefix_sum.size() < static_cast<size_t>(primcount)) prefix_sum.resize(static_cast<size_t>(primcount));
+    if (drawcmds.size() < static_cast<size_t>(primcount)) drawcmds.resize(static_cast<size_t>(primcount));
 
     uint64_t running = 0;
     for (GLsizei i = 0; i < primcount; ++i) {
@@ -1825,7 +1778,7 @@ static bool prepare_arrays_indirect_buffer(const GLint* first, const GLsizei* co
     }
 
     static thread_local std::vector<draw_arrays_indirect_command_t> staged;
-    staged.resize(static_cast<size_t>(drawcount));
+    if (staged.size() < static_cast<size_t>(drawcount)) staged.resize(static_cast<size_t>(drawcount));
     draw_arrays_indirect_command_t* cmds = staged.data();
 
     for (GLsizei i = 0; i < drawcount; ++i) {

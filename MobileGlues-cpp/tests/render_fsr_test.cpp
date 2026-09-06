@@ -5,6 +5,7 @@
 #include <cassert>
 #include <map>
 #include <thread>
+#include <chrono>
 #include <cstdio>
 gles_func_t g_gles_func{};
 gles_caps_t g_gles_caps{};
@@ -28,7 +29,7 @@ namespace {
     GLenum pending = 0, driverError = 0;
     int surfaceWidth = 640, surfaceHeight = 480, allocations = 0, draws = 0;
     bool validSurface = true, incomplete = false;
-    int barriers = 0;
+    int barriers = 0, shaderCompiles = 0;
     void textureBarrier() {
         ++barriers;
     }
@@ -170,7 +171,7 @@ namespace {
         assert(count == 1);
         assert(std::string(text[0]).find("#version 450") == std::string::npos);
     }
-    void compile(GLuint) {}
+    void compile(GLuint) { ++shaderCompiles; }
     void attach(GLuint, GLuint) {}
     void link(GLuint) {}
     void getStatus(GLuint, GLenum, GLint* status) {
@@ -338,10 +339,26 @@ int main() {
     surfaceWidth = 800;
     CheckResolutionChange(eglGetCurrentDisplay(), eglGetCurrentSurface(EGL_DRAW));
     assert(FSR1_Context::g_renderFBO == old && FSR1_Context::g_renderWidth == 640);
+    const int allocationsBeforeRetry = allocations;
+    for (int i = 0; i < 32; ++i)
+        CheckResolutionChange(eglGetCurrentDisplay(), eglGetCurrentSurface(EGL_DRAW));
+    std::fprintf(stderr, "FSR repeated failed resize: extra_allocations=%d\n", allocations - allocationsBeforeRetry);
+    assert(allocations == allocationsBeforeRetry);
     incomplete = false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1050));
     CheckResolutionChange(eglGetCurrentDisplay(), eglGetCurrentSurface(EGL_DRAW));
     assert(FSR1_Context::g_renderFBO != old && FSR1_Context::g_renderWidth == 800);
     old = FSR1_Context::g_renderFBO;
+    const int steadyAllocations = allocations;
+    for (int i = 0; i < 32; ++i)
+        CheckResolutionChange(eglGetCurrentDisplay(), eglGetCurrentSurface(EGL_DRAW));
+    assert(allocations == steadyAllocations);
+    for (int i = 0; i < 32; ++i) {
+        glViewport(0, 0, 4096, 4096); // a shadow/offscreen pass, not a surface resize
+        CheckResolutionChange(eglGetCurrentDisplay(), eglGetCurrentSurface(EGL_DRAW));
+    }
+    std::fprintf(stderr, "FSR offscreen viewport: extra_allocations=%d\n", allocations - steadyAllocations);
+    assert(allocations == steadyAllocations && FSR1_Context::g_renderWidth == surfaceWidth);
     std::thread other([] {
         mg_fsr1_bind_context(202);
         FSR1_Context::g_renderFBO = 999;
@@ -358,5 +375,22 @@ int main() {
     mg_texture_barrier_backend = textureBarrier;
     glTextureBarrier();
     assert(barriers == 1 && pending == 0);
+    mg_fsr1_bind_context(303);
+    incomplete = true;
+    InitFSRResources();
+    assert(!fsrInitialized);
+    const int failedInitAllocations = allocations, failedInitCompiles = shaderCompiles;
+    for (int i = 0; i < 32; ++i) InitFSRResources();
+    assert(allocations == failedInitAllocations && shaderCompiles == failedInitCompiles);
+    // A different context/size is not held behind another failed attempt.
+    mg_fsr1_bind_context(304);
+    incomplete = false;
+    InitFSRResources();
+    assert(fsrInitialized);
+    mg_fsr1_bind_context(303);
+    assert(!fsrInitialized);
+    ++surfaceWidth;
+    InitFSRResources();
+    assert(fsrInitialized && FSR1_Context::g_renderWidth == surfaceWidth);
     puts("FSR initialization/resize/state/context and ANGLE clear contracts passed");
 }

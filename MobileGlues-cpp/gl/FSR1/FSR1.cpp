@@ -6,6 +6,7 @@
 // End of Source File Header
 #include "FSR1.h"
 #include <mutex>
+#include <chrono>
 #include <ska/flat_hash_map.hpp>
 #include "FSRShaderSource.h"
 #include "../../config/settings.h"
@@ -299,6 +300,32 @@ void InitFullscreenQuad() {
 thread_local bool fsrInitialized = false;
 namespace {
     thread_local bool fsrInitializing = false;
+    struct FSRRetryState {
+        GLsizei width = 0, height = 0;
+        FSR1_Quality_Preset preset{};
+        bool pending = false;
+        std::chrono::steady_clock::time_point after{};
+
+        bool allows(GLsizei w, GLsizei h) const {
+            return !pending || width != w || height != h || preset != global_settings.fsr1_setting ||
+                   std::chrono::steady_clock::now() >= after;
+        }
+    };
+    thread_local FSRRetryState fsrRetry;
+    // A failed internal allocation/link is retried at most once per second for
+    // the same size/preset. A new size or context can recover immediately.
+    struct FSRRetryAttempt {
+        GLsizei width, height;
+        bool succeeded = false;
+        ~FSRRetryAttempt() {
+            fsrRetry.pending = !succeeded;
+            if (succeeded) return;
+            fsrRetry.width = width;
+            fsrRetry.height = height;
+            fsrRetry.preset = global_settings.fsr1_setting;
+            fsrRetry.after = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        }
+    };
     struct FSRTargets {
         GLuint renderFBO = 0, renderTexture = 0, depth = 0, targetFBO = 0, targetTexture = 0;
     };
@@ -377,6 +404,8 @@ void InitFSRResources() {
     if (fsrInitialized || fsrInitializing) return;
     GLsizei width = 0, height = 0;
     if (!surface_size(eglGetCurrentDisplay(), eglGetCurrentSurface(EGL_DRAW), width, height)) return;
+    if (!fsrRetry.allows(width, height)) return;
+    FSRRetryAttempt attempt{width, height};
     fsrInitializing = true;
     struct InitializingGuard {
         ~InitializingGuard() { fsrInitializing = false; }
@@ -408,6 +437,7 @@ void InitFSRResources() {
         return;
     }
     fsrInitialized = true;
+    attempt.succeeded = true;
     FSR1_Context::g_resolutionChanged = false;
 }
 
@@ -417,9 +447,14 @@ void RecreateFSRFBO() {
         return;
     }
     const GLsizei width = FSR1_Context::g_pendingWidth, height = FSR1_Context::g_pendingHeight;
+    if (!fsrRetry.allows(width, height)) return;
+    FSRRetryAttempt attempt{width, height};
     GLint tw = 0, th = 0;
     CalculateTargetResolution(global_settings.fsr1_setting, width, height, &tw, &th);
-    if (replace_targets(width, height, tw, th)) FSR1_Context::g_resolutionChanged = false;
+    if (replace_targets(width, height, tw, th)) {
+        FSR1_Context::g_resolutionChanged = false;
+        attempt.succeeded = true;
+    }
 }
 thread_local std::vector<std::pair<GLsizei, GLsizei>> g_viewportStack;
 
@@ -487,12 +522,8 @@ void glViewport(GLint x, GLint y, GLsizei w, GLsizei h) {
     LOG()
     LOG_D("glViewport: x=%d, y=%d, w=%d, h=%d", x, y, w, h);
 
-    if (w > FSR1_Context::g_pendingWidth || h > FSR1_Context::g_pendingHeight) {
-        FSR1_Context::g_pendingWidth = w;
-        FSR1_Context::g_pendingHeight = h;
-        FSR1_Context::g_resolutionChanged = true;
-    }
-
+    // Offscreen passes can use unrelated viewport sizes. Only the actual EGL
+    // surface size observed by CheckResolutionChange controls FSR allocation.
     GLES.glViewport(x, y, w, h);
 }
 
@@ -501,6 +532,7 @@ void glViewport(GLint x, GLint y, GLsizei w, GLsizei h) {
 namespace {
 
     struct fsr1_ctx_state_t {
+        FSRRetryState retry;
         GLuint renderFBO = 0, renderTexture = 0, depthStencilRBO = 0;
         GLuint quadVAO = 0, quadVBO = 0, fsrProgram = 0;
         // Locations belong to fsrProgram, so they travel with it rather than being
@@ -523,6 +555,7 @@ namespace {
     thread_local unsigned long long g_fsr_current_id = 0;
 
     void store_into(fsr1_ctx_state_t& d) {
+        d.retry = fsrRetry;
         d.renderFBO = FSR1_Context::g_renderFBO;
         d.renderTexture = FSR1_Context::g_renderTexture;
         d.depthStencilRBO = FSR1_Context::g_depthStencilRBO;
@@ -547,6 +580,7 @@ namespace {
     }
 
     void load_from(const fsr1_ctx_state_t& s) {
+        fsrRetry = s.retry;
         FSR1_Context::g_renderFBO = s.renderFBO;
         FSR1_Context::g_renderTexture = s.renderTexture;
         FSR1_Context::g_depthStencilRBO = s.depthStencilRBO;

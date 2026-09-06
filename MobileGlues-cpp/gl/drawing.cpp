@@ -131,24 +131,10 @@ void glMemoryBarrier(GLbitfield barriers) {
 
 namespace {
 
-    // Scratch index buffer for the base-vertex emulation below, and the context that
-    // owns it. Modeled on gl/restart.cpp's g_restart_ibo, including the invalidation:
-    // thread_local because g_current_ctx is, so two threads with different current
-    // contexts keep their own name instead of trading one back and forth.
-    thread_local GLuint g_basevertex_ibo = 0;
-    thread_local unsigned long long g_basevertex_owner_ctx_id = 0;
-
-    // Drop the cached name when the current context is not the one that created it.
-    //
-    // Deliberately no glDeleteBuffers: if the owning context is gone the buffer went
-    // with it, and if it is merely not current then this name refers to a buffer
-    // belonging to whichever context *is* current -- the glBufferData below would
-    // overwrite that buffer's contents.
-    void basevertex_check_context() {
-        const unsigned long long cur = g_current_ctx ? g_current_ctx->id : 0;
-        if (cur == g_basevertex_owner_ctx_id) return;
-        g_basevertex_ibo = 0;
-        g_basevertex_owner_ctx_id = cur;
+    // Retain each live context's scratch name, including thread migration.
+    thread_local GLuint fallback_basevertex_ibo = 0;
+    GLuint& basevertex_ibo() {
+        return g_current_ctx ? g_current_ctx->basevertex_scratch_buffer : fallback_basevertex_ibo;
     }
 
     // Staging for the rebased index stream. Elements are GLuint so the storage is
@@ -249,16 +235,17 @@ void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const voi
             memcpy(tempIndices, indices, bytes);
         }
 
-        std::vector<GLuint> rebased(static_cast<size_t>(count));
+        static thread_local std::vector<GLuint> rebased;
+        if (rebased.size() < static_cast<size_t>(count)) rebased.resize(static_cast<size_t>(count));
         const bool preserve_restart = restart_fixed || mg_enable_state()->scalar[MGC_PRIMITIVE_RESTART_FIXED_INDEX];
         const GLuint sentinel = type == GL_UNSIGNED_BYTE ? 0xffu : type == GL_UNSIGNED_SHORT ? 0xffffu : 0xffffffffu;
         mg_rebase_indices_to_u32(rebased.data(), tempIndices, count, type, basevertex, preserve_restart, sentinel);
         // One persistent scratch buffer instead of a glGenBuffers/glDeleteBuffers
         // pair per draw call.
-        basevertex_check_context();
+        GLuint& g_basevertex_ibo = basevertex_ibo();
         if (!g_basevertex_ibo) GLES.glGenBuffers(1, &g_basevertex_ibo);
         GLES.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_basevertex_ibo);
-        GLES.glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(rebased.size() * sizeof(GLuint)),
+        GLES.glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(count) * sizeof(GLuint),
                           rebased.data(), GL_STREAM_DRAW);
 
         GLES.glDrawElements(mode, count, GL_UNSIGNED_INT, nullptr);

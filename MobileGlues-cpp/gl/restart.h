@@ -59,10 +59,6 @@ extern "C"
     bool mg_draw_elements_restart(GLenum mode, GLsizei count, GLenum type, const void* indices, GLint basevertex,
                                   GLsizei instancecount);
 
-    // Drop the scratch objects this file caches. Called when the current context
-    // changes; the names belong to whichever context created them.
-    void mg_restart_invalidate(void);
-
 #ifdef __cplusplus
 }
 #endif
