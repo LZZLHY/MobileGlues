@@ -23,20 +23,11 @@ mg_shader_group& mg_shader_objects() {
     return fallback;
 }
 
-void mg_collect_deleted_shaders(mg_shader_group& group) {
-    for (auto it = group.shaders.begin(); it != group.shaders.end();) {
-        bool attached = false;
-        for (const auto& p : group.programs) {
-            if (std::find(p.second.attached.begin(), p.second.attached.end(), it->first) != p.second.attached.end()) {
-                attached = true;
-                break;
-            }
-        }
-        if (it->second.deleted && !attached)
-            it = group.shaders.erase(it);
-        else
-            ++it;
-    }
+void mg_release_shader_attachment(mg_shader_group& group, GLuint shader) {
+    const auto it = group.shaders.find(shader);
+    if (it == group.shaders.end()) return;
+    if (it->second.attachment_count > 0) --it->second.attachment_count;
+    if (it->second.deleted && it->second.attachment_count == 0) group.shaders.erase(it);
 }
 
 bool mg_shader_translate(mg_shader_record& shader, const mg_frag_bindings* outputs, std::string& source,
@@ -242,8 +233,10 @@ void glDeleteShader(GLuint shader) {
     GLES.glDeleteShader(shader);
     if (!mg_end_driver_operation("glDeleteShader")) return;
     auto it = group.shaders.find(shader);
-    if (it != group.shaders.end()) it->second.deleted = true;
-    mg_collect_deleted_shaders(group);
+    if (it != group.shaders.end()) {
+        it->second.deleted = true;
+        if (it->second.attachment_count == 0) group.shaders.erase(it);
+    }
 }
 
 extern "C"

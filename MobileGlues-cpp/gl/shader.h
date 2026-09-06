@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <vector>
+#include <set>
 #include "glsl/translation_state.h"
 
 struct mg_shader_record {
@@ -25,6 +26,7 @@ struct mg_shader_record {
     mg_glsl_metadata compiled_metadata;
     bool compiled = false;
     bool deleted = false;
+    unsigned attachment_count = 0;
 };
 struct mg_program_record {
     std::uint64_t generation = 0, link_generation = 0;
@@ -42,11 +44,12 @@ struct mg_shader_group {
     std::uint64_t generation = 1;
     std::map<GLuint, mg_shader_record> shaders;
     std::map<GLuint, mg_program_record> programs;
+    std::set<GLuint> pending_program_deletions;
 };
 mg_shader_group& mg_shader_objects();
 bool mg_shader_translate(mg_shader_record& shader, const mg_frag_bindings* outputs, std::string& source,
                          mg_glsl_metadata& metadata, std::string& error);
-void mg_collect_deleted_shaders(mg_shader_group& group);
+void mg_release_shader_attachment(mg_shader_group& group, GLuint shader);
 
 #ifdef __cplusplus
 extern "C"

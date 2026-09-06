@@ -305,6 +305,27 @@ int main() {
     rejectUse = false;
     glUseProgram(p);
     assert(current == p && useCalls == uses + 2);
+    // Object lifetime work follows attachment/deletion events, not every draw.
+    GLuint sharedShader = makeShader(GL_FRAGMENT_SHADER, fs);
+    GLuint ownerA = glCreateProgram(), ownerB = glCreateProgram();
+    glAttachShader(ownerA, sharedShader);
+    glAttachShader(ownerB, sharedShader);
+    assert(mg_shader_objects().shaders.at(sharedShader).attachment_count == 2);
+    glDeleteShader(sharedShader);
+    glDeleteProgram(ownerA);
+    assert(mg_shader_objects().shaders.at(sharedShader).attachment_count == 1);
+    glDeleteProgram(ownerB);
+    assert(!mg_shader_objects().shaders.count(sharedShader));
+    GLuint deferred = glCreateProgram();
+    glAttachShader(deferred, v);
+    glAttachShader(deferred, other);
+    glLinkProgram(deferred);
+    glUseProgram(deferred);
+    glDeleteProgram(deferred);
+    assert(mg_shader_objects().pending_program_deletions.count(deferred));
+    glUseProgram(p);
+    assert(!mg_shader_objects().pending_program_deletions.count(deferred));
+    assert(!mg_shader_objects().programs.count(deferred));
     global_settings.ignore_error = IgnoreErrorLevel::Full;
     programs[p2].linked = false;
     glGetProgramiv(p2, GL_LINK_STATUS, &ok);

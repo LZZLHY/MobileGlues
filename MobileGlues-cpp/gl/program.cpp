@@ -11,13 +11,17 @@
 #define DEBUG 0
 
 static void collect_deleted_programs(mg_shader_group& group) {
-    for (auto it = group.programs.begin(); it != group.programs.end();) {
-        if (it->second.deleted && !GLES.glIsProgram(it->first))
-            it = group.programs.erase(it);
-        else
-            ++it;
+    // Only names explicitly marked for deferred deletion can need work here.
+    // Do not scan the live object graph on every program bind.
+    for (auto pending = group.pending_program_deletions.begin(); pending != group.pending_program_deletions.end();) {
+        if (GLES.glIsProgram(*pending)) { ++pending; continue; }
+        const auto it = group.programs.find(*pending);
+        if (it != group.programs.end()) {
+            for (GLuint shader : it->second.attached) mg_release_shader_attachment(group, shader);
+            group.programs.erase(it);
+        }
+        pending = group.pending_program_deletions.erase(pending);
     }
-    mg_collect_deleted_shaders(group);
 }
 
 GLuint glCreateProgram() {
@@ -26,6 +30,11 @@ GLuint glCreateProgram() {
     if (program) {
         auto& group = mg_shader_objects();
         std::lock_guard<std::recursive_mutex> lock(group.mutex);
+        const auto old = group.programs.find(program);
+        if (old != group.programs.end()) {
+            for (GLuint shader : old->second.attached) mg_release_shader_attachment(group, shader);
+        }
+        group.pending_program_deletions.erase(program);
         auto& record = group.programs[program];
         record = {};
         record.generation = group.generation++;
@@ -41,7 +50,11 @@ void glAttachShader(GLuint program, GLuint shader) {
     GLES.glAttachShader(program, shader);
     if (!mg_end_driver_operation("glAttachShader")) return;
     auto& attached = group.programs[program].attached;
-    if (std::find(attached.begin(), attached.end(), shader) == attached.end()) attached.push_back(shader);
+    if (std::find(attached.begin(), attached.end(), shader) == attached.end()) {
+        attached.push_back(shader);
+        const auto it = group.shaders.find(shader);
+        if (it != group.shaders.end()) ++it->second.attachment_count;
+    }
 }
 
 void glDetachShader(GLuint program, GLuint shader) {
@@ -54,9 +67,12 @@ void glDetachShader(GLuint program, GLuint shader) {
     const auto it = group.programs.find(program);
     if (it != group.programs.end()) {
         auto& attached = it->second.attached;
-        attached.erase(std::remove(attached.begin(), attached.end(), shader), attached.end());
+        const auto member = std::find(attached.begin(), attached.end(), shader);
+        if (member != attached.end()) {
+            attached.erase(member);
+            mg_release_shader_attachment(group, shader);
+        }
     }
-    mg_collect_deleted_shaders(group);
 }
 
 void glDeleteProgram(GLuint program) {
@@ -67,7 +83,10 @@ void glDeleteProgram(GLuint program) {
     GLES.glDeleteProgram(program);
     if (!mg_end_driver_operation("glDeleteProgram")) return;
     const auto it = group.programs.find(program);
-    if (it != group.programs.end()) it->second.deleted = true;
+    if (it != group.programs.end()) {
+        it->second.deleted = true;
+        group.pending_program_deletions.insert(program);
+    }
     collect_deleted_programs(group);
 }
 
@@ -293,8 +312,10 @@ void glUseProgram(GLuint program) {
     }
     mg_begin_driver_operation();
     GLES.glUseProgram(program);
-    if (mg_end_driver_operation("glUseProgram")) gl_state->current_program = program;
-    collect_deleted_programs(group);
+    if (mg_end_driver_operation("glUseProgram")) {
+        gl_state->current_program = program;
+        if (!group.pending_program_deletions.empty()) collect_deleted_programs(group);
+    }
 }
 
 extern "C"
