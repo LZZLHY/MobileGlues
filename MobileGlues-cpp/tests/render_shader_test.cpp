@@ -58,7 +58,7 @@ namespace {
     GLuint nextName = 1, current = 0;
     int submissions = 0, lastCount = 0, useCalls = 0, queries = 0;
     GLenum driverError = 0, frontendError = 0;
-    bool rejectUse = false;
+    bool rejectUse = false, rejectLink = false;
     std::map<int, int> uniforms;
     GLuint createShader(GLenum type) {
         GLuint id = nextName++;
@@ -124,6 +124,7 @@ namespace {
     }
     void link(GLuint id) {
         auto& p = programs[id];
+        if (rejectLink) { p.linked = false; return; }
         ++p.link;
         p.linked = true;
         p.linkedSources.clear();
@@ -348,6 +349,15 @@ int main() {
     int q = queries;
     setupBufferTextureUniforms(p);
     assert(queries > q);
+    const auto linkedGeneration = record.link_generation;
+    q = queries;
+    rejectLink = true;
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    assert(!ok && record.link_generation == linkedGeneration);
+    setupBufferTextureUniforms(p);
+    assert(queries == q);
+    rejectLink = false;
     // Two non-shared contexts may use exactly the same GLuint names.
     MGContext a{}, b{};
     a.share_group = std::make_shared<MGShareGroup>();

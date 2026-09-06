@@ -205,9 +205,11 @@ void glLinkProgram(GLuint program) {
         defaultFS = compile_link_shader(GL_FRAGMENT_SHADER, source, record.failure);
         if (defaultFS) GLES.glAttachShader(program, defaultFS);
     }
-    GLES.glLinkProgram(program);
     GLint status = 0;
-    GLES.glGetProgramiv(program, GL_LINK_STATUS, &status);
+    if (record.failure.empty()) {
+        GLES.glLinkProgram(program);
+        GLES.glGetProgramiv(program, GL_LINK_STATUS, &status);
+    }
     for (const auto& replacement : replacements) {
         GLES.glDetachShader(program, replacement.second);
         GLES.glAttachShader(program, replacement.first);
@@ -219,8 +221,10 @@ void glLinkProgram(GLuint program) {
         GLES.glDetachShader(program, defaultFS);
         GLES.glDeleteShader(defaultFS);
     }
-    ++record.link_generation;
     if (status && record.failure.empty()) {
+        // Failed relinks leave the old executable installed while current.
+        // Keep its reflection until a successful replacement is available.
+        ++record.link_generation;
         record.metadata = std::move(linked);
         restore_source_bindings(program, record.metadata);
     } else {
@@ -228,6 +232,7 @@ void glLinkProgram(GLuint program) {
             char log[4096]{};
             GLES.glGetProgramInfoLog(program, sizeof(log), nullptr, log);
             record.failure = log;
+            if (record.failure.empty()) record.failure = "GLES program link failed without an information log";
         }
         LOG_W_FORCE("[MG-PROGRAM-LINK] program=%u generation=%llu failed: %s", program,
                     static_cast<unsigned long long>(record.link_generation), record.failure.c_str())
