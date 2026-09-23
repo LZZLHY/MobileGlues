@@ -14,6 +14,7 @@
 #include <chrono>
 #include "texture.h"
 #include "buffer_contract_core.h"
+#include "buffer_readback_core.h"
 #include "terrain_upload_core.h"
 #include "upload_scheduler_core.h"
 
@@ -1553,6 +1554,99 @@ GLboolean mg_buffer_sub_data_named(GLuint buffer, GLintptr offset, GLsizeiptr si
     if (saved != backend) GLES.glBindBuffer(GL_COPY_WRITE_BUFFER, saved);
     CHECK_GL_ERROR
     return GL_TRUE;
+}
+
+namespace {
+/**
+ * 单次同步读回借用两个原生COPY绑定；不改变frontend绑定、VAO或源buffer的映射。
+ * 只有persistent源使用至多1MiB的scratch，以免对已经映射的driver buffer再次Map，
+ * 也避免从没有READ权限的原映射指针读数据。内部错误通过既有pending队列保留。
+ */
+struct BufferReadbackDriver {
+    GLuint source;
+    GLuint scratch{0};
+    GLint savedRead{0}, savedWrite{0};
+    bool captured{false};
+
+    bool Begin(bool persistentSource, std::int64_t scratchSize) {
+        if (!GLES.glGetIntegerv || !GLES.glBindBuffer || !GLES.glMapBufferRange || !GLES.glUnmapBuffer ||
+            (persistentSource && (!GLES.glGenBuffers || !GLES.glDeleteBuffers || !GLES.glBufferData ||
+                                  !GLES.glCopyBufferSubData))) {
+            mg_set_gl_error(GL_INVALID_OPERATION);
+            return false;
+        }
+        mg_begin_driver_operation();
+        GLES.glGetIntegerv(GL_COPY_READ_BUFFER_BINDING, &savedRead);
+        GLES.glGetIntegerv(GL_COPY_WRITE_BUFFER_BINDING, &savedWrite);
+        if (!mg_end_driver_operation("glGetBufferSubData/bindings")) return false;
+        captured = true;
+        if (persistentSource) {
+            GLES.glGenBuffers(1, &scratch);
+            if (!mg_end_driver_operation("glGetBufferSubData/scratch-name")) return false;
+            if (scratch == 0) { mg_set_gl_error(GL_OUT_OF_MEMORY); return false; }
+            GLES.glBindBuffer(GL_COPY_WRITE_BUFFER, scratch);
+            GLES.glBufferData(GL_COPY_WRITE_BUFFER, static_cast<GLsizeiptr>(scratchSize), nullptr, GL_STREAM_READ);
+            if (!mg_end_driver_operation("glGetBufferSubData/scratch-storage")) return false;
+        }
+        return true;
+    }
+
+    bool Transfer(std::int64_t offset, std::int64_t size, void* output, bool persistentSource) {
+        GLES.glBindBuffer(GL_COPY_READ_BUFFER, source);
+        if (persistentSource) {
+            GLES.glBindBuffer(GL_COPY_WRITE_BUFFER, scratch);
+            GLES.glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER,
+                static_cast<GLintptr>(offset), 0, static_cast<GLsizeiptr>(size));
+            if (!mg_end_driver_operation("glGetBufferSubData/copy")) return false;
+            GLES.glBindBuffer(GL_COPY_READ_BUFFER, scratch);
+        }
+        void* mapped = GLES.glMapBufferRange(GL_COPY_READ_BUFFER,
+            persistentSource ? 0 : static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(size), GL_MAP_READ_BIT);
+        const bool mappedCleanly = mg_end_driver_operation("glGetBufferSubData/map");
+        if (!mapped || !mappedCleanly) {
+            // 即使driver同时返回地址和错误，也要退休这个临时映射；不向调用方复制可疑数据。
+            if (mapped) { GLES.glUnmapBuffer(GL_COPY_READ_BUFFER); mg_end_driver_operation("glGetBufferSubData/unmap-failed-map"); }
+            if (!mapped && mappedCleanly) mg_set_gl_error(GL_OUT_OF_MEMORY);
+            return false;
+        }
+        std::memcpy(output, mapped, static_cast<std::size_t>(size));
+        const GLboolean unmapped = GLES.glUnmapBuffer(GL_COPY_READ_BUFFER);
+        const bool clean = mg_end_driver_operation("glGetBufferSubData/unmap");
+        if (!unmapped && clean) mg_set_gl_error(GL_INVALID_OPERATION);
+        return clean && unmapped == GL_TRUE;
+    }
+
+    bool End() {
+        if (!captured) return true;
+        GLES.glBindBuffer(GL_COPY_READ_BUFFER, static_cast<GLuint>(savedRead));
+        GLES.glBindBuffer(GL_COPY_WRITE_BUFFER, static_cast<GLuint>(savedWrite));
+        if (scratch != 0) GLES.glDeleteBuffers(1, &scratch);
+        scratch = 0;
+        captured = false;
+        return mg_end_driver_operation("glGetBufferSubData/restore");
+    }
+};
+} // namespace
+
+/** desktop GL的CPU读回入口；core、ARB与DSA最终共用此实现，不再返回空数据。 */
+void glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void* data) {
+    if (binding_target_to_index(target) < 0) { mg_set_gl_error(GL_INVALID_ENUM); return; }
+    const GLuint frontend = find_bound_buffer_by_target(target);
+    if (frontend == 0 || !has_buffer(frontend)) { mg_set_gl_error(GL_INVALID_OPERATION); return; }
+    const auto mapping = frontend < g_buffer_mappings.size()
+        ? g_buffer_mappings[frontend] : mg::buffer_contract::MappingState{};
+    BufferReadbackDriver driver{find_real_buffer(frontend)};
+    const auto result = mg::buffer_readback::Read(driver,
+        static_cast<std::int64_t>(get_buffer_data_size(frontend)), offset, size, data, mapping.active,
+        (mapping.requested_access & GL_MAP_PERSISTENT_BIT) != 0);
+    if (result == mg::buffer_readback::Result::InvalidValue) mg_set_gl_error(GL_INVALID_VALUE);
+    if (result == mg::buffer_readback::Result::InvalidOperation) mg_set_gl_error(GL_INVALID_OPERATION);
+    // DriverFailure的原始错误已经进pending队列，不以另一个错误覆盖它。
+}
+
+/** ARB旧名称保持同样的参数验证、真实读回和资源生命周期。 */
+void glGetBufferSubDataARB(GLenum target, GLintptrARB offset, GLsizeiptrARB size, void* data) {
+    glGetBufferSubData(target, offset, size, data);
 }
 
 void glGetBufferParameteriv(GLenum target, GLenum pname, GLint* params) {

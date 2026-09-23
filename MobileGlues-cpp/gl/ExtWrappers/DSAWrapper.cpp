@@ -470,10 +470,8 @@ void glGetNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, vo
     LOG()
     LOG_D("[DSA] glGetNamedBufferSubData, buffer: %u, offset: %lld, size: %lld, data: %p", buffer, offset, size, data);
 
-    if (buffer == 0 || size <= 0 || offset < 0 || !data) {
-        LOG_W("[DSA] Invalid parameters for glGetNamedBufferSubData");
-        // return;
-    }
+    // DSA查询不能经临时Bind创建不存在的名称；零长度是合法读回，参数范围交给共享入口。
+    if (buffer == 0 || !has_buffer(buffer)) { mg_set_gl_error(GL_INVALID_OPERATION); return; }
     temporarilyBindBuffer(buffer);
     glGetBufferSubData(GL_ARRAY_BUFFER, offset, size, data);
     CHECK_GL_ERROR;

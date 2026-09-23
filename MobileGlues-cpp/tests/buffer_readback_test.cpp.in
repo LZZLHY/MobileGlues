@@ -1,0 +1,107 @@
+// 真实生产driver适配器、core/ARB/DSA入口被测试脚本插入本文件；只替换GLES与名称表边界。
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <vector>
+#include <limits>
+#include <cstdlib>
+#include "gl/buffer_readback_core.h"
+using GLuint=unsigned;using GLenum=unsigned;using GLint=int;using GLint64=long long;using GLsizei=int;
+using GLintptr=std::intptr_t;using GLsizeiptr=std::intptr_t;using GLintptrARB=GLintptr;using GLsizeiptrARB=GLsizeiptr;
+using GLboolean=unsigned char;
+constexpr GLenum GL_ARRAY_BUFFER=0x8892,GL_COPY_READ_BUFFER=0x8f36,GL_COPY_WRITE_BUFFER=0x8f37;
+constexpr GLenum GL_COPY_READ_BUFFER_BINDING=GL_COPY_READ_BUFFER,GL_COPY_WRITE_BUFFER_BINDING=GL_COPY_WRITE_BUFFER;
+constexpr GLenum GL_STREAM_READ=0x88e1,GL_MAP_READ_BIT=1,GL_MAP_PERSISTENT_BIT=0x40;
+constexpr GLenum GL_INVALID_ENUM=0x500,GL_INVALID_VALUE=0x501,GL_INVALID_OPERATION=0x502,GL_OUT_OF_MEMORY=0x505;
+constexpr GLboolean GL_TRUE=1;
+#define LOG() do{}while(false);
+#define LOG_D(...) do{}while(false)
+#define LOG_W(...) do{}while(false)
+#define CHECK_GL_ERROR do{}while(false)
+namespace mg::buffer_contract {struct MappingState {unsigned requested_access=0;bool active=false;};}
+std::vector<mg::buffer_contract::MappingState> g_buffer_mappings(8);
+struct NativeBuffer {std::vector<unsigned char> bytes;bool mapped=false;};
+std::map<GLuint,NativeBuffer> buffers;
+GLuint rawRead=111,rawWrite=222,arrayFrontend=7,nextName=1000;
+int maps=0,copies=0,unmaps=0,deletes=0,sourceUnmaps=0;
+std::size_t largestScratch=0;
+int failStage=0;GLenum driverError=0;std::vector<GLenum> pending;
+void check(bool okay,const char* label){if(!okay){std::cerr<<"FAIL "<<label<<'\n';std::exit(1);}}
+void mg_set_gl_error(GLenum error){if(error)pending.push_back(error);}
+void mg_begin_driver_operation(){if(driverError){mg_set_gl_error(driverError);driverError=0;}}
+bool mg_end_driver_operation(const char*){if(!driverError)return true;mg_set_gl_error(driverError);driverError=0;return false;}
+bool has_buffer(GLuint id){return id==7;}
+GLuint find_real_buffer(GLuint id){return id==7?107:0;}
+GLuint find_bound_buffer_by_target(GLenum target){return target==GL_ARRAY_BUFFER?arrayFrontend:0;}
+int binding_target_to_index(GLenum target){return target==GL_ARRAY_BUFFER?0:-1;}
+std::size_t get_buffer_data_size(GLuint id){return buffers[find_real_buffer(id)].bytes.size();}
+struct DriverApi {
+    std::function<void(GLenum,GLint*)> glGetIntegerv;
+    std::function<void(GLenum,GLuint)> glBindBuffer;
+    std::function<void*(GLenum,GLintptr,GLsizeiptr,unsigned)> glMapBufferRange;
+    std::function<GLboolean(GLenum)> glUnmapBuffer;
+    std::function<void(GLsizei,GLuint*)> glGenBuffers;
+    std::function<void(GLsizei,const GLuint*)> glDeleteBuffers;
+    std::function<void(GLenum,GLsizeiptr,const void*,GLenum)> glBufferData;
+    std::function<void(GLenum,GLenum,GLintptr,GLintptr,GLsizeiptr)> glCopyBufferSubData;
+} GLES;
+std::vector<GLuint> bindingStack;
+void temporarilyBindBuffer(GLuint id){bindingStack.push_back(arrayFrontend);arrayFrontend=id;}
+void restoreTemporaryBufferBinding(){arrayFrontend=bindingStack.back();bindingStack.pop_back();}
+
+// @PRODUCTION_CODE@
+
+/** 驱动记录真实复制及映射行为，禁止重映射原有persistent源；故障发生后仍检查状态恢复。 */
+void setup(std::size_t size,bool persistent=false) {
+    buffers.clear();buffers[107].bytes.resize(size);buffers[107].mapped=persistent;
+    for(std::size_t i=0;i<size;i++)buffers[107].bytes[i]=static_cast<unsigned char>((i*37+19)%251);
+    g_buffer_mappings[7]={persistent?GL_MAP_PERSISTENT_BIT:0,persistent};
+    rawRead=111;rawWrite=222;arrayFrontend=7;maps=copies=unmaps=deletes=sourceUnmaps=0;largestScratch=0;
+    driverError=0;pending.clear();failStage=0;
+    GLES.glGetIntegerv=[](GLenum key,GLint* out){*out=key==GL_COPY_READ_BUFFER_BINDING?rawRead:rawWrite;};
+    GLES.glBindBuffer=[](GLenum target,GLuint id){if(target==GL_COPY_READ_BUFFER)rawRead=id;else rawWrite=id;};
+    GLES.glGenBuffers=[](GLsizei,GLuint* out){*out=nextName++;buffers[*out]={};};
+    GLES.glDeleteBuffers=[](GLsizei,const GLuint* id){buffers.erase(*id);++deletes;};
+    GLES.glBufferData=[](GLenum,GLsizeiptr size,const void*,GLenum){if(failStage==1){driverError=GL_OUT_OF_MEMORY;return;}buffers[rawWrite].bytes.resize(size);largestScratch=std::max(largestScratch,static_cast<std::size_t>(size));};
+    GLES.glCopyBufferSubData=[](GLenum,GLenum,GLintptr src,GLintptr dst,GLsizeiptr size){++copies;if(failStage==2){driverError=GL_INVALID_OPERATION;return;}std::memcpy(buffers[rawWrite].bytes.data()+dst,buffers[rawRead].bytes.data()+src,size);};
+    GLES.glMapBufferRange=[](GLenum,GLintptr at,GLsizeiptr size,unsigned)->void*{++maps;if(failStage==3){driverError=GL_OUT_OF_MEMORY;return nullptr;}check(!buffers[rawRead].mapped,"never remap active source");check(at>=0&&static_cast<std::size_t>(at+size)<=buffers[rawRead].bytes.size(),"native map bounds");buffers[rawRead].mapped=true;return buffers[rawRead].bytes.data()+at;};
+    GLES.glUnmapBuffer=[](GLenum)->GLboolean{++unmaps;if(rawRead==107)++sourceUnmaps;buffers[rawRead].mapped=false;return failStage==4?0:GL_TRUE;};
+}
+void restored(bool persistent) {
+    check(rawRead==111&&rawWrite==222&&arrayFrontend==7,"restore native and frontend bindings");
+    check(buffers.size()==1&&buffers.count(107),"delete scratch only");
+    check(buffers[107].mapped==persistent,"source mapping state unchanged");
+}
+int main(){
+    for(bool persistent:{false,true}) {
+        setup(2*1024*1024+119,persistent);std::vector<unsigned char> output(2*1024*1024+3);
+        driverError=GL_INVALID_ENUM;
+        glGetBufferSubData(GL_ARRAY_BUFFER,17,output.size(),output.data());
+        check(std::equal(output.begin(),output.end(),buffers[107].bytes.begin()+17),"real range contents");
+        check(pending.size()==1&&pending[0]==GL_INVALID_ENUM,"retain pre-existing error");
+        check(largestScratch<=1024*1024,"bounded scratch");
+        check(maps==3&&unmaps==3,"chunked native reads");
+        if(persistent)check(copies==3&&sourceUnmaps==0,"persistent source copied without unmap");
+        restored(persistent);
+    }
+    for(int stage:{1,2,3,4}) {
+        setup(128,true);failStage=stage;unsigned char output[16]{};
+        glGetBufferSubData(GL_ARRAY_BUFFER,5,16,output);check(!pending.empty(),"driver failure retained");restored(true);
+    }
+    setup(64);unsigned char output[16]{};
+    glGetBufferSubData(GL_ARRAY_BUFFER,-1,4,output);check(pending.back()==GL_INVALID_VALUE,"negative offset");
+    glGetBufferSubData(GL_ARRAY_BUFFER,60,8,output);check(pending.back()==GL_INVALID_VALUE,"range overflow");
+    glGetBufferSubData(GL_ARRAY_BUFFER,1,std::numeric_limits<GLsizeiptr>::max(),output);check(pending.back()==GL_INVALID_VALUE,"integer overflow");
+    check(maps==0,"invalid range never reaches driver");
+    g_buffer_mappings[7]={0,true};glGetBufferSubData(GL_ARRAY_BUFFER,0,4,output);check(pending.back()==GL_INVALID_OPERATION,"ordinary mapped source rejected");
+    setup(64);glGetBufferSubData(GL_ARRAY_BUFFER,64,0,nullptr);check(pending.empty()&&maps==0,"zero byte read");
+    glGetBufferSubData(0,0,4,output);check(pending.back()==GL_INVALID_ENUM,"unknown target");
+    setup(64);GLES.glMapBufferRange={};glGetBufferSubData(GL_ARRAY_BUFFER,0,4,output);check(pending.back()==GL_INVALID_OPERATION,"missing native entry");restored(false);
+    setup(64);glGetBufferSubDataARB(GL_ARRAY_BUFFER,5,16,output);check(output[0]==buffers[107].bytes[5],"ARB routes real readback");
+    arrayFrontend=0;glGetNamedBufferSubData(7,9,16,output);check(output[0]==buffers[107].bytes[9]&&arrayFrontend==0,"DSA restores binding and reads named source");
+    glGetNamedBufferSubData(999,0,4,output);check(pending.back()==GL_INVALID_OPERATION&&arrayFrontend==0,"DSA cannot create an unknown name");
+    std::cout<<"PASS production MG core/ARB/DSA readback: bytes, chunk bounds, persistent mapping, failures, aliases and binding/error preservation\n";
+}
