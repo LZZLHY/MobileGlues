@@ -356,6 +356,54 @@ std::string getGLESName() {
 static std::string rendererString;
 static std::string vendorString;
 static std::string versionString;
+
+// 参数是caller已经确定的MG桌面身份。此函数只保留原版本展示格式，不做context
+// 授予/能力裁决，也不改变翻译器输出或其支持的GLSL版本；因此无需推进翻译缓存revision。
+std::string mg_format_desktop_version(const Version& version) {
+    std::string formatted = version.toString();
+    if (global_settings.hide_mg_env_level == HideMGEnvLevel::Disabled) {
+        if (version.toInt(2) == DEFAULT_GL_VERSION) {
+            formatted += " MobileGlues ";
+        } else {
+            Version defaultVersion = Version(DEFAULT_GL_VERSION);
+            formatted += " §4§l(" + defaultVersion.toString() + ") MobileGlues§r ";
+        }
+        formatted += std::to_string(MAJOR) + "." + std::to_string(MINOR) + "." + std::to_string(REVISION);
+#if PATCH != 0
+        formatted += "." + std::to_string(PATCH);
+#endif
+#if defined(VERSION_TYPE)
+#if VERSION_TYPE == VERSION_ALPHA
+        formatted += "·Alpha";
+#elif VERSION_TYPE == VERSION_BETA
+        formatted += "·Beta";
+#elif VERSION_TYPE == VERSION_DEVELOPMENT
+        formatted += "·Dev" + std::to_string(VERSION_DEV_NUMBER);
+#elif VERSION_TYPE == VERSION_RC
+        formatted += "·RC" + std::to_string(VERSION_RC_NUMBER);
+#endif
+#endif
+        formatted += VERSION_SUFFIX;
+    } else {
+        const char choices[] = "AIN";
+        formatted += " ";
+        formatted += choices[rand() % 3];
+        RandomStringOptions randStrOpts;
+        randStrOpts.includeDigits = false;
+        randStrOpts.customChars = " ";
+        formatted += GenerateRandomString(randStrOpts);
+        RandomStringOptions randStrOpts2;
+        randStrOpts2.includeDigits = false;
+        randStrOpts2.includeUppercase = false;
+        randStrOpts2.minLength = 1;
+        randStrOpts2.maxLength = 4;
+        formatted += std::to_string(MAJOR) + GenerateRandomString(randStrOpts2) + std::to_string(MINOR) +
+                     GenerateRandomString(randStrOpts2) + std::to_string(REVISION) +
+                     GenerateRandomString(randStrOpts2) + std::to_string(PATCH) + GenerateRandomString(randStrOpts2);
+    }
+    return formatted;
+}
+
 const GLubyte* glGetString(GLenum name) {
     LOG()
     LOG_D("glGetString, %s", glEnumToString(name))
@@ -382,53 +430,13 @@ const GLubyte* glGetString(GLenum name) {
         return (const GLubyte*)vendorString.c_str();
     }
     case GL_VERSION: {
+        // GL_VERSION与已有desktop整数/EGL授予记录一致。记录的字符串创建后不改写，
+        // 同线程切换context或读取另一个context都不能覆盖调用方尚在使用的c_str。
+        if (g_current_ctx && g_current_ctx->client_type == EGL_OPENGL_API)
+            return reinterpret_cast<const GLubyte*>(g_current_ctx->desktop_version_string.c_str());
         if (versionString.empty()) {
-            versionString = GLVersion.toString();
-            if (global_settings.hide_mg_env_level == HideMGEnvLevel::Disabled) {
-                if (GLVersion.toInt(2) == DEFAULT_GL_VERSION) {
-                    versionString += " MobileGlues ";
-                } else {
-                    Version defaultVersion = Version(DEFAULT_GL_VERSION);
-                    versionString += " §4§l(" + defaultVersion.toString() + ") MobileGlues§r ";
-                }
-
-                versionString += std::to_string(MAJOR) + "." + std::to_string(MINOR) + "." + std::to_string(REVISION);
-#if PATCH != 0
-                versionString += "." + std::to_string(PATCH);
-#endif
-#if defined(VERSION_TYPE)
-#if VERSION_TYPE == VERSION_ALPHA
-                versionString += "·Alpha";
-#elif VERSION_TYPE == VERSION_BETA
-                versionString += "·Beta";
-#elif VERSION_TYPE == VERSION_DEVELOPMENT
-                versionString += "·Dev" + std::to_string(VERSION_DEV_NUMBER);
-#elif VERSION_TYPE == VERSION_RC
-                versionString += "·RC" + std::to_string(VERSION_RC_NUMBER);
-#endif
-#endif
-                versionString += VERSION_SUFFIX;
-            } else {
-                const char choices[] = "AIN";
-                versionString += " ";
-                versionString += choices[rand() % 3];
-
-                RandomStringOptions randStrOpts;
-                randStrOpts.includeDigits = false;
-                randStrOpts.customChars = " ";
-                versionString += GenerateRandomString(randStrOpts);
-
-                RandomStringOptions randStrOpts2;
-                randStrOpts2.includeDigits = false;
-                randStrOpts2.includeUppercase = false;
-                randStrOpts2.minLength = 1;
-                randStrOpts2.maxLength = 4;
-
-                versionString += std::to_string(MAJOR) + GenerateRandomString(randStrOpts2) + std::to_string(MINOR) +
-                                 GenerateRandomString(randStrOpts2) + std::to_string(REVISION) +
-                                 GenerateRandomString(randStrOpts2) + std::to_string(PATCH) +
-                                 GenerateRandomString(randStrOpts2);
-            }
+            // 无current及既有GLES transport路径保留配置版本回退；这里不改变产品承诺。
+            versionString = mg_format_desktop_version(GLVersion);
         }
         return (const GLubyte*)versionString.c_str();
     }
@@ -533,6 +541,12 @@ const GLubyte* glGetString(GLenum name) {
 
 const GLubyte* glGetStringi(GLenum name, GLuint index) {
     LOG()
+    // GL_VERSION不是标准glGetStringi的合法name；这里仅维护MG已经提供的兼容接口。
+    // desktop记录拥有不可变token数组，返回指针在该记录仍存活期间不受context切换影响。
+    if (name == GL_VERSION && g_current_ctx && g_current_ctx->client_type == EGL_OPENGL_API) {
+        const auto& tokens = g_current_ctx->desktop_version_tokens;
+        return index < tokens.size() ? reinterpret_cast<const GLubyte*>(tokens[index].c_str()) : nullptr;
+    }
     if (name == GL_EXTENSIONS + GL_BACKEND_GETTER_MG && global_settings.hide_mg_env_level == HideMGEnvLevel::Disabled) {
         return GLES.glGetStringi(name - GL_BACKEND_GETTER_MG, index);
     }
@@ -559,7 +573,9 @@ const GLubyte* glGetStringi(GLenum name, GLuint index) {
                 delimiter = ", ";
                 break;
             case GL_VERSION:
-                str = glGetString(GL_VERSION);
+                // 这一全局兼容cache只服务未跟踪/ES回退，不能被当前desktop记录的文本污染。
+                if (versionString.empty()) versionString = mg_format_desktop_version(GLVersion);
+                str = reinterpret_cast<const GLubyte*>(versionString.c_str());
                 delimiter = " .";
                 break;
             case GL_SHADING_LANGUAGE_VERSION:

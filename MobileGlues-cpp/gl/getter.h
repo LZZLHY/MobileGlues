@@ -39,4 +39,8 @@ extern "C"
 
 extern Version GLVersion;
 
+// 格式化MG桌面版本身份，保留既有产品后缀/隐藏设置；不选择或改变实际授予版本。
+// context创建前调用以固定该记录的字符串，fallback仍使用原进程配置身份。
+std::string mg_format_desktop_version(const Version& version);
+
 #endif // MOBILEGLUES_GETTER_H

@@ -56,3 +56,10 @@ mg_test(depth_range_test depth_range_test.cpp "${MG}/gl/gl_native.cpp"
 find_package(Threads REQUIRED)
 target_link_libraries(depth_range_test PRIVATE Threads::Threads)
 add_test(NAME depth_range_legacy_negative COMMAND depth_range_test --verify-legacy-noop)
+
+# desktop字符串和授予元数据使用真实context生命周期；GPU仅在宿主边界替换。
+# 两种首次读取顺序都验证，避免进程缓存掩盖低版本context身份。
+mg_test(version_identity_test version_identity_test.cpp "${MG}/gl/getter.cpp"
+    "${MG}/egl/context.cpp" "${MG}/gl/enable.cpp")
+target_link_libraries(version_identity_test PRIVATE Threads::Threads)
+add_test(NAME version_identity_high_first COMMAND version_identity_test --high-first)

@@ -9,6 +9,7 @@
 #include "../gl/log.h"
 #include "../gl/mg.h"
 #include "../gl/shader.h"
+#include "../gl/getter.h"
 #include "trace.h"
 #include <mutex>
 #include <ska/flat_hash_map.hpp>
@@ -123,6 +124,21 @@ MGContext* mg_context_create(EGLDisplay dpy, EGLContext handle, EGLContext share
     ctx->client_type = client_type;
     ctx->granted_major = major;
     ctx->granted_minor = minor;
+    // 与整数查询/EGL属性消费同一已授予身份，不将请求值升级到配置上限，也不降为GLES版本。
+    // 在记录发布到map/current线程之前建立不可变文本，避免首次glGetString的缓存顺序决定结果。
+    if (client_type == EGL_OPENGL_API) {
+        ctx->desktop_version_string = mg_format_desktop_version(Version(major, minor, 0));
+        // 非标准index兼容路径也从这同一文本生成，不能首次读取其他context时全局缓存。
+        // 保留既有find_first_of(" .")行为，包括相邻分隔符对应的空token。
+        std::size_t start = 0;
+        std::size_t end = ctx->desktop_version_string.find_first_of(" .");
+        while (end != std::string::npos) {
+            ctx->desktop_version_tokens.push_back(ctx->desktop_version_string.substr(start, end - start));
+            start = end + 1;
+            end = ctx->desktop_version_string.find_first_of(" .", start);
+        }
+        ctx->desktop_version_tokens.push_back(ctx->desktop_version_string.substr(start));
+    }
     ctx->profile_mask = profile_mask;
     ctx->context_flags = context_flags;
     ctx->draw = EGL_NO_SURFACE;

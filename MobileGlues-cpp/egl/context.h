@@ -12,6 +12,8 @@
 #include "../gl/enable.h"
 #include "../gl/mg.h"
 #include <memory>
+#include <string>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Virtual context records
@@ -52,6 +54,14 @@ struct MGContext {
     EGLenum client_type;   // EGL_OPENGL_API or EGL_OPENGL_ES_API, fixed at creation
     EGLint granted_major;  // what the application was told it got
     EGLint granted_minor;
+    // 桌面context的GL_VERSION由已经授予的同一元数据生成，创建时一次建立后不再改写。
+    // 切到其他context不能复用进程配置版本；切回时c_str地址保持稳定。记录因pending
+    // destroy继续current而存活期间，这个字符串也继续存活；最终退休后不再使用其指针。
+    // GLES transport记录留空，保持原有MG公开版本兼容路径，不在此推定新的frontend契约。
+    std::string desktop_version_string;
+    // 既有glGetStringi(GL_VERSION, index)是MG非标准token兼容接口。它与完整字符串
+    // 在创建时同时冻结，保留原" ."分隔及空token规则；vector之后不扩容、不改写。
+    std::vector<std::string> desktop_version_tokens;
     EGLint profile_mask;
     EGLint context_flags;  // reported back through glGetIntegerv(GL_CONTEXT_FLAGS)
     std::shared_ptr<MGShareGroup> share_group;
