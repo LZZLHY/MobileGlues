@@ -52,6 +52,15 @@ NATIVE_FUNCTION_HEAD(void, glDeleteRenderbuffers, GLsizei n, const GLuint *rende
 NATIVE_FUNCTION_HEAD(void, glDepthFunc, GLenum func) NATIVE_FUNCTION_END_NO_RETURN(void, glDepthFunc, func)
 NATIVE_FUNCTION_HEAD(void, glDepthMask, GLboolean flag) NATIVE_FUNCTION_END_NO_RETURN(void, glDepthMask, flag)
 NATIVE_FUNCTION_HEAD(void, glDepthRangef, GLfloat n, GLfloat f) NATIVE_FUNCTION_END_NO_RETURN(void, glDepthRangef, n,f)
+// 桌面 double 入口与既有 float 入口共享同一驱动状态，避免创建进程全局的范围缓存。
+// 深度范围属于当前 GLES context；getter 继续查询驱动，因此两入口交替及 context 切换
+// 都使用实际绘制状态。按 GL 规范分别 clamp 两端，不排序，保留合法的反向深度范围。
+// 必须先在 double 域内 clamp 再缩窄，不能把超大有限 double 直接转换为 GLfloat。
+extern "C" GLAPI GLAPIENTRY void glDepthRange(GLdouble n, GLdouble f) {
+    const GLdouble clamped_n = n < 0.0 ? 0.0 : (n > 1.0 ? 1.0 : n);
+    const GLdouble clamped_f = f < 0.0 ? 0.0 : (f > 1.0 ? 1.0 : f);
+    glDepthRangef(static_cast<GLfloat>(clamped_n), static_cast<GLfloat>(clamped_f));
+}
 // Implemented with object metadata in shader.cpp/program.cpp.
 // NATIVE_FUNCTION_HEAD(void, glDisable, GLenum cap) NATIVE_FUNCTION_END_NO_RETURN(void, glDisable, cap)   // moved to gl/enable.cpp (virtual enable state table)
 NATIVE_FUNCTION_HEAD(void, glDisableVertexAttribArray, GLuint index) NATIVE_FUNCTION_END_NO_RETURN(void, glDisableVertexAttribArray, index)

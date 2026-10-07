@@ -48,3 +48,11 @@ mg_test(render_resource_test render_resource_test.cpp "${MG}/gl/buffer.cpp" "${M
 mg_test(render_fsr_test render_fsr_test.cpp "${MG}/gl/FSR1/FSR1.cpp" "${MG}/gl/gl.cpp"
     "${MG}/gl/glsl/glsl_for_es.cpp" "${MG}/gl/glsl/cache.cpp")
 target_link_libraries(render_fsr_test PRIVATE glslang SPIRV spirv-cross-c spirv-cross-glsl spirv-cross-core)
+
+# 深度范围使用生产 setter、stub 集及查询 TU；GPU 仅在测试进程的驱动边界替换。
+# 同一可执行文件的旧空行为负控制进入 CTest，防止判据退化为只检查默认范围。
+mg_test(depth_range_test depth_range_test.cpp "${MG}/gl/gl_native.cpp"
+    "${MG}/gl/gl_stub.cpp" "${MG}/gl/enable.cpp")
+find_package(Threads REQUIRED)
+target_link_libraries(depth_range_test PRIVATE Threads::Threads)
+add_test(NAME depth_range_legacy_negative COMMAND depth_range_test --verify-legacy-noop)

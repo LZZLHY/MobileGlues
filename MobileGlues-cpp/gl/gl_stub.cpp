@@ -49,7 +49,8 @@ STUB_FUNCTION_HEAD(GLint, glRenderMode, GLenum mode) STUB_FUNCTION_END(GLint, gl
 * Depth Buffer
 */
 
-STUB_FUNCTION_HEAD(void, glDepthRange, GLclampd near_val, GLclampd far_val ) STUB_FUNCTION_END_NO_RETURN(void, glDepthRange, near_val, far_val)
+// glDepthRange 的唯一生产定义移到 gl_native.cpp，复用真实 glDepthRangef 驱动路径。
+// 此处不能再保留空定义，否则会产生重复符号或把修复入口替换为空行为。
 /*
 * Accumulation Buffer
 */
