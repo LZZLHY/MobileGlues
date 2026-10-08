@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cstring>
 #include <vector>
+#include <array>
+#include <cstdio>
 #define DEBUG 0
 
 static void collect_deleted_programs(mg_shader_group& group) {
@@ -165,8 +167,147 @@ static void restore_source_bindings(GLuint program, const mg_glsl_metadata& meta
     if (borrowed) GLES.glUseProgram(static_cast<GLuint>(previous));
 }
 
+namespace {
+// 以下helper只供本TU链接期恢复使用，不导出新API、不进入draw或glUseProgram热路径。
+// setter按解析类型选择，每个展平叶字段count=1；缺入口在真link前拒绝，避免静默剥初值。
+using Initializer = mg_glsl_metadata::initializer;
+using FloatSetter = void (*)(GLint, GLsizei, const GLfloat*);
+using IntSetter = void (*)(GLint, GLsizei, const GLint*);
+using UintSetter = void (*)(GLint, GLsizei, const GLuint*);
+using MatrixSetter = void (*)(GLint, GLsizei, GLboolean, const GLfloat*);
+using ProgramFloatSetter = void (*)(GLuint, GLint, GLsizei, const GLfloat*);
+using ProgramIntSetter = void (*)(GLuint, GLint, GLsizei, const GLint*);
+using ProgramUintSetter = void (*)(GLuint, GLint, GLsizei, const GLuint*);
+using ProgramMatrixSetter = void (*)(GLuint, GLint, GLsizei, GLboolean, const GLfloat*);
+FloatSetter float_setter(unsigned rows) {
+    const std::array<FloatSetter, 4> calls{GLES.glUniform1fv, GLES.glUniform2fv, GLES.glUniform3fv, GLES.glUniform4fv};
+    return rows >= 1 && rows <= 4 ? calls[rows - 1] : nullptr;
+}
+IntSetter int_setter(unsigned rows) {
+    const std::array<IntSetter, 4> calls{GLES.glUniform1iv, GLES.glUniform2iv, GLES.glUniform3iv, GLES.glUniform4iv};
+    return rows >= 1 && rows <= 4 ? calls[rows - 1] : nullptr;
+}
+UintSetter uint_setter(unsigned rows) {
+    const std::array<UintSetter, 4> calls{GLES.glUniform1uiv, GLES.glUniform2uiv, GLES.glUniform3uiv, GLES.glUniform4uiv};
+    return rows >= 1 && rows <= 4 ? calls[rows - 1] : nullptr;
+}
+MatrixSetter matrix_setter(unsigned columns, unsigned rows) {
+    if (columns == 2 && rows == 2) return GLES.glUniformMatrix2fv;
+    if (columns == 3 && rows == 3) return GLES.glUniformMatrix3fv;
+    if (columns == 4 && rows == 4) return GLES.glUniformMatrix4fv;
+    if (columns == 2 && rows == 3) return GLES.glUniformMatrix2x3fv;
+    if (columns == 2 && rows == 4) return GLES.glUniformMatrix2x4fv;
+    if (columns == 3 && rows == 2) return GLES.glUniformMatrix3x2fv;
+    if (columns == 3 && rows == 4) return GLES.glUniformMatrix3x4fv;
+    if (columns == 4 && rows == 2) return GLES.glUniformMatrix4x2fv;
+    if (columns == 4 && rows == 3) return GLES.glUniformMatrix4x3fv;
+    return nullptr;
+}
+ProgramFloatSetter program_float_setter(unsigned rows) {
+    const std::array<ProgramFloatSetter, 4> calls{GLES.glProgramUniform1fv, GLES.glProgramUniform2fv, GLES.glProgramUniform3fv, GLES.glProgramUniform4fv};
+    return rows >= 1 && rows <= 4 ? calls[rows - 1] : nullptr;
+}
+ProgramIntSetter program_int_setter(unsigned rows) {
+    const std::array<ProgramIntSetter, 4> calls{GLES.glProgramUniform1iv, GLES.glProgramUniform2iv, GLES.glProgramUniform3iv, GLES.glProgramUniform4iv};
+    return rows >= 1 && rows <= 4 ? calls[rows - 1] : nullptr;
+}
+ProgramUintSetter program_uint_setter(unsigned rows) {
+    const std::array<ProgramUintSetter, 4> calls{GLES.glProgramUniform1uiv, GLES.glProgramUniform2uiv, GLES.glProgramUniform3uiv, GLES.glProgramUniform4uiv};
+    return rows >= 1 && rows <= 4 ? calls[rows - 1] : nullptr;
+}
+ProgramMatrixSetter program_matrix_setter(unsigned columns, unsigned rows) {
+    if (columns == 2 && rows == 2) return GLES.glProgramUniformMatrix2fv;
+    if (columns == 3 && rows == 3) return GLES.glProgramUniformMatrix3fv;
+    if (columns == 4 && rows == 4) return GLES.glProgramUniformMatrix4fv;
+    if (columns == 2 && rows == 3) return GLES.glProgramUniformMatrix2x3fv;
+    if (columns == 2 && rows == 4) return GLES.glProgramUniformMatrix2x4fv;
+    if (columns == 3 && rows == 2) return GLES.glProgramUniformMatrix3x2fv;
+    if (columns == 3 && rows == 4) return GLES.glProgramUniformMatrix3x4fv;
+    if (columns == 4 && rows == 2) return GLES.glProgramUniformMatrix4x2fv;
+    if (columns == 4 && rows == 3) return GLES.glProgramUniformMatrix4x3fv;
+    return nullptr;
+}
+int current_gles_version() {
+    // 只读当前driver的真实ES身份，绝不取MG desktop配置文本或bootstrap最大版本。
+    const auto* text = GLES.glGetString(GL_VERSION);
+    int major = 0, minor = 0;
+    return text && std::sscanf(reinterpret_cast<const char*>(text), "OpenGL ES %d.%d", &major, &minor) == 2
+        ? major * 100 + minor * 10 : 0;
+}
+bool program_initializer_available(const Initializer& value, int driver_version) {
+    // ProgramUniform是GLES3.1 core；不能仅因GetProcAddress返回非空就在低API context调用它。
+    if (driver_version < 310) return false;
+    if (value.columns > 1) return value.kind == 'f' && program_matrix_setter(value.columns, value.rows);
+    return value.kind == 'f' ? program_float_setter(value.rows) != nullptr : value.kind == 'i' ? program_int_setter(value.rows) != nullptr :
+           value.kind == 'u' && program_uint_setter(value.rows) != nullptr;
+}
+bool initializer_available(const Initializer& value) {
+    if (value.columns > 1) return value.kind == 'f' && matrix_setter(value.columns, value.rows);
+    return value.kind == 'f' ? float_setter(value.rows) != nullptr : value.kind == 'i' ? int_setter(value.rows) != nullptr :
+           value.kind == 'u' && uint_setter(value.rows) != nullptr;
+}
+bool merge_initializers(mg_glsl_metadata& linked, const mg_glsl_metadata& stage, std::string& failure) {
+    for (const auto& value : stage.initializers) {
+        const auto old = std::find_if(linked.initializers.begin(), linked.initializers.end(),
+            [&](const Initializer& existing) { return existing.name == value.name; });
+        // ES driver看不到已剥掉的desktop初值。显式初值冲突必须在真link前拒绝，保留旧executable。
+        if (old != linked.initializers.end()) {
+            if (*old != value) { failure = "Conflicting uniform initializers: " + value.name; return false; }
+        } else linked.initializers.push_back(value);
+        if (!initializer_available(value)) { failure = "Missing GLES uniform initializer setter: " + value.name; return false; }
+    }
+    return true;
+}
+void restore_uniform_initializers(GLuint program, const mg_glsl_metadata& metadata) {
+    if (metadata.initializers.empty()) return;
+    // 只在成功link后执行一次。raw driver临时绑定不修改MG current-program对象域；旧GL错误入原队列。
+    mg_begin_driver_operation();
+    static_assert(sizeof(GLfloat) == sizeof(std::uint32_t) && sizeof(GLint) == sizeof(std::uint32_t));
+    GLint previous = 0;
+    GLES.glGetIntegerv(GL_CURRENT_PROGRAM, &previous);
+    const int driver_version = current_gles_version();
+    bool borrowed = false, paused_feedback = false;
+    for (const auto& value : metadata.initializers) {
+        const GLint location = GLES.glGetUniformLocation(program, value.name.c_str());
+        if (location < 0) continue; // 优化掉的叶字段不产生新错误，也不借用当前program。
+        const bool direct = program_initializer_available(value, driver_version);
+        if (!direct && static_cast<GLuint>(previous) != program && !borrowed) {
+            // GLES3.0回退不能在活动TF期间UseProgram。只暂停本次原本未暂停的捕获，恢复owner后再恢复。
+            if (driver_version >= 300) {
+                GLint active = 0, paused = 0;
+                GLES.glGetIntegerv(GL_TRANSFORM_FEEDBACK_ACTIVE, &active);
+                GLES.glGetIntegerv(GL_TRANSFORM_FEEDBACK_PAUSED, &paused);
+                if (active && !paused) {
+                    GLES.glPauseTransformFeedback(); paused_feedback = true;
+                }
+            }
+            GLES.glUseProgram(program); borrowed = true;
+        }
+        if (value.kind == 'f') {
+            std::array<GLfloat, 16> numbers{};
+            for (size_t i = 0; i < value.bits.size(); ++i) std::memcpy(&numbers[i], &value.bits[i], sizeof(GLfloat));
+            if (direct && value.columns > 1) program_matrix_setter(value.columns, value.rows)(program, location, 1, GL_FALSE, numbers.data());
+            else if (direct) program_float_setter(value.rows)(program, location, 1, numbers.data());
+            else if (value.columns > 1) matrix_setter(value.columns, value.rows)(location, 1, GL_FALSE, numbers.data());
+            else float_setter(value.rows)(location, 1, numbers.data());
+        } else if (value.kind == 'i') {
+            std::array<GLint, 4> numbers{};
+            for (size_t i = 0; i < value.bits.size(); ++i) std::memcpy(&numbers[i], &value.bits[i], sizeof(GLint));
+            if (direct) program_int_setter(value.rows)(program, location, 1, numbers.data());
+            else int_setter(value.rows)(location, 1, numbers.data());
+        } else if (direct) program_uint_setter(value.rows)(program, location, 1, value.bits.data());
+        else uint_setter(value.rows)(location, 1, value.bits.data());
+    }
+    if (borrowed) GLES.glUseProgram(static_cast<GLuint>(previous));
+    if (paused_feedback) GLES.glResumeTransformFeedback();
+    mg_end_driver_operation("uniform initializer restoration");
+}
+} // namespace
+
 void glLinkProgram(GLuint program) {
     LOG()
+    // 先把旧driver错误归入已有MG队列，后续不得拿旧错判定本次link失败或成功。
+    mg_begin_driver_operation();
     if (!GLES.glIsProgram(program)) {
         mg_set_gl_error(GL_INVALID_VALUE);
         return;
@@ -174,6 +315,19 @@ void glLinkProgram(GLuint program) {
     auto& group = mg_shader_objects();
     std::lock_guard<std::recursive_mutex> lock(group.mutex);
     auto& record = group.programs[program];
+    const std::string previous_failure = record.failure;
+    if (current_gles_version() >= 300) {
+        GLint current = 0, active = 0;
+        GLES.glGetIntegerv(GL_CURRENT_PROGRAM, &current);
+        GLES.glGetIntegerv(GL_TRANSFORM_FEEDBACK_ACTIVE, &active);
+        if (active && static_cast<GLuint>(current) == program) {
+            // 原生在TF活动时（包括paused）拒绝当前program的link，却保持旧LINK_STATUS=true。
+            // 在任何转译或attachment替换之前交driver执行原拒绝；旧executable/反射/初值不动。
+            GLES.glLinkProgram(program);
+            mg_end_driver_operation("glLinkProgram active transform feedback");
+            return;
+        }
+    }
     record.failure.clear();
     mg_glsl_metadata linked;
     std::vector<std::pair<GLuint, GLuint>> replacements;
@@ -216,6 +370,7 @@ void glLinkProgram(GLuint program) {
         linked.bindings.insert(linked.bindings.end(), metadata.bindings.begin(), metadata.bindings.end());
         linked.buffer_samplers.insert(linked.buffer_samplers.end(), metadata.buffer_samplers.begin(),
                                       metadata.buffer_samplers.end());
+        if (!merge_initializers(linked, metadata, record.failure)) break;
     }
     GLuint defaultFS = 0;
     if (vertex && !fragment) {
@@ -225,8 +380,10 @@ void glLinkProgram(GLuint program) {
         if (defaultFS) GLES.glAttachShader(program, defaultFS);
     }
     GLint status = 0;
+    bool driver_rejected = false;
     if (record.failure.empty()) {
         GLES.glLinkProgram(program);
+        driver_rejected = !mg_end_driver_operation("glLinkProgram");
         GLES.glGetProgramiv(program, GL_LINK_STATUS, &status);
     }
     for (const auto& replacement : replacements) {
@@ -240,12 +397,18 @@ void glLinkProgram(GLuint program) {
         GLES.glDetachShader(program, defaultFS);
         GLES.glDeleteShader(defaultFS);
     }
+    if (driver_rejected) {
+        // 有GL错误的操作可能没有产生新的link结果；driver的旧TRUE不能触发初值重置或推进代次。
+        record.failure = previous_failure;
+        return;
+    }
     if (status && record.failure.empty()) {
         // Failed relinks leave the old executable installed while current.
         // Keep its reflection until a successful replacement is available.
         ++record.link_generation;
         record.metadata = std::move(linked);
         restore_source_bindings(program, record.metadata);
+        restore_uniform_initializers(program, record.metadata);
     } else {
         if (record.failure.empty()) {
             char log[4096]{};

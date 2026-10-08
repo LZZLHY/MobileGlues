@@ -12,6 +12,7 @@
 #include <thread>
 #include <fstream>
 #include <set>
+#include <algorithm>
 
 gles_func_t g_gles_func{};
 gles_caps_t g_gles_caps{};
@@ -58,8 +59,15 @@ namespace {
     GLuint nextName = 1, current = 0;
     int submissions = 0, lastCount = 0, useCalls = 0, queries = 0;
     GLenum driverError = 0, frontendError = 0;
+    std::vector<GLenum> recordedErrors;
     bool rejectUse = false, rejectLink = false;
+    bool feedbackActive = false, feedbackPaused = false;
+    int pauses = 0, resumes = 0;
+    int driverContextVersion = 320;
     std::map<int, int> uniforms;
+    std::map<int, std::string> initializerNames;
+    std::map<std::string, int> initializerLocations;
+    std::map<std::pair<GLuint, std::string>, std::vector<double>> initializerValues;
     GLuint createShader(GLenum type) {
         GLuint id = nextName++;
         shaders.emplace(id, Shader{type, {}});
@@ -124,8 +132,13 @@ namespace {
     }
     void link(GLuint id) {
         auto& p = programs[id];
+        if (feedbackActive && id == current) { driverError = GL_INVALID_OPERATION; return; }
         if (rejectLink) { p.linked = false; return; }
         ++p.link;
+        // 真实成功link会把普通uniform重新初始化；拒绝link不碰旧executable的值。
+        for (auto it = initializerValues.begin(); it != initializerValues.end();) {
+            if (it->first.first == id) it = initializerValues.erase(it); else ++it;
+        }
         p.linked = true;
         p.linkedSources.clear();
         for (GLuint s : p.attached) {
@@ -141,7 +154,7 @@ namespace {
     }
     void use(GLuint id) {
         ++useCalls;
-        if (rejectUse || (id && !programs[id].linked)) {
+        if (rejectUse || (feedbackActive && !feedbackPaused && id != current) || (id && !programs[id].linked)) {
             driverError = GL_INVALID_OPERATION;
             return;
         }
@@ -150,15 +163,28 @@ namespace {
         if (old != id && programs.count(old) && programs[old].deleted) programs.erase(old);
     }
     void getInt(GLenum p, GLint* v) {
-        *v = p == GL_MAX_DRAW_BUFFERS ? 8 : p == GL_CURRENT_PROGRAM ? current : 0;
+        *v = p == GL_MAX_DRAW_BUFFERS ? 8 : p == GL_CURRENT_PROGRAM ? current :
+             p == GL_TRANSFORM_FEEDBACK_ACTIVE ? feedbackActive : p == GL_TRANSFORM_FEEDBACK_PAUSED ? feedbackPaused : 0;
     }
     GLenum getError() {
         auto e = driverError;
         driverError = 0;
         return e;
     }
+    const GLubyte* driverString(GLenum name) {
+        assert(name == GL_VERSION);
+        return reinterpret_cast<const GLubyte*>(driverContextVersion == 300 ? "OpenGL ES 3.0" : "OpenGL ES 3.2");
+    }
     GLint location(GLuint p, const GLchar* name) {
         ++queries;
+        if (!strcmp(name, "initial_inactive")) return -1;
+        if (!std::strncmp(name, "initial_", 8)) {
+            auto [entry, inserted] = initializerLocations.emplace(name, 1000 + initializerLocations.size() * 100);
+            (void)inserted;
+            const int result = entry->second + programs[p].link;
+            initializerNames[result] = name;
+            return result;
+        }
         int base = !strcmp(name, "atlas")               ? 3
                    : !strcmp(name, "bufferData")        ? 4
                    : !strcmp(name, "u_BufferTexWidth")  ? 1
@@ -172,10 +198,35 @@ namespace {
     void uniforms1(GLint loc, GLsizei n, const GLint* values) {
         for (int i = 0; i < n; ++i)
             uniforms[loc + i] = values[i];
+        if (initializerNames.count(loc)) initializerValues[{current, initializerNames[loc]}] = {double(values[0])};
     }
-    void programUniform(GLuint, GLint loc, GLsizei n, const GLint* values) {
-        uniforms1(loc, n, values);
+    template<class T> void initializerSetter(GLint loc, GLsizei n, const T* values, unsigned components) {
+        assert(n == 1 && initializerNames.count(loc));
+        auto& result = initializerValues[{current, initializerNames[loc]}];
+        result.assign(values, values + components);
     }
+    void floats1(GLint l, GLsizei n, const GLfloat* v) { initializerSetter(l,n,v,1); }
+    void floats2(GLint l, GLsizei n, const GLfloat* v) { initializerSetter(l,n,v,2); }
+    void floats3(GLint l, GLsizei n, const GLfloat* v) { initializerSetter(l,n,v,3); }
+    void floats4(GLint l, GLsizei n, const GLfloat* v) { initializerSetter(l,n,v,4); }
+    void ints2(GLint l, GLsizei n, const GLint* v) { initializerSetter(l,n,v,2); }
+    void ints3(GLint l, GLsizei n, const GLint* v) { initializerSetter(l,n,v,3); }
+    void ints4(GLint l, GLsizei n, const GLint* v) { initializerSetter(l,n,v,4); }
+    void uints1(GLint l, GLsizei n, const GLuint* v) { initializerSetter(l,n,v,1); }
+    void uints2(GLint l, GLsizei n, const GLuint* v) { initializerSetter(l,n,v,2); }
+    void uints3(GLint l, GLsizei n, const GLuint* v) { initializerSetter(l,n,v,3); }
+    void uints4(GLint l, GLsizei n, const GLuint* v) { initializerSetter(l,n,v,4); }
+    void matrix2(GLint l, GLsizei n, GLboolean transpose, const GLfloat* v) { assert(!transpose); initializerSetter(l,n,v,4); }
+    void programUniform(GLuint program, GLint loc, GLsizei n, const GLint* values) {
+        for (int i = 0; i < n; ++i) uniforms[loc + i] = values[i];
+        if (initializerNames.count(loc)) initializerValues[{program, initializerNames[loc]}] = {double(values[0])};
+    }
+    void programFloats4(GLuint program, GLint loc, GLsizei n, const GLfloat* values) {
+        assert(n == 1 && initializerNames.count(loc));
+        initializerValues[{program, initializerNames[loc]}].assign(values, values + 4);
+    }
+    void pauseFeedback() { assert(feedbackActive && !feedbackPaused); feedbackPaused = true; ++pauses; }
+    void resumeFeedback() { assert(feedbackActive && feedbackPaused); feedbackPaused = false; ++resumes; }
     GLuint blockIndex(GLuint, const char*) {
         return GL_INVALID_INDEX;
     }
@@ -206,10 +257,17 @@ namespace {
         GLES.glUseProgram = use;
         GLES.glGetIntegerv = getInt;
         GLES.glGetError = getError;
+        GLES.glGetString = driverString;
         GLES.glGetUniformLocation = location;
         GLES.glUniform1i = uniform;
         GLES.glUniform1iv = uniforms1;
+        GLES.glUniform1fv = floats1; GLES.glUniform2fv = floats2; GLES.glUniform3fv = floats3; GLES.glUniform4fv = floats4;
+        GLES.glUniform2iv = ints2; GLES.glUniform3iv = ints3; GLES.glUniform4iv = ints4;
+        GLES.glUniform1uiv = uints1; GLES.glUniform2uiv = uints2; GLES.glUniform3uiv = uints3; GLES.glUniform4uiv = uints4;
+        GLES.glUniformMatrix2fv = matrix2;
         GLES.glProgramUniform1iv = programUniform;
+        GLES.glProgramUniform4fv = programFloats4;
+        GLES.glPauseTransformFeedback = pauseFeedback; GLES.glResumeTransformFeedback = resumeFeedback;
         GLES.glGetUniformBlockIndex = blockIndex;
         GLES.glUniformBlockBinding = blockBinding;
         GLES.glGetActiveUniform = activeUniform;
@@ -227,6 +285,7 @@ namespace {
 } // namespace
 void mg_set_gl_error(GLenum e) {
     if (!frontendError) frontendError = e;
+    if (std::find(recordedErrors.begin(), recordedErrors.end(), e) == recordedErrors.end()) recordedErrors.push_back(e);
 }
 void mg_begin_driver_operation() {
     GLenum e = getError();
@@ -379,6 +438,110 @@ int main() {
     setupBufferTextureUniforms(p);
     assert(queries == q);
     rejectLink = false;
+    // 固定声明的初值走真实parse/translate/cache/link TU；driver边界只记录typed setter的实际值。
+    const char* initializedFS = R"(#version 430
+struct Values { vec2 pair; int count; };
+uniform vec4 initial_tint=vec4(1,0,0,1);
+uniform mat2 initial_matrix=mat2(1,2,3,4);
+uniform uint initial_unsigned[2]=uint[2](0xffffffffu,17u);
+uniform bvec2 initial_boolean=bvec2(true,false);
+uniform Values initial_struct=Values(vec2(0.25,0.5),-7);
+uniform vec2 initial_inactive=vec2(9);
+out vec4 color;
+void main(){color=initial_tint;}
+)";
+    const GLuint initializedShader = makeShader(GL_FRAGMENT_SHADER, initializedFS);
+    const GLuint initializedProgram = glCreateProgram();
+    glAttachShader(initializedProgram, v); glAttachShader(initializedProgram, initializedShader);
+    glLinkProgram(p);
+    glUseProgram(p);
+    const GLuint priorProgram = current;
+    frontendError = GL_INVALID_VALUE;
+    glLinkProgram(initializedProgram);
+    glGetProgramiv(initializedProgram, GL_LINK_STATUS, &ok);
+    assert(ok && current == priorProgram && gl_state->current_program == priorProgram && frontendError == GL_INVALID_VALUE);
+    const auto actual = [&](const char* name) -> const std::vector<double>& { return initializerValues[{initializedProgram,name}]; };
+    assert(actual("initial_tint") == (std::vector<double>{1,0,0,1}));
+    assert(actual("initial_matrix") == (std::vector<double>{1,2,3,4}));
+    assert(actual("initial_unsigned[0]") == (std::vector<double>{4294967295.0}));
+    assert(actual("initial_unsigned[1]") == (std::vector<double>{17}));
+    assert(actual("initial_boolean") == (std::vector<double>{1,0}));
+    assert(actual("initial_struct.pair") == (std::vector<double>{0.25,0.5}));
+    assert(actual("initial_struct.count") == (std::vector<double>{-7}));
+    assert(!initializerValues.count({initializedProgram,"initial_inactive"}));
+    // 新serialized schema包含零项证明；单行/整块丢失、截断和重复不能退回无初值成功。
+    mg_glsl_metadata parsed;
+    mg_read_translation_metadata("//MG_INIT_BEGIN 0\n//MG_INIT_END 0\n", parsed);
+    assert(parsed.initializer_failure.empty() && parsed.initializers.empty());
+    const std::string oneInitializer = "//MG_INIT f 1 4 tint 4 1065353216 0 0 1065353216\n";
+    mg_read_translation_metadata("//MG_INIT_BEGIN 1\n" + oneInitializer + "//MG_INIT_END 1\n", parsed);
+    assert(parsed.initializer_failure.empty() && parsed.initializers.size() == 1);
+    for (const std::string& corrupt : std::vector<std::string>{
+             "//MG_INIT_BEGIN 1\n//MG_INIT_END 1\n", "#version 320 es\nvoid main(){}\n",
+             "//MG_INIT_BEGIN 1\n" + oneInitializer,
+             "//MG_INIT_BEGIN 2\n" + oneInitializer + oneInitializer + "//MG_INIT_END 2\n",
+             "//MG_INIT_BEGIN 0\n//MG_INIT_END 0\n//MG_INIT_END 0\n",
+             "//MG_INIT_BEGIN 1\n//MG_INIT i 1 1 tint 1 -1\n//MG_INIT_END 1\n",
+             "//MG_INIT_BEGIN 1\n//MG_INIT i 1 1 tint 1 4294967296\n//MG_INIT_END 1\n"}) {
+        mg_read_translation_metadata(corrupt, parsed); assert(!parsed.initializer_failure.empty());
+    }
+    // 成功relink重置声明初值；失败relink不重置当前旧executable或其代次/值。
+    initializerValues[{initializedProgram,"initial_tint"}] = {0,1,0,1};
+    frontendError = 0; driverError = GL_INVALID_ENUM;
+    glLinkProgram(initializedProgram);
+    assert(frontendError == GL_INVALID_ENUM && driverError == 0 && actual("initial_tint") == (std::vector<double>{1,0,0,1}));
+    glUseProgram(initializedProgram);
+    initializerValues[{initializedProgram,"initial_tint"}] = {0,0,1,1};
+    const auto initializerGeneration = mg_shader_objects().programs[initializedProgram].link_generation;
+    rejectLink = true; glLinkProgram(initializedProgram); rejectLink = false;
+    glGetProgramiv(initializedProgram, GL_LINK_STATUS, &ok);
+    assert(!ok && current == initializedProgram && actual("initial_tint") == (std::vector<double>{0,0,1,1}));
+    assert(mg_shader_objects().programs[initializedProgram].link_generation == initializerGeneration);
+    // 同名跨stage冲突在driverlink前拒绝，避免已经丢初值的ES源码误成功。
+    const char* conflictVS = "#version 430\nuniform vec4 initial_tint=vec4(0,1,0,1);void main(){gl_Position=initial_tint;}";
+    const GLuint conflictVertex = makeShader(GL_VERTEX_SHADER, conflictVS);
+    glDetachShader(initializedProgram, v); glAttachShader(initializedProgram, conflictVertex);
+    const auto beforeConflict = programs[initializedProgram].link;
+    glLinkProgram(initializedProgram); glGetProgramiv(initializedProgram, GL_LINK_STATUS, &ok);
+    assert(!ok && programs[initializedProgram].link == beforeConflict && actual("initial_tint") == (std::vector<double>{0,0,1,1}));
+    glUseProgram(p);
+    glDeleteProgram(initializedProgram); glDeleteShader(initializedShader); glDeleteShader(conflictVertex);
+    frontendError = 0;
+    // 真实driver反例已证明活动TF不允许临时UseProgram。3.1+用ProgramUniform；3.0回退只暂停本次捕获。
+    const char* feedbackFS = "#version 330\nuniform vec4 initial_tint=vec4(1,0,0,1);out vec4 color;void main(){color=initial_tint;}";
+    const GLuint feedbackShader = makeShader(GL_FRAGMENT_SHADER, feedbackFS), feedbackProgram = glCreateProgram();
+    glAttachShader(feedbackProgram, v); glAttachShader(feedbackProgram, feedbackShader);
+    feedbackActive = true; feedbackPaused = false;
+    int previousUses = useCalls;
+    glLinkProgram(feedbackProgram); glGetProgramiv(feedbackProgram, GL_LINK_STATUS, &ok);
+    assert(ok && frontendError == 0 && current == p && useCalls == previousUses && !feedbackPaused);
+    assert((initializerValues[{feedbackProgram,"initial_tint"}] == std::vector<double>{1,0,0,1}));
+    driverContextVersion = 300; // bootstrap仍为320，当前API才决定DSA资格。
+    glLinkProgram(feedbackProgram); glGetProgramiv(feedbackProgram, GL_LINK_STATUS, &ok);
+    assert(ok && frontendError == 0 && current == p && feedbackActive && !feedbackPaused && pauses == 1 && resumes == 1);
+    assert((initializerValues[{feedbackProgram,"initial_tint"}] == std::vector<double>{1,0,0,1}));
+    feedbackPaused = true;
+    glLinkProgram(feedbackProgram);
+    assert(current == p && feedbackPaused && pauses == 1 && resumes == 1);
+    feedbackActive = false; feedbackPaused = false; driverContextVersion = 320;
+    glUseProgram(feedbackProgram);
+    initializerValues[{feedbackProgram,"initial_tint"}] = {0,0,1,1};
+    const auto feedbackGeneration = mg_shader_objects().programs[feedbackProgram].link_generation;
+    const auto feedbackDriverGeneration = programs[feedbackProgram].link;
+    feedbackActive = true;
+    for (bool paused : {false,true}) {
+        feedbackPaused = paused; frontendError = 0; recordedErrors.clear();
+        glLinkProgram(feedbackProgram); glGetProgramiv(feedbackProgram, GL_LINK_STATUS, &ok);
+        assert(ok && frontendError == GL_INVALID_OPERATION && current == feedbackProgram);
+        assert(mg_shader_objects().programs[feedbackProgram].link_generation == feedbackGeneration && programs[feedbackProgram].link == feedbackDriverGeneration);
+        assert((initializerValues[{feedbackProgram,"initial_tint"}] == std::vector<double>{0,0,1,1}));
+        frontendError = 0; recordedErrors.clear(); driverError = GL_INVALID_ENUM;
+        glLinkProgram(feedbackProgram);
+        assert((recordedErrors == std::vector<GLenum>{GL_INVALID_ENUM,GL_INVALID_OPERATION}));
+        assert(mg_shader_objects().programs[feedbackProgram].link_generation == feedbackGeneration);
+    }
+    feedbackActive = false; feedbackPaused = false; frontendError = 0; glUseProgram(p);
+    glDeleteProgram(feedbackProgram); glDeleteShader(feedbackShader);
     // Two non-shared contexts may use exactly the same GLuint names.
     MGContext a{}, b{};
     a.share_group = std::make_shared<MGShareGroup>();

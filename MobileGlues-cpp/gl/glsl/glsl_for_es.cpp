@@ -24,6 +24,9 @@
 #include <vector>
 #include <mutex>
 #include <set>
+#include <cstring>
+#include <limits>
+#include <charconv>
 #include "cache.h"
 #include "uniform_initializer_core.h"
 #include "../../version.h"
@@ -65,8 +68,11 @@
 //       serving them and the fix appears to do nothing at all.
 //
 // Never reuse or lower a value: an old entry that becomes reachable again is a
-// translation the current code would not produce. Roll forward to t3 instead.
-#define GLSL_TRANSLATOR_REVISION 3
+// translation the current code would not produce. Always advance the revision.
+//   t3恢复shader/program对象语义、source binding metadata与失败传播。
+// t4曾用于本轮隔离initializer候选；缺少完整性证明的实验cache仍保留为负控。
+// t5在每份转译ESSL中写入完整初值计数和终止证明（包括零项），不能复用t4旧格式。
+#define GLSL_TRANSLATOR_REVISION 5
 
 namespace {
 thread_local std::string translation_error;
@@ -81,6 +87,15 @@ void mg_read_translation_metadata(const std::string& essl, mg_glsl_metadata& met
     metadata = {};
     std::istringstream lines(essl);
     std::string line, tag;
+    bool began = false, ended = false;
+    unsigned expected_initializers = 0;
+    std::set<std::string> initializer_names;
+    const auto number = [](std::istringstream& input, std::uint32_t& value) {
+        std::string token;
+        if (!(input >> token)) return false;
+        const auto parsed = std::from_chars(token.data(), token.data() + token.size(), value);
+        return parsed.ec == std::errc{} && parsed.ptr == token.data() + token.size();
+    };
     while (std::getline(lines, line)) {
         std::istringstream fields(line);
         fields >> tag;
@@ -91,8 +106,53 @@ void mg_read_translation_metadata(const std::string& essl, mg_glsl_metadata& met
         } else if (tag == "//MG_BUFFER") {
             std::string name;
             if (fields >> name) metadata.buffer_samplers.push_back(std::move(name));
+        } else if (tag == "//MG_INIT_BEGIN" || tag == "//MG_INIT_END") {
+            std::uint32_t count = 0;
+            std::string extra;
+            if (!number(fields, count) || (fields >> extra)) {
+                metadata.initializer_failure = "Invalid uniform initializer envelope"; return;
+            }
+            if (tag == "//MG_INIT_BEGIN") {
+                if (began || ended) { metadata.initializer_failure = "Duplicate uniform initializer begin"; return; }
+                began = true; expected_initializers = count;
+            } else {
+                if (!began || ended || count != expected_initializers || metadata.initializers.size() != count) {
+                    metadata.initializer_failure = "Incomplete or duplicate uniform initializer end"; return;
+                }
+                ended = true;
+            }
+        } else if (tag == "//MG_INIT") {
+            // Cache外层只检查key/长度/NUL。新schema必须证明所有初值行都到齐，不能把丢行当无初值。
+            if (!began || ended || metadata.initializers.size() >= expected_initializers) {
+                metadata.initializer_failure = "Uniform initializer outside its complete envelope"; return;
+            }
+            mg_glsl_metadata::initializer value;
+            unsigned count = 0;
+            if (!(fields >> value.kind >> value.columns >> value.rows >> value.name >> count) ||
+                (value.kind != 'f' && value.kind != 'i' && value.kind != 'u') ||
+                value.columns < 1 || value.columns > 4 || value.rows < 1 || value.rows > 4 ||
+                (value.columns > 1 && (value.kind != 'f' || value.rows < 2)) ||
+                count != value.columns * value.rows) {
+                metadata.initializer_failure = "Invalid cached uniform initializer shape"; return;
+            }
+            value.bits.resize(count);
+            for (auto& bits : value.bits) {
+                std::string token;
+                if (!(fields >> token)) { metadata.initializer_failure = "Truncated cached uniform initializer value"; return; }
+                const auto parsed = std::from_chars(token.data(), token.data() + token.size(), bits);
+                if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size()) {
+                    metadata.initializer_failure = "Invalid cached uniform initializer bits"; return;
+                }
+            }
+            std::string extra;
+            if (fields >> extra) { metadata.initializer_failure = "Trailing cached uniform initializer data"; return; }
+            if (!initializer_names.insert(value.name).second) {
+                metadata.initializer_failure = "Duplicate cached uniform initializer name"; return;
+            }
+            metadata.initializers.push_back(std::move(value));
         }
     }
+    if (!began || !ended) metadata.initializer_failure = "Missing uniform initializer completeness envelope";
 }
 
 static TBuiltInResource InitResources() {
@@ -1024,14 +1084,63 @@ class SourceBindings : public glslang::TIntermTraverser {
     GLenum stage;
     mg_glsl_metadata& metadata;
     std::set<std::string> seen;
+    // glslang已求出合法uniform常量。按其类型树展平array/struct，绝不从源码猜表达式。
+    void initialValue(const glslang::TType& type, const std::string& name,
+                      const glslang::TConstUnionArray& constants, size_t& offset) {
+        using namespace glslang;
+        if (type.isArray()) {
+            const int count = type.getOuterArraySize();
+            if (count <= 0) throw std::runtime_error("Unsized uniform initializer array");
+            const TType element(type, 0);
+            for (int i = 0; i < count; ++i) initialValue(element, name + "[" + std::to_string(i) + "]", constants, offset);
+            return;
+        }
+        if (type.isStruct()) {
+            for (const auto& field : *type.getStruct())
+                initialValue(*field.type, name + "." + field.type->getFieldName().c_str(), constants, offset);
+            return;
+        }
+        mg_glsl_metadata::initializer value;
+        value.name = name;
+        const auto basic = type.getBasicType();
+        value.kind = basic == EbtFloat ? 'f' : basic == EbtInt || basic == EbtBool ? 'i' : basic == EbtUint ? 'u' : 0;
+        if (!value.kind) throw std::runtime_error("Uniform initializer type is not supported by the GLES target");
+        value.columns = type.isMatrix() ? type.getMatrixCols() : 1;
+        value.rows = type.isMatrix() ? type.getMatrixRows() : type.getVectorSize();
+        const size_t count = value.columns * value.rows;
+        if (count < 1 || count > 16 || offset + count > constants.size())
+            throw std::runtime_error("Uniform initializer constant shape mismatch");
+        for (size_t i = 0; i < count; ++i) {
+            const auto& component = constants[offset++];
+            std::uint32_t bits = 0;
+            if (basic == EbtFloat) {
+                static_assert(sizeof(float) == sizeof(bits) && std::numeric_limits<float>::is_iec559);
+                const float number = static_cast<float>(component.getDConst());
+                std::memcpy(&bits, &number, sizeof(bits));
+            } else if (basic == EbtInt) bits = static_cast<std::uint32_t>(component.getIConst());
+            else if (basic == EbtBool) bits = component.getBConst() ? 1 : 0;
+            else bits = component.getUConst();
+            value.bits.push_back(bits);
+        }
+        metadata.initializers.push_back(std::move(value));
+    }
 public:
     SourceBindings(const mg_frag_bindings* o, GLenum s, mg_glsl_metadata& m)
-        : outputs(o), stage(s), metadata(m) {}
+        : glslang::TIntermTraverser(true, false, false, false, true), outputs(o), stage(s), metadata(m) {}
     void visitSymbol(glslang::TIntermSymbol* symbol) override {
         using namespace glslang;
         auto& q = symbol->getQualifier();
         const auto& type = symbol->getType();
         const std::string name = symbol->getName().c_str();
+        // 当前glslang把uniform初值折叠到symbol，而不是保留为运行时赋值节点。
+        if (q.storage == EvqUniform && seen.insert("initializer:" + name).second) {
+            if (symbol->getConstSubtree()) throw std::runtime_error("Uniform specialization initializer cannot be preserved");
+            if (!symbol->getConstArray().empty()) {
+                size_t offset = 0;
+                initialValue(type, name, symbol->getConstArray(), offset);
+                if (offset != symbol->getConstArray().size()) throw std::runtime_error("Unused uniform initializer constants");
+            }
+        }
         if (stage == GL_FRAGMENT_SHADER && outputs && q.storage == EvqVaryingOut && !q.hasLocation()) {
             const auto binding = outputs->find(name);
             if (binding != outputs->end()) q.layoutLocation = binding->second;
@@ -1285,6 +1394,14 @@ std::string GLSLtoGLSLES_2(const char* glsl_code, GLenum glsl_type, uint essl_ve
         essl += "\n//MG_BIND " + binding.kind + " " + std::to_string(binding.binding) + " " +
                 std::to_string(binding.count) + " " + binding.name;
     for (const auto& name : metadata.buffer_samplers) essl += "\n//MG_BUFFER " + name;
+    // 与ESSL一起缓存；计数/终止证据包括零项，整块/单行丢失和重复都必须拒绝。
+    essl += "\n//MG_INIT_BEGIN " + std::to_string(metadata.initializers.size());
+    for (const auto& value : metadata.initializers) {
+        essl += "\n//MG_INIT " + std::string(1, value.kind) + " " + std::to_string(value.columns) + " " +
+                std::to_string(value.rows) + " " + value.name + " " + std::to_string(value.bits.size());
+        for (const auto bits : value.bits) essl += " " + std::to_string(bits);
+    }
+    essl += "\n//MG_INIT_END " + std::to_string(metadata.initializers.size());
     essl += "\n";
 
     LOG_D("Originally GLSL to GLSL ES Complete: \n%s", essl.c_str())

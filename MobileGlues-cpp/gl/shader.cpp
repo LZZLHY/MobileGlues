@@ -53,6 +53,11 @@ bool mg_shader_translate(mg_shader_record& shader, const mg_frag_bindings* outpu
                               getGLSLVersion(shader.original.c_str()), rc, outputs);
         if (rc >= 0 && !source.empty()) {
             mg_read_translation_metadata(source, metadata);
+            if (!metadata.initializer_failure.empty()) {
+                error = metadata.initializer_failure;
+                source.clear();
+                return false;
+            }
             return true;
         }
         error = mg_translation_error();
