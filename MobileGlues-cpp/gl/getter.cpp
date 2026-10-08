@@ -249,7 +249,6 @@ void InitGLESBaseExtensions() {
                                "GL_ARB_shading_language_100",
                                "GL_ARB_imaging",
                                "GL_ARB_draw_buffers_blend",
-                               "OpenGL15",
                                "GL_ARB_shader_storage_buffer_object",
                                "GL_ARB_shader_image_load_store",
                                "GL_ARB_clear_texture",
@@ -258,6 +257,10 @@ void InitGLESBaseExtensions() {
                                "GL_ARB_multi_bind",
                                "GL_KHR_no_error"};
 
+    // 扩展串只描述 GL 扩展名称，不能放入 LWJGL 用于内部版本集合的 OpenGLxx。
+    // 实际 core 版本由当前 context 的整数/字符串回答，loader 依真实版本与必需函数
+    // 建立自己的 core flags；合成标识会使低grant甚至GLES owner误报更高版本。
+    // 真实 GL_ARB/EXT 等扩展保持原集合，这里不改变其实现、配置或准入资格。
     extensions.insert(extensions.end(), std::begin(base_exts), std::end(base_exts));
 
     if (global_settings.hide_mg_env_level >= HideMGEnvLevel::Level1) {

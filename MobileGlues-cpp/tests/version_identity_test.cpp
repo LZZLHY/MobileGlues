@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <stdexcept>
 #include <thread>
+#include <sstream>
+#include <vector>
 
 gles_func_t g_gles_func{};
 gles_caps_t g_gles_caps{};
@@ -44,6 +46,26 @@ void Check(bool condition,const char* message) {
 void DriverInteger(GLenum name,GLint* value) {
     *value=name==GL_MAJOR_VERSION ? 3 : name==GL_MINOR_VERSION ? 2 : 0;
 }
+const GLubyte* DriverString(GLenum) { return reinterpret_cast<const GLubyte*>("unit driver boundary"); }
+void CheckExtensionNamespace() {
+    // 运行生产base initializer及getter，不手写扩展列表或core标识过滤器。显式
+    // GL_ARB真实名称须保留；OpenGLxx不是GL扩展名称，会污染实际LWJGL版本集合。
+    InitGLESBaseExtensions();
+    const char* raw=reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+    Check(raw!=nullptr,"production extension string exists");
+    std::istringstream stream(raw);std::string part;std::vector<std::string> names;
+    while(stream>>part) {
+        Check(part.rfind("OpenGL",0)!=0,"public extension namespace contains forged core token");
+        names.push_back(part);
+    }
+    Check(std::strstr(raw,"GL_ARB_fragment_program")&&std::strstr(raw,"GL_ARB_vertex_buffer_object"),"real GL extensions retained");
+    int count=-1;glGetIntegerv(GL_NUM_EXTENSIONS,&count);
+    Check(count==static_cast<int>(names.size()),"production extension count equals raw token count");
+    for(int i=0;i<count;++i) {
+        const auto* indexed=glGetStringi(GL_EXTENSIONS,i);
+        Check(indexed&&names[i]==reinterpret_cast<const char*>(indexed),"production indexed extension ordering equals raw string");
+    }
+}
 void CheckDesktopVersion(int major,int minor) {
     int actualMajor=-1,actualMinor=-1,stringMajor=-1,stringMinor=-1;
     glGetIntegerv(GL_MAJOR_VERSION,&actualMajor); glGetIntegerv(GL_MINOR_VERSION,&actualMinor);
@@ -67,6 +89,9 @@ int main(int argc,char** argv) {
         GLVersion=Version(4,0,0);
         global_settings.hide_mg_env_level=HideMGEnvLevel::Disabled;
         GLES.glGetIntegerv=DriverInteger;
+        GLES.glGetString=DriverString;
+        // 第一次任意indexed cache读取之前初始化，遵守真实bootstrap的发布顺序。
+        CheckExtensionNamespace();
         // 无current保留既有配置fallback；GLSL表达实现语言上限，不强制等于context的GL版本。
         CheckDesktopVersion(4,0);
         const std::string language=reinterpret_cast<const char*>(glGetString(GL_SHADING_LANGUAGE_VERSION));

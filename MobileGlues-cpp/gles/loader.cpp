@@ -303,12 +303,10 @@ void InitGLESCapabilities() {
     if (mg_texture_barrier_backend) AppendExtension("GL_ARB_texture_barrier");
     LOG_I("[MG-CAPABILITIES] requested_gl=%d effective_gl=%d texture_barrier=%d",
           requestedVersion, GLVersion.toInt(2), mg_texture_barrier_backend != nullptr)
-    int glVersion = GLVersion.toInt(2);
-    for (int ver = 32; ver <= glVersion; ++ver) {
-        if (ver > 33 && ver < 40) continue;
-        LOG_D("Appending OpenGL extension for version %d", ver)
-        AppendExtension(("OpenGL" + std::to_string(ver)).c_str());
-    }
+    // 配置上限仍用于既有desktop创建gate，但不能在公开扩展串伪造OpenGLxx
+    // core标识。LWJGL会把这些字符串当内部版本集合，即使当前合法grant只有3.0，
+    // 也会据全局4.0标识将OpenGL40置true。让真实版本查询与函数解析决定core flags；
+    // 此处保留所有driver/GL扩展、版本数值和texture-barrier上限处理。
 
     if (g_gles_caps.major > 3 || (g_gles_caps.major == 3 && g_gles_caps.minor >= 1)) {
         AppendExtension("GL_ARB_vertex_attrib_binding");
