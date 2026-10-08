@@ -10,15 +10,14 @@
 #include "../gles/loader.h"
 #include "log.h"
 #include "mg.h"
+#include "enable_cap_validation.h"
 #include "../egl/context.h"
 #include <cstring>
 
 #define DEBUG 0
 
-// Report a rejected argument once per site. This layer cannot raise a GL error
-// -- glGetError always answers GL_NO_ERROR by design -- so an unusable argument
-// means "do nothing" plus one line a user can paste into a bug report. LOG_W and
-// LOG_E compile to nothing in release builds, hence LOG_W_FORCE.
+// 保留既有受限cap/index的有界诊断。公共scalar参数错误另外走原MG错误队列；
+// 内部状态查找不能把未知pname当GL错误。LOG_W/LOG_E在release关闭，因此用LOG_W_FORCE。
 #define EN_WARN_ONCE(...)                                                                                              \
     do {                                                                                                               \
         static bool mg_en_warned = false;                                                                              \
@@ -262,6 +261,22 @@ bool table_matches_driver(const mg_enable_state_t* st) {
     return st->driver_synced;
 }
 
+bool validate_scalar_cap(GLenum cap, bool query) {
+    GLuint clip = 0;
+    // 已实现参数保持原热路径；分类集合只保留合法但未实现项，不增加backing或伪tracked状态。
+    if (find_cap(cap) || is_clip_distance(cap, &clip) || mg::enable_detail::known_possible_scalar_cap(cap, query))
+        return true;
+    // Registry以外的GLES extension可能由当前driver实际支持。只读验证而非猜名字/转发setter，
+    // 先把旧错放入原队列；driver拒绝的真实错误随mg_end进入同队列，不能拿旧错判本次参数。
+    mg_begin_driver_operation();
+    if (!GLES.glIsEnabled || !GLES.glGetError) {
+        mg_set_gl_error(GL_INVALID_OPERATION);
+        return false;
+    }
+    GLES.glIsEnabled(cap);
+    return mg_end_driver_operation("scalar enable capability validation");
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -442,7 +457,7 @@ static void mg_set_enabled(GLenum cap, GLuint index, bool indexed, GLboolean val
 
     const cap_desc_t* d = find_cap(cap);
     if (!d) {
-        EN_WARN_ONCE("glEnable/glDisable: 0x%04x is not an enable capability, ignored", cap);
+        EN_WARN_ONCE("glEnable/glDisable: 0x%04x is outside MG tracking, ignored", cap);
         return;
     }
 
@@ -546,18 +561,18 @@ extern "C"
     GLAPI GLAPIENTRY void glEnable(GLenum cap) {
         LOG()
         LOG_D("glEnable, cap = 0x%04x", cap)
-        mg_set_enabled(cap, 0, false, GL_TRUE);
+        if (validate_scalar_cap(cap, false)) mg_set_enabled(cap, 0, false, GL_TRUE);
     }
 
     GLAPI GLAPIENTRY void glDisable(GLenum cap) {
         LOG()
         LOG_D("glDisable, cap = 0x%04x", cap)
-        mg_set_enabled(cap, 0, false, GL_FALSE);
+        if (validate_scalar_cap(cap, false)) mg_set_enabled(cap, 0, false, GL_FALSE);
     }
 
     GLAPI GLAPIENTRY GLboolean glIsEnabled(GLenum cap) {
         LOG()
-        return mg_enable_get(cap, 0);
+        return validate_scalar_cap(cap, true) ? mg_enable_get(cap, 0) : GL_FALSE;
     }
 
     GLAPI GLAPIENTRY void glEnablei(GLenum cap, GLuint index) {
